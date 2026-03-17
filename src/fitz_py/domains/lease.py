@@ -45,7 +45,9 @@ class Lease:
 
 
 class LeaseSubscription:
-    def __init__(self, sub_id: int, pattern: str, unsubscribe: Callable[[int], Awaitable[None]]) -> None:
+    def __init__(
+        self, sub_id: int, pattern: str, unsubscribe: Callable[[int], Awaitable[None]]
+    ) -> None:
         self.sub_id = sub_id
         self.pattern = pattern
         self._unsubscribe = unsubscribe
@@ -125,7 +127,9 @@ class LeaseClient(DomainClient):
         self._subscriptions[sub_id] = (pattern, handler)
         return LeaseSubscription(sub_id, pattern, self._unsubscribe)
 
-    async def _send_token_ttl(self, message_type: int, route: str, token: int, ttl_secs: int, operation: str) -> None:
+    async def _send_token_ttl(
+        self, message_type: int, route: str, token: int, ttl_secs: int, operation: str
+    ) -> None:
         writer = BufferWriter()
         writer.write_route(route)
         writer.write_route("")
@@ -134,7 +138,11 @@ class LeaseClient(DomainClient):
         reader = BufferReader(await self.request_frame(message_type, writer.build()))
         status = reader.read_u8() if not reader.is_eof() else 0
         if status != 0:
-            raise LeaseError(f"{operation} failed with status {status}", f"{operation}_FAILED", status)
+            raise LeaseError(
+                f"{operation} failed with status {status}",
+                f"{operation}_FAILED",
+                status,
+            )
 
     async def _unsubscribe(self, sub_id: int) -> None:
         subscription = self._subscriptions.pop(sub_id, None)

@@ -89,7 +89,9 @@ class FrameParser:
         if first == 0xFF:
             if self._offset + 3 > len(self._buffer):
                 return False
-            self._message_type = int.from_bytes(self._buffer[self._offset + 1 : self._offset + 3], "big")
+            self._message_type = int.from_bytes(
+                self._buffer[self._offset + 1 : self._offset + 3], "big"
+            )
             self._offset += 3
             return True
         self._message_type = first

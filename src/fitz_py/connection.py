@@ -113,7 +113,9 @@ class Connection:
     async def send_fire_and_forget(self, message_type: int, payload: bytes) -> None:
         await self.send(message_type, payload)
 
-    def register_notification_handler(self, message_type: int, handler: Callable[[bytes], None]) -> None:
+    def register_notification_handler(
+        self, message_type: int, handler: Callable[[bytes], None]
+    ) -> None:
         self._multiplexer.register_notification_handler(message_type, handler)
 
     def unregister_notification_handler(self, message_type: int) -> None:
@@ -142,7 +144,9 @@ class Connection:
     async def _open_and_authenticate(self, is_reconnect: bool) -> None:
         self._receive_loop_abort = False
         self._transport = self._transport_factory()
-        self._set_state(ConnectionState.RECONNECTING if is_reconnect else ConnectionState.CONNECTING)
+        self._set_state(
+            ConnectionState.RECONNECTING if is_reconnect else ConnectionState.CONNECTING
+        )
         await self._transport.connect()
         self._receive_task = asyncio.create_task(self._receive_loop())
 
@@ -152,7 +156,9 @@ class Connection:
 
         try:
             await self._send_connect()
-            await asyncio.wait_for(asyncio.shield(self._auth_settle()), timeout=self._timeout_ms / 1000)
+            await asyncio.wait_for(
+                asyncio.shield(self._auth_settle()), timeout=self._timeout_ms / 1000
+            )
             if self._auth_future is not None and not self._auth_future.done():
                 self._auth_future.set_result(None)
             self._auth_future = None
@@ -207,8 +213,14 @@ class Connection:
     async def _handle_connection_loss(self, exc: Exception) -> None:
         self._multiplexer.set_disconnected()
 
-        if self._state is ConnectionState.AUTHENTICATING and self._auth_future is not None and not self._auth_future.done():
-            self._auth_future.set_exception(AuthenticationError(self._describe_connection_loss(exc)))
+        if (
+            self._state is ConnectionState.AUTHENTICATING
+            and self._auth_future is not None
+            and not self._auth_future.done()
+        ):
+            self._auth_future.set_exception(
+                AuthenticationError(self._describe_connection_loss(exc))
+            )
 
         if self._close_requested:
             self._set_state(ConnectionState.CLOSED)

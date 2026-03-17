@@ -28,7 +28,12 @@ class ScheduleEntry:
 
 
 class ScheduleSubscription:
-    def __init__(self, sub_id: int | None, pattern: str, unsubscribe: Callable[[str], Awaitable[None]]) -> None:
+    def __init__(
+        self,
+        sub_id: int | None,
+        pattern: str,
+        unsubscribe: Callable[[str], Awaitable[None]],
+    ) -> None:
         self.sub_id = sub_id
         self.pattern = pattern
         self._unsubscribe = unsubscribe
@@ -50,7 +55,9 @@ class ScheduleClient(DomainClient):
         writer.write_string(cron)
         writer.write_u32_be(len(payload))
         writer.write_bytes(payload)
-        data = assert_success(await self.request_frame(MSG_SCHEDULE_CREATE, writer.build()), "CREATE")
+        data = assert_success(
+            await self.request_frame(MSG_SCHEDULE_CREATE, writer.build()), "CREATE"
+        )
         reader = BufferReader(data)
         if not reader.is_eof() and reader.read_u8() == 1:
             return reader.read_string()
@@ -61,7 +68,9 @@ class ScheduleClient(DomainClient):
         writer.write_route(route)
         assert_success(await self.request_frame(MSG_SCHEDULE_CANCEL, writer.build()), "CANCEL")
 
-    async def list(self, *, offset: int | None = None, limit: int | None = None) -> list[ScheduleEntry]:
+    async def list(
+        self, *, offset: int | None = None, limit: int | None = None
+    ) -> list[ScheduleEntry]:
         writer = BufferWriter()
         writer.write_optional_u64(offset)
         writer.write_optional_u64(limit)
@@ -83,7 +92,10 @@ class ScheduleClient(DomainClient):
         self._init_notify_handler()
         writer = BufferWriter()
         writer.write_string(pattern)
-        data = assert_success(await self.request_frame(MSG_SCHEDULE_SUBSCRIBE, writer.build()), "SUBSCRIBE")
+        data = assert_success(
+            await self.request_frame(MSG_SCHEDULE_SUBSCRIBE, writer.build()),
+            "SUBSCRIBE",
+        )
         reader = BufferReader(data)
         sub_id = reader.read_u64_be() if not reader.is_eof() and reader.read_u8() == 1 else None
         self._subscriptions[pattern] = (sub_id, handler)
@@ -95,7 +107,10 @@ class ScheduleClient(DomainClient):
         self._subscriptions.pop(pattern, None)
         writer = BufferWriter()
         writer.write_string(pattern)
-        assert_success(await self.request_frame(MSG_SCHEDULE_UNSUBSCRIBE, writer.build()), "UNSUBSCRIBE")
+        assert_success(
+            await self.request_frame(MSG_SCHEDULE_UNSUBSCRIBE, writer.build()),
+            "UNSUBSCRIBE",
+        )
 
     def _init_notify_handler(self) -> None:
         if self._initialized:

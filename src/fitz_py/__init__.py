@@ -39,7 +39,13 @@ from fitz_py.errors import (
     TimeoutError,
     TransportError,
 )
-from fitz_py.types import ClientConfig, ConnectionState, ReconnectOptions, TokenProvider, TransportType
+from fitz_py.types import (
+    ClientConfig,
+    ConnectionState,
+    ReconnectOptions,
+    TokenProvider,
+    TransportType,
+)
 
 __all__ = [
     "AuthenticationError",

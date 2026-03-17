@@ -21,7 +21,9 @@ QueueAvailabilityHandler = Callable[[str], None | Awaitable[None]]
 
 
 class QueueSubscription:
-    def __init__(self, sub_id: int, pattern: str, unsubscribe: Callable[[int], Awaitable[None]]) -> None:
+    def __init__(
+        self, sub_id: int, pattern: str, unsubscribe: Callable[[int], Awaitable[None]]
+    ) -> None:
         self.sub_id = sub_id
         self.pattern = pattern
         self._unsubscribe = unsubscribe

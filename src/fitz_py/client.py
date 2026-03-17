@@ -73,7 +73,11 @@ class Client:
 
     @property
     def state(self) -> ConnectionState:
-        return self._connection.get_state() if self._connection is not None else ConnectionState.DISCONNECTED
+        return (
+            self._connection.get_state()
+            if self._connection is not None
+            else ConnectionState.DISCONNECTED
+        )
 
     def kv(self) -> KvClient:
         if self._kv_client is None:

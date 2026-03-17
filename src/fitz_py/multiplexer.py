@@ -32,7 +32,9 @@ class Multiplexer:
         self._optional_responses.clear()
         self.cancel_all()
 
-    def register_notification_handler(self, message_type: int, handler: NotificationHandler) -> None:
+    def register_notification_handler(
+        self, message_type: int, handler: NotificationHandler
+    ) -> None:
         self._notification_handlers[message_type] = handler
 
     def unregister_notification_handler(self, message_type: int) -> None:
@@ -75,7 +77,9 @@ class Multiplexer:
                 )
 
         timeout_handle = loop.call_later(timeout_ms / 1000, on_timeout)
-        self._pending[message_type].append(PendingRequest(future=future, timeout_handle=timeout_handle))
+        self._pending[message_type].append(
+            PendingRequest(future=future, timeout_handle=timeout_handle)
+        )
 
         try:
             await send(frame_data)
@@ -84,7 +88,9 @@ class Multiplexer:
             timeout_handle.cancel()
             queue = self._pending.get(message_type)
             if queue is not None:
-                self._pending[message_type] = deque(item for item in queue if item.future is not future)
+                self._pending[message_type] = deque(
+                    item for item in queue if item.future is not future
+                )
                 if not self._pending[message_type]:
                     self._pending.pop(message_type, None)
             raise

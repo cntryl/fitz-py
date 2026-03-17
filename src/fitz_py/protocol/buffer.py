@@ -53,7 +53,7 @@ class BufferReader:
             raise CodecError(f"Buffer overflow: cannot read {size} bytes")
         start = self._offset
         self._offset += size
-        return self._buffer[start:self._offset]
+        return self._buffer[start : self._offset]
 
     def read_u8(self) -> int:
         return struct.unpack(">B", self._read(1))[0]

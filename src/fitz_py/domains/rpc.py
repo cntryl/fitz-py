@@ -148,7 +148,11 @@ class RpcClient(DomainClient):
         reader = BufferReader(await self.request_frame(MSG_RPC_SUBSCRIBE_WORKER, writer.build()))
         status = reader.read_u8()
         if status != 0:
-            raise RpcError(f"REGISTER_WORKER failed with status {status}", "REGISTER_FAILED", status)
+            raise RpcError(
+                f"REGISTER_WORKER failed with status {status}",
+                "REGISTER_FAILED",
+                status,
+            )
         self._workers[route] = handler
         return RpcSubscription(route, self._unregister_worker)
 
@@ -199,7 +203,12 @@ class RpcClient(DomainClient):
                 handler = self._workers.get(route)
                 if handler is None:
                     return
-                request = InboundRpcRequest(correlation_id=correlation_id, route=route, reply_route=reply_route, body=body)
+                request = InboundRpcRequest(
+                    correlation_id=correlation_id,
+                    route=route,
+                    reply_route=reply_route,
+                    body=body,
+                )
                 response_writer = ResponseWriter(self.connection, correlation_id)
                 result = handler(request, response_writer)
                 if asyncio.iscoroutine(result):

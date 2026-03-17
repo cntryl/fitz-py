@@ -43,7 +43,9 @@ class StreamCommitNotification:
 
 
 class StreamSubscription:
-    def __init__(self, sub_id: int, pattern: str, unsubscribe: Callable[[str], Awaitable[None]]) -> None:
+    def __init__(
+        self, sub_id: int, pattern: str, unsubscribe: Callable[[str], Awaitable[None]]
+    ) -> None:
         self.sub_id = sub_id
         self.pattern = pattern
         self._unsubscribe = unsubscribe
@@ -108,7 +110,11 @@ class StreamSession:
         reader = BufferReader(await self._connection.request(message_type, payload))
         status = reader.read_u8() if not reader.is_eof() else 0
         if status != 0:
-            raise StreamError(f"{operation} failed with status {status}", f"{operation}_FAILED", status)
+            raise StreamError(
+                f"{operation} failed with status {status}",
+                f"{operation}_FAILED",
+                status,
+            )
 
 
 class StreamClient(DomainClient):
@@ -118,7 +124,9 @@ class StreamClient(DomainClient):
         self._initialized = False
         self.connection.on_reconnect(self._restore_subscriptions)
 
-    async def begin(self, route: str, expected_offset: int = 0, ingest_metadata: bytes | None = None) -> StreamSession:
+    async def begin(
+        self, route: str, expected_offset: int = 0, ingest_metadata: bytes | None = None
+    ) -> StreamSession:
         writer = BufferWriter()
         writer.write_route(route)
         writer.write_u64_be(expected_offset)
@@ -137,7 +145,13 @@ class StreamClient(DomainClient):
             raise StreamError("BEGIN response missing session id", "MISSING_SESSION_ID")
         return StreamSession(self.connection, reader.read_u64_be())
 
-    async def read(self, route: str, start_offset: int, limit: int = 100, max_bytes: int | None = None) -> list[StreamRecord]:
+    async def read(
+        self,
+        route: str,
+        start_offset: int,
+        limit: int = 100,
+        max_bytes: int | None = None,
+    ) -> list[StreamRecord]:
         writer = BufferWriter()
         writer.write_route(route)
         writer.write_u64_be(start_offset)

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+from fitz_py.domains.base import DomainClient
 from fitz_py.errors import KvError
 from fitz_py.protocol.buffer import BufferReader, BufferWriter
 from fitz_py.protocol.messages import (
@@ -16,7 +17,6 @@ from fitz_py.protocol.messages import (
     MSG_KV_ROLLBACK,
     MSG_KV_SCAN,
 )
-from fitz_py.domains.base import DomainClient
 
 KVMode = Literal["read_only", "read_write"]
 KVDurability = Literal["none", "async", "sync"]
@@ -166,7 +166,11 @@ class KvTransaction:
         reader = BufferReader(await self._connection.request(message_type, payload))
         status = reader.read_u8()
         if status != 0:
-            raise KvError(f"{operation} failed with status {status}", f"{operation}_FAILED", status)
+            raise KvError(
+                f"{operation} failed with status {status}",
+                f"{operation}_FAILED",
+                status,
+            )
 
 
 class KvClient(DomainClient):

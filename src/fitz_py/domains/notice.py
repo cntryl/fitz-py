@@ -24,7 +24,9 @@ class NoticeMessage:
 
 
 class NoticeSubscription:
-    def __init__(self, sub_id: int, pattern: str, unsubscribe: Callable[[int], Awaitable[None]]) -> None:
+    def __init__(
+        self, sub_id: int, pattern: str, unsubscribe: Callable[[int], Awaitable[None]]
+    ) -> None:
         self.sub_id = sub_id
         self.pattern = pattern
         self._unsubscribe = unsubscribe
@@ -45,7 +47,9 @@ class NoticeClient(DomainClient):
         writer.write_route(route)
         writer.write_u32_be(len(body))
         writer.write_bytes(body)
-        cancel_optional = self.connection.get_multiplexer().expect_optional_response(MSG_NOTICE_PUBLISH)
+        cancel_optional = self.connection.get_multiplexer().expect_optional_response(
+            MSG_NOTICE_PUBLISH
+        )
         try:
             await self.connection.send_fire_and_forget(MSG_NOTICE_PUBLISH, writer.build())
         except Exception:
