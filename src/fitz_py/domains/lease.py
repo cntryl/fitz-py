@@ -13,7 +13,6 @@ from fitz_py.protocol.messages import (
     MSG_LEASE_NOTIFY,
     MSG_LEASE_QUERY,
     MSG_LEASE_RELEASE,
-    MSG_LEASE_RENEW,
     MSG_LEASE_SUBSCRIBE,
     MSG_LEASE_UNSUBSCRIBE,
 )
@@ -36,9 +35,6 @@ class Lease:
 
     async def extend(self, ttl_secs: int) -> None:
         await self._client.extend(self.route, self.token, ttl_secs)
-
-    async def renew(self, ttl_secs: int) -> None:
-        await self._client.renew(self.route, self.token, ttl_secs)
 
     async def release(self) -> None:
         await self._client.release(self.route, self.token)
@@ -81,9 +77,6 @@ class LeaseClient(DomainClient):
 
     async def extend(self, route: str, token: int, ttl_secs: int) -> None:
         await self._send_token_ttl(MSG_LEASE_EXTEND, route, token, ttl_secs, "EXTEND")
-
-    async def renew(self, route: str, token: int, ttl_secs: int) -> None:
-        await self._send_token_ttl(MSG_LEASE_RENEW, route, token, ttl_secs, "RENEW")
 
     async def release(self, route: str, token: int) -> None:
         writer = BufferWriter()
