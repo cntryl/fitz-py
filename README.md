@@ -56,6 +56,12 @@ python -m pytest tests/unit
 
 Broker-backed integration testing will use the same Fitz broker environment contract as the Go and TypeScript clients.
 
+The required repo-local spec gate is the conformance suite:
+
+```powershell
+python -m pytest tests/conformance -v
+```
+
 ## Canonical Spec
 
 Canonical client behavior is defined by the server-owned docs in the Fitz repository:
