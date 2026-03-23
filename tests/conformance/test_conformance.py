@@ -7,7 +7,7 @@ Covers all 15 scenarios defined in:
 Configuration via environment variables:
   CONFORMANCE_TRANSPORT   "ws" (default) | "tcp"
   CONFORMANCE_AUTH_MODE   "anonymous" (default) | "valid_jwt"
-  CONFORMANCE_OUTPUT      path to write JSON results (default: ./conformance-results.json)
+  CONFORMANCE_OUTPUT      path to write JSON results (default: ./artifacts/conformance-results.json)
 
 Broker addresses resolved via the same env vars as integration tests.
 
@@ -47,7 +47,7 @@ CONFORMANCE_TRANSPORT: str = os.getenv("CONFORMANCE_TRANSPORT", "ws")
 CONFORMANCE_AUTH_MODE: Literal["anonymous", "valid_jwt"] = (
     "valid_jwt" if os.getenv("CONFORMANCE_AUTH_MODE", "anonymous") == "valid_jwt" else "anonymous"
 )
-CONFORMANCE_OUTPUT: str = os.getenv("CONFORMANCE_OUTPUT", "./conformance-results.json")
+CONFORMANCE_OUTPUT: str = os.getenv("CONFORMANCE_OUTPUT", "./artifacts/conformance-results.json")
 CLIENT_NAME = "fitz-py"
 
 
@@ -162,6 +162,7 @@ def _write_results() -> None:
     }
 
     output_path = Path(CONFORMANCE_OUTPUT)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(aggregate, indent=2), encoding="utf-8")
     print(f"\nConformance results written to: {output_path}")
     print(f"Status: {overall.upper()}  P0: {p0_rate:.0%}  P1: {p1_rate:.0%}")
@@ -565,12 +566,16 @@ async def test_cs008_caller_cancellation() -> None:
 
     worker_client = await _new_client()
     caller_client = await _new_client()
+    handler_finished = asyncio.Event()
     try:
         route = _unique_route("rpc")
 
         async def _slow_handler(req, writer) -> None:
-            await asyncio.sleep(3.0)
-            await writer.send(b"late", is_end=True)
+            try:
+                await asyncio.sleep(3.0)
+                await writer.send(b"late", is_end=True)
+            finally:
+                handler_finished.set()
 
         sub = await worker_client.rpc().register_worker(route, _slow_handler)
 
@@ -597,6 +602,11 @@ async def test_cs008_caller_cancellation() -> None:
         evidence.append("error is CancelledError (correct — not timeout)")
 
         await sub.unsubscribe()
+        try:
+            await asyncio.wait_for(handler_finished.wait(), timeout=1.0)
+            evidence.append("worker handler finished after caller cancellation")
+        except asyncio.TimeoutError:
+            evidence.append("worker handler still draining after cancellation")
 
         # Subsequent request must succeed
         kv_route = _unique_route("kv")
@@ -634,14 +644,18 @@ async def test_cs009_disconnect_during_request() -> None:
 
     worker_client = await _new_client()
     caller_client = await _new_client()
+    handler_finished = asyncio.Event()
     try:
         route = _unique_route("rpc")
 
         async def _slow_handler(req, writer) -> None:
-            await asyncio.sleep(5.0)
-            await writer.send(b"late", is_end=True)
+            try:
+                await asyncio.sleep(1.5)
+                await writer.send(b"late", is_end=True)
+            finally:
+                handler_finished.set()
 
-        await worker_client.rpc().register_worker(route, _slow_handler)
+        sub = await worker_client.rpc().register_worker(route, _slow_handler)
 
         async def _do_call() -> None:
             iterator = await caller_client.rpc().call(route, b"block", timeout_ms=30000)
@@ -666,6 +680,12 @@ async def test_cs009_disconnect_during_request() -> None:
         else:
             evidence.append("in-flight request completed before close (race — partial)")
             verdict = "partial"
+        await sub.unsubscribe()
+        try:
+            await asyncio.wait_for(handler_finished.wait(), timeout=2.0)
+            evidence.append("worker handler finished after disconnect")
+        except asyncio.TimeoutError:
+            evidence.append("worker handler still draining after disconnect")
     finally:
         await worker_client.close()
         # Caller may already be closed

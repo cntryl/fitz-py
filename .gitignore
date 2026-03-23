@@ -12,6 +12,8 @@ env/
 .tox/
 .coverage
 .coverage.*
+artifacts/
+conformance-results.json
 htmlcov/
 build/
 dist/

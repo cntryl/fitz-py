@@ -1,10 +1,14 @@
 # fitz-py
 
-`fitz-py` is an async-first Python client for Fitz.
+`fitz-py` is the async-first Python SDK for Fitz.
 
-## Status
+## Install
 
-This package is structured as a modern `src/`-layout Python project and exposes a canonical public surface:
+```bash
+python -m pip install cntryl-fitz
+```
+
+## Quick Start
 
 ```python
 from fitz_py import Client, ClientConfig
@@ -25,42 +29,44 @@ await tx.rollback()
 await client.close()
 ```
 
-## Public API
+The package is `asyncio`-first and does not provide a synchronous wrapper.
 
-- `Client`
-- `ClientConfig`
-- `ConnectionState`
-- Fitz/domain error types
-- Canonical domain accessors:
-  - `client.kv()`
-  - `client.queue()`
-  - `client.rpc()`
-  - `client.notice()`
-  - `client.lease()`
-  - `client.stream()`
-  - `client.schedule()`
+## Verification
 
-The package is `asyncio`-first. It does not provide a synchronous wrapper.
+Fast local checks:
+
+```bash
+python -m pip install -e ".[dev]"
+python -m ruff check .
+python -m pytest tests/unit
+```
+
+Broker-backed verification:
+
+```bash
+docker compose -f ../fitz-go/compose.yml up -d
+python -m pytest tests/integration -v
+CONFORMANCE_TRANSPORT=ws CONFORMANCE_AUTH_MODE=anonymous \
+CONFORMANCE_OUTPUT=artifacts/conformance-results.json \
+python -m pytest tests/conformance -v
+docker compose -f ../fitz-go/compose.yml down --volumes
+```
+
+Package smoke verification:
+
+```bash
+python -m build
+python -m pip install dist/*.whl
+```
+
+The conformance harness writes JSON results to `artifacts/conformance-results.json` by default.
 
 ## Project Layout
 
 - `src/fitz_py`: package code
 - `tests/unit`: fast unit coverage
-- `tests/integration`: reserved for broker-backed acceptance tests
-
-## Testing
-
-```powershell
-python -m pytest tests/unit
-```
-
-Broker-backed integration testing will use the same Fitz broker environment contract as the Go and TypeScript clients.
-
-The required repo-local spec gate is the conformance suite:
-
-```powershell
-python -m pytest tests/conformance -v
-```
+- `tests/integration`: broker-backed integration coverage
+- `tests/conformance`: release-gate conformance coverage
 
 ## Canonical Spec
 

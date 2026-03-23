@@ -27,8 +27,46 @@ jobs:
       - name: Run unit tests
         run: python -m pytest tests/unit
 
+  package:
+    runs-on: ubuntu-latest
+    needs: fast
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Build distributions
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: Smoke install built wheel
+        run: |
+          python -m venv artifacts/smoke/.venv
+          . artifacts/smoke/.venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install dist/*.whl
+          python - <<'PY'
+          from fitz_py import Client, ClientConfig
+
+          client = Client(ClientConfig(url="ws://localhost:4190/ws"))
+          print(type(client).__name__)
+          print(type(client.kv()).__name__)
+          PY
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: fitz-py-dist
+          path: dist/*
+
   spec:
     runs-on: ubuntu-latest
+    needs: fast
     strategy:
       fail-fast: false
       matrix:
@@ -41,7 +79,7 @@ jobs:
       FITZ_BROKER_AUTH_WS_ADDR: ws://localhost:4090/ws
       FITZ_BROKER_JWT_HMAC_SECRET: test-secret-key
       FITZ_BROKER_JWT_AUDIENCE: fitz
-      CONFORMANCE_OUTPUT: conformance-results.json
+      CONFORMANCE_OUTPUT: artifacts/conformance-results.json
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -69,19 +107,19 @@ jobs:
         run: |
           CONFORMANCE_TRANSPORT=${{ matrix.transport }} CONFORMANCE_AUTH_MODE=anonymous python -m pytest tests/conformance/test_conformance.py -k cs002 -v
 
-      - name: Enforce P0 conformance
+      - name: Enforce full conformance
         run: |
           python - <<'PY'
           import json
           from pathlib import Path
-          required = {"CS-001","CS-002","CS-003","CS-004","CS-005","CS-006","CS-007","CS-008"}
-          path = Path("conformance-results.json")
+          required = {f"CS-{index:03d}" for index in range(1, 16)}
+          path = Path("artifacts/conformance-results.json")
           data = json.loads(path.read_text(encoding="utf-8"))
           observed = {s["scenario_id"] for s in data["scenarios"]}
           missing = sorted(required - observed)
           failing = sorted(s["scenario_id"] for s in data["scenarios"] if s["scenario_id"] in required and s["verdict"] != "pass")
           print(f"transport={data['transport']} auth={data['auth_mode']} p0={data['p0_pass_rate']:.0%} p1={data['p1_pass_rate']:.0%} failing={failing} missing={missing}")
-          if failing or missing:
+          if data.get("overall_status") != "pass" or failing or missing:
               raise SystemExit(1)
           PY
 
@@ -90,7 +128,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: fitz-py-conformance-${{ matrix.transport }}-${{ matrix.auth_mode }}
-          path: conformance-results.json
+          path: artifacts/conformance-results.json
 
       - name: Stop broker stack
         if: always()
