@@ -3,8 +3,7 @@ from __future__ import annotations
 import asyncio
 from urllib.parse import urlparse
 
-from fitz_py.errors import TransportError
-from fitz_py.protocol.frame import FrameParser
+from fitz_py.errors import TimeoutError, TransportError
 from fitz_py.transport.base import Transport
 
 
@@ -15,11 +14,10 @@ class TcpTransport(Transport):
         self._max_frame_size = max_frame_size
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
-        self._parser = FrameParser()
 
         parsed = urlparse(url if "://" in url else f"tcp://{url}")
         self._host = parsed.hostname or "localhost"
-        self._port = parsed.port or 4191
+        self._port = parsed.port or 4090
 
     async def connect(self) -> None:
         try:
@@ -27,6 +25,10 @@ class TcpTransport(Transport):
                 asyncio.open_connection(self._host, self._port),
                 timeout=self._timeout,
             )
+        except TimeoutError:
+            raise
+        except asyncio.TimeoutError as exc:  # pragma: no cover - transport boundary
+            raise TimeoutError(f"TCP connection timeout after {int(self._timeout * 1000)}ms") from exc
         except Exception as exc:  # pragma: no cover - transport boundary
             raise TransportError(f"TCP connect failed: {exc}") from exc
 
@@ -46,9 +48,17 @@ class TcpTransport(Transport):
         writer = self._writer
         if writer is None:
             raise TransportError("TCP transport is not connected")
+        if len(data) > self._max_frame_size:
+            raise TransportError(
+                f"TCP frame length {len(data)} exceeds max frame size {self._max_frame_size}"
+            )
+
+        full_message = len(data).to_bytes(4, "big") + data
         try:
-            writer.write(data)
-            await writer.drain()
+            writer.write(full_message)
+            await asyncio.wait_for(writer.drain(), timeout=self._timeout)
+        except asyncio.TimeoutError as exc:  # pragma: no cover - transport boundary
+            raise TimeoutError(f"TCP send timeout after {int(self._timeout * 1000)}ms") from exc
         except Exception as exc:  # pragma: no cover - transport boundary
             raise TransportError(f"TCP send failed: {exc}") from exc
 
@@ -57,26 +67,22 @@ class TcpTransport(Transport):
         if reader is None:
             raise TransportError("TCP transport is not connected")
 
-        while True:
-            try:
-                chunk = await asyncio.wait_for(reader.read(4096), timeout=self._timeout)
-            except Exception as exc:  # pragma: no cover - transport boundary
-                raise TransportError(f"TCP receive failed: {exc}") from exc
-
-            if not chunk:
-                raise TransportError("TCP connection closed")
-
-            if len(chunk) > self._max_frame_size + 3:
-                raise TransportError("TCP frame exceeds configured max_frame_size")
-
-            frames = self._parser.parse_frames(chunk)
-            if not frames:
-                continue
-
-            frame = frames[0]
-            if len(frame.payload) > self._max_frame_size:
-                raise TransportError("TCP frame exceeds configured max_frame_size")
-            return chunk
+        try:
+            header = await asyncio.wait_for(reader.readexactly(4), timeout=self._timeout)
+            frame_length = int.from_bytes(header, "big")
+            if frame_length > self._max_frame_size:
+                raise TransportError(
+                    f"TCP frame length {frame_length} exceeds max frame size {self._max_frame_size}"
+                )
+            return await asyncio.wait_for(reader.readexactly(frame_length), timeout=self._timeout)
+        except asyncio.IncompleteReadError as exc:  # pragma: no cover - transport boundary
+            raise TransportError("TCP connection closed") from exc
+        except asyncio.TimeoutError as exc:  # pragma: no cover - transport boundary
+            raise TimeoutError(f"TCP receive timeout after {int(self._timeout * 1000)}ms") from exc
+        except TransportError:
+            raise
+        except Exception as exc:  # pragma: no cover - transport boundary
+            raise TransportError(f"TCP receive failed: {exc}") from exc
 
     def get_url(self) -> str:
         return self._url

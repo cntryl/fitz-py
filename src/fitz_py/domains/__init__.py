@@ -1,24 +1,50 @@
 from fitz_py.domains.kv import (
     KvClient,
+    KVDurability,
     KvGetResult,
+    KVMode,
     KvPair,
     KvScanResult,
     KvTransaction,
 )
-from fitz_py.domains.lease import Lease, LeaseClient, LeaseInfo, LeaseSubscription
-from fitz_py.domains.notice import NoticeClient, NoticeMessage, NoticeSubscription
-from fitz_py.domains.queue import QueueClient, QueueItem, QueueSubscription
+from fitz_py.domains.lease import (
+    Lease,
+    LeaseClient,
+    LeaseHandler,
+    LeaseInfo,
+    LeaseSubscription,
+)
+from fitz_py.domains.notice import (
+    NoticeClient,
+    NoticeHandler,
+    NoticeMessage,
+    NoticeSubscription,
+)
+from fitz_py.domains.queue import (
+    QueueAvailabilityHandler,
+    QueueClient,
+    QueueItem,
+    QueueSubscription,
+)
 from fitz_py.domains.rpc import (
     InboundRpcRequest,
     ResponseFrame,
     ResponseWriter,
     RpcClient,
+    RpcHandler,
     RpcSubscription,
 )
-from fitz_py.domains.schedule import ScheduleClient, ScheduleEntry, ScheduleSubscription
+from fitz_py.domains.schedule import (
+    ScheduleClient,
+    ScheduleEntry,
+    ScheduleHandler,
+    ScheduleNotification,
+    ScheduleSubscription,
+)
 from fitz_py.domains.stream import (
     StreamClient,
     StreamCommitNotification,
+    StreamHandler,
     StreamMetadata,
     StreamRecord,
     StreamSession,
@@ -27,6 +53,8 @@ from fitz_py.domains.stream import (
 
 __all__ = [
     "InboundRpcRequest",
+    "KVDurability",
+    "KVMode",
     "KvClient",
     "KvGetResult",
     "KvPair",
@@ -34,23 +62,30 @@ __all__ = [
     "KvTransaction",
     "Lease",
     "LeaseClient",
+    "LeaseHandler",
     "LeaseInfo",
     "LeaseSubscription",
     "NoticeClient",
+    "NoticeHandler",
     "NoticeMessage",
     "NoticeSubscription",
+    "QueueAvailabilityHandler",
     "QueueClient",
     "QueueItem",
     "QueueSubscription",
     "ResponseFrame",
     "ResponseWriter",
     "RpcClient",
+    "RpcHandler",
     "RpcSubscription",
     "ScheduleClient",
     "ScheduleEntry",
+    "ScheduleHandler",
+    "ScheduleNotification",
     "ScheduleSubscription",
     "StreamClient",
     "StreamCommitNotification",
+    "StreamHandler",
     "StreamMetadata",
     "StreamRecord",
     "StreamSession",

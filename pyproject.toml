@@ -54,8 +54,10 @@ asyncio_mode = "auto"
 build = "python -m build"
 lint = "ruff check ."
 test-unit = "pytest tests/unit"
+test-integration = "pytest tests/integration -v"
 test-conformance = "pytest tests/conformance -v"
 test-spec = "pytest tests/conformance -v"
+verify = "ruff check . && pytest tests/unit && pytest tests/integration -v && pytest tests/conformance -v"
 
 [tool.ruff]
 target-version = "py311"

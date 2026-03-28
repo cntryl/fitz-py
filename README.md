@@ -31,6 +31,13 @@ await client.close()
 
 The package is `asyncio`-first and does not provide a synchronous wrapper.
 
+## Parity Goals
+
+`fitz-py` tracks the Fitz client behavior implemented in `fitz-go` and `fitz-ts`.
+The Python SDK now exposes the same seven domains, typed Fitz/domain errors, retryability
+helpers via `is_retryable()`, reconnect-aware subscription restoration, and extended
+integration/conformance coverage for queue, lease, notice, and schedule lifecycle flows.
+
 ## Verification
 
 Fast local checks:
@@ -39,6 +46,12 @@ Fast local checks:
 python -m pip install -e ".[dev]"
 python -m ruff check .
 python -m pytest tests/unit
+```
+
+One-shot verification:
+
+```bash
+hatch run verify
 ```
 
 Broker-backed verification:

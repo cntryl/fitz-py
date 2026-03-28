@@ -5,7 +5,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from fitz_py.domains.base import DomainClient
-from fitz_py.errors import NoticeError
+from fitz_py.errors import NoticeError, notice_error
 from fitz_py.protocol.buffer import BufferReader, BufferWriter
 from fitz_py.protocol.messages import (
     MSG_NOTICE_NOTIFY,
@@ -63,7 +63,7 @@ class NoticeClient(DomainClient):
         reader = BufferReader(await self.request_frame(MSG_NOTICE_SUBSCRIBE, writer.build()))
         status = reader.read_u8()
         if status != 0:
-            raise NoticeError(f"SUBSCRIBE failed with status {status}", "SUBSCRIBE_FAILED", status)
+            raise notice_error(f"SUBSCRIBE failed with status {status}", status)
         has_sub_id = reader.read_u8() if not reader.is_eof() else 0
         if has_sub_id != 1 or reader.remaining_bytes() < 8:
             raise NoticeError("SUBSCRIBE response missing subscription id", "MISSING_SUB_ID")

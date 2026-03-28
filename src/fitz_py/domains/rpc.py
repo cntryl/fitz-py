@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 
 from fitz_py.domains.base import DomainClient
-from fitz_py.errors import ConnectionError, RpcError, TransportError
+from fitz_py.errors import ConnectionError, ErrRpcTimeout, TransportError, rpc_error
 from fitz_py.protocol.buffer import BufferReader, BufferWriter
 from fitz_py.protocol.messages import (
     MSG_RPC_ACK,
@@ -99,7 +99,7 @@ class RpcIterator(AsyncIterator[ResponseFrame]):
         except TimeoutError as exc:
             self._client.cleanup_pending_rpc(self._correlation_id)
             self._done = True
-            raise RpcError("RPC call timeout", "TIMEOUT") from exc
+            raise ErrRpcTimeout("RPC call timeout") from exc
         if frame is None:
             raise StopAsyncIteration
         return frame
@@ -135,7 +135,7 @@ class RpcClient(DomainClient):
             status = reader.read_u8()
             if status != 0:
                 self._pending.pop(correlation_id.hex(), None)
-                raise RpcError(f"REQUEST failed with status {status}", "REQUEST_FAILED", status)
+                raise rpc_error(f"REQUEST failed with status {status}", status)
             return iterator
         except Exception:
             self._pending.pop(correlation_id.hex(), None)
@@ -148,11 +148,7 @@ class RpcClient(DomainClient):
         reader = BufferReader(await self.request_frame(MSG_RPC_SUBSCRIBE_WORKER, writer.build()))
         status = reader.read_u8()
         if status != 0:
-            raise RpcError(
-                f"REGISTER_WORKER failed with status {status}",
-                "REGISTER_FAILED",
-                status,
-            )
+            raise rpc_error(f"REGISTER_WORKER failed with status {status}", status)
         self._workers[route] = handler
         return RpcSubscription(route, self._unregister_worker)
 

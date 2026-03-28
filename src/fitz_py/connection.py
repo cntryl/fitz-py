@@ -150,6 +150,7 @@ class Connection:
         await self._transport.connect()
         self._receive_task = asyncio.create_task(self._receive_loop())
 
+        self._set_state(ConnectionState.CONNECTED)
         self._set_state(ConnectionState.AUTHENTICATING)
         loop = asyncio.get_running_loop()
         self._auth_future = loop.create_future()

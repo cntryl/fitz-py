@@ -5,7 +5,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from fitz_py.domains.base import DomainClient
-from fitz_py.errors import LeaseError
+from fitz_py.errors import LeaseError, lease_error
 from fitz_py.protocol.buffer import BufferReader, BufferWriter
 from fitz_py.protocol.messages import (
     MSG_LEASE_ACQUIRE,
@@ -16,6 +16,7 @@ from fitz_py.protocol.messages import (
     MSG_LEASE_SUBSCRIBE,
     MSG_LEASE_UNSUBSCRIBE,
 )
+from fitz_py.protocol.response import assert_success
 
 LeaseHandler = Callable[[str], None | Awaitable[None]]
 
@@ -34,7 +35,9 @@ class Lease:
     _client: "LeaseClient"
 
     async def extend(self, ttl_secs: int) -> None:
-        await self._client.extend(self.route, self.token, ttl_secs)
+        new_token = await self._client.extend(self.route, self.token, ttl_secs)
+        if new_token is not None:
+            self.token = new_token
 
     async def release(self) -> None:
         await self._client.release(self.route, self.token)
@@ -67,7 +70,7 @@ class LeaseClient(DomainClient):
         reader = BufferReader(await self.request_frame(MSG_LEASE_ACQUIRE, writer.build()))
         status = reader.read_u8()
         if status != 0:
-            raise LeaseError(f"ACQUIRE failed with status {status}", "ACQUIRE_FAILED", status)
+            raise lease_error(f"ACQUIRE failed with status {status}", status)
         if not reader.is_eof():
             reader.read_u8()
         token = reader.read_u64_be() if not reader.is_eof() else None
@@ -75,18 +78,18 @@ class LeaseClient(DomainClient):
             raise LeaseError("ACQUIRE response missing fencing token", "MISSING_TOKEN")
         return Lease(route=route, token=token, _client=self)
 
-    async def extend(self, route: str, token: int, ttl_secs: int) -> None:
-        await self._send_token_ttl(MSG_LEASE_EXTEND, route, token, ttl_secs, "EXTEND")
+    async def extend(self, route: str, token: int, ttl_secs: int) -> int | None:
+        data = await self._send_token_ttl(MSG_LEASE_EXTEND, route, token, ttl_secs, "EXTEND")
+        if data and len(data) >= 8:
+            return BufferReader(data).read_u64_be()
+        return None
 
     async def release(self, route: str, token: int) -> None:
         writer = BufferWriter()
         writer.write_route(route)
         writer.write_route("")
         writer.write_u64_be(token)
-        reader = BufferReader(await self.request_frame(MSG_LEASE_RELEASE, writer.build()))
-        status = reader.read_u8() if not reader.is_eof() else 0
-        if status != 0:
-            raise LeaseError(f"RELEASE failed with status {status}", "RELEASE_FAILED", status)
+        assert_success(await self.request_frame(MSG_LEASE_RELEASE, writer.build()), "RELEASE")
 
     async def query(self, route: str) -> LeaseInfo:
         writer = BufferWriter()
@@ -94,7 +97,7 @@ class LeaseClient(DomainClient):
         reader = BufferReader(await self.request_frame(MSG_LEASE_QUERY, writer.build()))
         status = reader.read_u8()
         if status != 0:
-            raise LeaseError(f"QUERY failed with status {status}", "QUERY_FAILED", status)
+            raise lease_error(f"QUERY failed with status {status}", status)
         has_holder = reader.read_u8()
         if has_holder == 0:
             if not reader.is_eof():
@@ -113,7 +116,7 @@ class LeaseClient(DomainClient):
         reader = BufferReader(await self.request_frame(MSG_LEASE_SUBSCRIBE, writer.build()))
         status = reader.read_u8()
         if status != 0:
-            raise LeaseError(f"SUBSCRIBE failed with status {status}", "SUBSCRIBE_FAILED", status)
+            raise lease_error(f"SUBSCRIBE failed with status {status}", status)
         sub_id = reader.read_u64_be() if not reader.is_eof() else None
         if sub_id is None:
             raise LeaseError("SUBSCRIBE response missing subscription id", "MISSING_SUB_ID")
@@ -122,20 +125,20 @@ class LeaseClient(DomainClient):
 
     async def _send_token_ttl(
         self, message_type: int, route: str, token: int, ttl_secs: int, operation: str
-    ) -> None:
+    ) -> bytes:
         writer = BufferWriter()
         writer.write_route(route)
         writer.write_route("")
         writer.write_u64_be(token)
         writer.write_u64_be(ttl_secs)
-        reader = BufferReader(await self.request_frame(message_type, writer.build()))
-        status = reader.read_u8() if not reader.is_eof() else 0
-        if status != 0:
-            raise LeaseError(
-                f"{operation} failed with status {status}",
-                f"{operation}_FAILED",
-                status,
-            )
+        payload = await self.request_frame(message_type, writer.build())
+        try:
+            return assert_success(payload, operation)
+        except LeaseError:
+            raise
+        except Exception as exc:
+            message = str(exc)
+            raise _map_lease_protocol_error(message) from exc
 
     async def _unsubscribe(self, sub_id: int) -> None:
         subscription = self._subscriptions.pop(sub_id, None)
@@ -173,3 +176,14 @@ class LeaseClient(DomainClient):
         self._subscriptions.clear()
         for pattern, handler in snapshot:
             await self.subscribe(pattern, handler)
+
+
+def _map_lease_protocol_error(message: str) -> LeaseError:
+    normalized = message.lower()
+    if "held" in normalized:
+        return lease_error(message, 1)
+    if "not found" in normalized:
+        return lease_error(message, 2)
+    if "invalid" in normalized or "token" in normalized or "fence" in normalized:
+        return lease_error(message, 3)
+    return LeaseError(message, "ERROR")

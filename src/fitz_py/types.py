@@ -12,6 +12,7 @@ TokenProvider: TypeAlias = Callable[[], str | Awaitable[str]]
 class ConnectionState(str, Enum):
     DISCONNECTED = "DISCONNECTED"
     CONNECTING = "CONNECTING"
+    CONNECTED = "CONNECTED"
     AUTHENTICATING = "AUTHENTICATING"
     AUTHENTICATED = "AUTHENTICATED"
     RECONNECTING = "RECONNECTING"

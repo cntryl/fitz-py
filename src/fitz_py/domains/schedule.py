@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from fitz_py.domains.base import DomainClient
+from fitz_py.errors import ScheduleError, schedule_error
 from fitz_py.protocol.buffer import BufferReader, BufferWriter
 from fitz_py.protocol.messages import (
     MSG_SCHEDULE_CANCEL,
@@ -14,9 +16,16 @@ from fitz_py.protocol.messages import (
     MSG_SCHEDULE_SUBSCRIBE,
     MSG_SCHEDULE_UNSUBSCRIBE,
 )
-from fitz_py.protocol.response import assert_success
+from fitz_py.protocol.response import parse_standard_response
 
-ScheduleHandler = Callable[[bytes], None | Awaitable[None]]
+ScheduleHandler = Callable[["ScheduleNotification"], None | Awaitable[None]]
+
+_SCHEDULE_ROUTE_RE = re.compile(r"^schedule://([^/*]+)/([^/*]+)/([^/*]+)/([^/*]+)$")
+
+
+@dataclass(slots=True)
+class ScheduleNotification:
+    payload: bytes
 
 
 @dataclass(slots=True)
@@ -27,46 +36,60 @@ class ScheduleEntry:
     payload: bytes
 
 
+@dataclass(slots=True)
+class _ScheduleSubscriptionState:
+    sub_id: int
+    handlers: dict[int, ScheduleHandler] = field(default_factory=dict)
+
+
 class ScheduleSubscription:
     def __init__(
         self,
-        sub_id: int | None,
+        sub_id: int,
         pattern: str,
-        unsubscribe: Callable[[str], Awaitable[None]],
+        handler: ScheduleHandler,
+        unsubscribe: Callable[[str, int], Awaitable[None]],
+        handler_id: int,
     ) -> None:
         self.sub_id = sub_id
         self.pattern = pattern
+        self.handler = handler
         self._unsubscribe = unsubscribe
+        self._handler_id = handler_id
 
     async def unsubscribe(self) -> None:
-        await self._unsubscribe(self.pattern)
+        await self._unsubscribe(self.pattern, self._handler_id)
 
 
 class ScheduleClient(DomainClient):
     def __init__(self, connection) -> None:
         super().__init__(connection)
-        self._subscriptions: dict[str, tuple[int | None, ScheduleHandler]] = {}
+        self._subscriptions_by_pattern: dict[str, _ScheduleSubscriptionState] = {}
+        self._patterns_by_sub_id: dict[int, str] = {}
         self._initialized = False
+        self._next_handler_id = 1
         self.connection.on_reconnect(self._restore_subscriptions)
 
-    async def create(self, route: str, cron: str, payload: bytes) -> str | None:
+    async def create(self, route: str, cron: str, payload: bytes = b"") -> str:
+        _assert_schedule_route(route, "route")
         writer = BufferWriter()
         writer.write_route(route)
         writer.write_string(cron)
         writer.write_u32_be(len(payload))
         writer.write_bytes(payload)
-        data = assert_success(
+        data = self._assert_success(
             await self.request_frame(MSG_SCHEDULE_CREATE, writer.build()), "CREATE"
         )
         reader = BufferReader(data)
         if not reader.is_eof() and reader.read_u8() == 1:
             return reader.read_string()
-        return None
+        return route
 
     async def cancel(self, route: str) -> None:
+        _assert_schedule_route(route, "route")
         writer = BufferWriter()
         writer.write_route(route)
-        assert_success(await self.request_frame(MSG_SCHEDULE_CANCEL, writer.build()), "CANCEL")
+        self._assert_success(await self.request_frame(MSG_SCHEDULE_CANCEL, writer.build()), "CANCEL")
 
     async def list(
         self, *, offset: int | None = None, limit: int | None = None
@@ -74,7 +97,7 @@ class ScheduleClient(DomainClient):
         writer = BufferWriter()
         writer.write_optional_u64(offset)
         writer.write_optional_u64(limit)
-        data = assert_success(await self.request_frame(MSG_SCHEDULE_LIST, writer.build()), "LIST")
+        data = self._assert_success(await self.request_frame(MSG_SCHEDULE_LIST, writer.build()), "LIST")
         reader = BufferReader(data)
         if reader.remaining_bytes() >= 8:
             reader.read_u64_be()
@@ -89,27 +112,47 @@ class ScheduleClient(DomainClient):
         return entries
 
     async def subscribe(self, pattern: str, handler: ScheduleHandler) -> ScheduleSubscription:
+        _assert_schedule_route(pattern, "pattern")
         self._init_notify_handler()
+
+        existing = self._subscriptions_by_pattern.get(pattern)
+        if existing is None:
+            sub_id = await self._subscribe_wire(pattern)
+            existing = _ScheduleSubscriptionState(sub_id=sub_id)
+            self._subscriptions_by_pattern[pattern] = existing
+            self._patterns_by_sub_id[sub_id] = pattern
+
+        handler_id = self._next_handler_id
+        self._next_handler_id += 1
+        existing.handlers[handler_id] = handler
+        return ScheduleSubscription(existing.sub_id, pattern, handler, self._unsubscribe, handler_id)
+
+    async def _subscribe_wire(self, pattern: str) -> int:
         writer = BufferWriter()
         writer.write_string(pattern)
-        data = assert_success(
-            await self.request_frame(MSG_SCHEDULE_SUBSCRIBE, writer.build()),
-            "SUBSCRIBE",
+        data = self._assert_success(
+            await self.request_frame(MSG_SCHEDULE_SUBSCRIBE, writer.build()), "SUBSCRIBE"
         )
         reader = BufferReader(data)
-        sub_id = reader.read_u64_be() if not reader.is_eof() and reader.read_u8() == 1 else None
-        self._subscriptions[pattern] = (sub_id, handler)
-        return ScheduleSubscription(sub_id, pattern, self._unsubscribe)
+        has_sub_id = reader.read_u8() if not reader.is_eof() else 0
+        if has_sub_id != 1 or reader.remaining_bytes() < 8:
+            raise ScheduleError("SUBSCRIBE response missing subscription id", "MISSING_SUB_ID")
+        return reader.read_u64_be()
 
-    async def _unsubscribe(self, pattern: str) -> None:
-        if pattern not in self._subscriptions:
+    async def _unsubscribe(self, pattern: str, handler_id: int) -> None:
+        subscription = self._subscriptions_by_pattern.get(pattern)
+        if subscription is None:
             return
-        self._subscriptions.pop(pattern, None)
+        subscription.handlers.pop(handler_id, None)
+        if subscription.handlers:
+            return
+
+        self._subscriptions_by_pattern.pop(pattern, None)
+        self._patterns_by_sub_id.pop(subscription.sub_id, None)
         writer = BufferWriter()
         writer.write_string(pattern)
-        assert_success(
-            await self.request_frame(MSG_SCHEDULE_UNSUBSCRIBE, writer.build()),
-            "UNSUBSCRIBE",
+        self._assert_success(
+            await self.request_frame(MSG_SCHEDULE_UNSUBSCRIBE, writer.build()), "UNSUBSCRIBE"
         )
 
     def _init_notify_handler(self) -> None:
@@ -119,9 +162,16 @@ class ScheduleClient(DomainClient):
 
         def handler(payload: bytes) -> None:
             try:
-                actual_payload = _decode_schedule_notification(payload)
-                for _, callback in self._subscriptions.values():
-                    result = callback(actual_payload)
+                sub_id, actual_payload = _decode_schedule_notification(payload)
+                pattern = self._patterns_by_sub_id.get(sub_id)
+                if pattern is None:
+                    return
+                subscription = self._subscriptions_by_pattern.get(pattern)
+                if subscription is None:
+                    return
+                notification = ScheduleNotification(payload=actual_payload)
+                for callback in subscription.handlers.values():
+                    result = callback(notification)
                     if asyncio.iscoroutine(result):
                         asyncio.create_task(result)
             except Exception:
@@ -130,20 +180,51 @@ class ScheduleClient(DomainClient):
         self.connection.register_notification_handler(MSG_SCHEDULE_NOTIFY, handler)
 
     async def _restore_subscriptions(self) -> None:
-        if not self._subscriptions:
+        if not self._subscriptions_by_pattern:
             return
-        snapshot = list(self._subscriptions.items())
-        self._subscriptions.clear()
-        for pattern, (_, handler) in snapshot:
-            await self.subscribe(pattern, handler)
+        snapshot = [
+            (pattern, list(state.handlers.values()))
+            for pattern, state in self._subscriptions_by_pattern.items()
+        ]
+        self._subscriptions_by_pattern.clear()
+        self._patterns_by_sub_id.clear()
+        for pattern, handlers in snapshot:
+            for handler in handlers:
+                await self.subscribe(pattern, handler)
+
+    @staticmethod
+    def _assert_success(payload: bytes, operation: str) -> bytes:
+        result = parse_standard_response(payload)
+        if result.success:
+            return result.data
+        error_message = result.error or f"{operation} failed"
+        raise _map_schedule_protocol_error(f"{operation} failed: {error_message}")
 
 
-def _decode_schedule_notification(payload: bytes) -> bytes:
-    if len(payload) < 4:
-        return b""
-    bytes_only_length = int.from_bytes(payload[:4], "big")
-    if bytes_only_length == len(payload) - 4:
-        return payload[4:]
+def _assert_schedule_route(route: str, noun: str) -> None:
+    if not _SCHEDULE_ROUTE_RE.match(route):
+        raise ScheduleError(f"Invalid {noun}: {route}", "INVALID_ROUTE")
+
+
+def _decode_schedule_notification(payload: bytes) -> tuple[int, bytes]:
     reader = BufferReader(payload)
-    reader.read_u64_be()
-    return reader.read_bytes(reader.read_u32_be())
+    sub_id = reader.read_u64_be()
+    body = reader.read_bytes(reader.read_u32_be())
+    return sub_id, body
+
+
+def _map_schedule_protocol_error(message: str) -> ScheduleError:
+    normalized = message.lower()
+    if "not found" in normalized:
+        return schedule_error(message, 1)
+    if "task" in normalized and "not found" in normalized:
+        return schedule_error(message, 2)
+    if "cron" in normalized:
+        return schedule_error(message, 3)
+    if "delay" in normalized:
+        return schedule_error(message, 4)
+    if "timestamp" in normalized or "time" in normalized:
+        return schedule_error(message, 5)
+    if "invalid route" in normalized or "must be schedule://" in normalized:
+        return ScheduleError(message, "INVALID_ROUTE")
+    return ScheduleError(message, "ERROR")

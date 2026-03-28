@@ -26,7 +26,10 @@ def _broker_url(transport: str, auth_mode: AuthMode) -> str:
 
 
 def unique_route(prefix: str) -> str:
-    return f"{prefix}/{int(time.time() * 1000)}-{uuid.uuid4().hex}"
+    suffix = f"{int(time.time() * 1000)}-{uuid.uuid4().hex}"
+    if prefix == "schedule":
+        return f"{prefix}://integration-realm/{suffix}/res/run"
+    return f"{prefix}://integration-realm/{suffix}/res"
 
 
 @dataclass(slots=True)

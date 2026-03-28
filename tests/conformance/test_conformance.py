@@ -82,6 +82,8 @@ def _token_provider():
 def _unique_route(prefix: str) -> str:
     ts = int(time.time() * 1000)
     uid = uuid.uuid4().hex[:8]
+    if prefix == "schedule":
+        return f"{prefix}://conformance-realm/{ts}-{uid}/res/run"
     return f"{prefix}://conformance-realm/{ts}-{uid}/res"
 
 
@@ -985,6 +987,202 @@ async def test_cs015_shutdown_during_active_work() -> None:
     r = ScenarioResult(
         "CS-015",
         "shutdown during active work",
+        "P1",
+        CLIENT_NAME,
+        CONFORMANCE_TRANSPORT,
+        CONFORMANCE_AUTH_MODE,
+        "pass",
+        evidence,
+        0,
+    )
+    _record(r)
+    assert r.verdict == "pass"
+
+
+# ---------------------------------------------------------------------------
+# CS-016 — queue enqueue/reserve/complete lifecycle
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cs016_queue_enqueue_reserve_complete() -> None:
+    evidence: list[str] = []
+    verdict: Verdict = "pass"
+    client = await _new_client()
+    try:
+        route = _unique_route("queue")
+        msg_id = await client.queue().enqueue(route, b"cs016-payload")
+        evidence.append(f"enqueued message id={msg_id}")
+
+        items = await client.queue().reserve(route, 30, batch_size=1)
+        assert len(items) == 1, f"expected 1 reserved item, got {len(items)}"
+        assert items[0].body == b"cs016-payload"
+        evidence.append("reserved item matches payload")
+
+        await items[0].complete()
+        evidence.append("message completed")
+
+        empty = await client.queue().reserve(route, 30, batch_size=1)
+        if empty:
+            verdict = "partial"
+            evidence.append(f"expected empty queue after complete, got {len(empty)} items")
+        else:
+            evidence.append("queue empty after complete")
+    finally:
+        await client.close()
+
+    r = ScenarioResult(
+        "CS-016",
+        "queue enqueue/reserve/complete lifecycle",
+        "P1",
+        CLIENT_NAME,
+        CONFORMANCE_TRANSPORT,
+        CONFORMANCE_AUTH_MODE,
+        verdict,
+        evidence,
+        0,
+    )
+    _record(r)
+    assert r.verdict in ("pass", "partial")
+
+
+# ---------------------------------------------------------------------------
+# CS-017 — lease acquire/contention/release lifecycle
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cs017_lease_acquire_contention_release() -> None:
+    evidence: list[str] = []
+    client1 = await _new_client()
+    client2 = await _new_client()
+    try:
+        route = _unique_route("lease")
+        lease1 = await client1.lease().acquire(route, 30)
+        evidence.append("client1 acquired lease")
+
+        caught: Exception | None = None
+        try:
+            await client2.lease().acquire(route, 30)
+        except Exception as exc:
+            caught = exc
+
+        assert caught is not None, "expected contention error for second lease acquire"
+        evidence.append(f"client2 rejected while held: {type(caught).__name__}")
+
+        await lease1.release()
+        evidence.append("client1 released lease")
+
+        lease2 = await client2.lease().acquire(route, 30)
+        evidence.append("client2 acquired lease after release")
+        await lease2.release()
+    finally:
+        await client1.close()
+        await client2.close()
+
+    r = ScenarioResult(
+        "CS-017",
+        "lease acquire/contention/release lifecycle",
+        "P1",
+        CLIENT_NAME,
+        CONFORMANCE_TRANSPORT,
+        CONFORMANCE_AUTH_MODE,
+        "pass",
+        evidence,
+        0,
+    )
+    _record(r)
+    assert r.verdict == "pass"
+
+
+# ---------------------------------------------------------------------------
+# CS-018 — notice subscribe/publish/deliver lifecycle
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cs018_notice_subscribe_publish_deliver() -> None:
+    evidence: list[str] = []
+    verdict: Verdict = "pass"
+    client = await _new_client()
+    try:
+        route = _unique_route("notice")
+        received: list[bytes] = []
+        delivered = asyncio.Event()
+
+        async def _handler(message) -> None:
+            received.append(message.body)
+            delivered.set()
+
+        sub = await client.notice().subscribe(route, _handler)
+        evidence.append("subscribed to route")
+
+        await client.notice().publish(route, b"cs018-msg")
+        await asyncio.wait_for(delivered.wait(), timeout=5.0)
+        assert received == [b"cs018-msg"]
+        evidence.append("handler received message")
+
+        await sub.unsubscribe()
+        evidence.append("unsubscribed")
+
+        delivered.clear()
+        await client.notice().publish(route, b"after-unsub")
+        try:
+            await asyncio.wait_for(delivered.wait(), timeout=0.5)
+            verdict = "partial"
+            evidence.append("message delivered after unsubscribe")
+        except asyncio.TimeoutError:
+            evidence.append("no delivery after unsubscribe")
+    finally:
+        await client.close()
+
+    r = ScenarioResult(
+        "CS-018",
+        "notice subscribe/publish/deliver lifecycle",
+        "P1",
+        CLIENT_NAME,
+        CONFORMANCE_TRANSPORT,
+        CONFORMANCE_AUTH_MODE,
+        verdict,
+        evidence,
+        0,
+    )
+    _record(r)
+    assert r.verdict in ("pass", "partial")
+
+
+# ---------------------------------------------------------------------------
+# CS-019 — schedule create/subscribe/cancel lifecycle
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cs019_schedule_create_subscribe_cancel() -> None:
+    evidence: list[str] = []
+    client = await _new_client()
+    try:
+        route = _unique_route("schedule")
+
+        async def _handler(_notification) -> None:
+            return None
+
+        sub = await client.schedule().subscribe(route, _handler)
+        evidence.append("subscribed to schedule route")
+
+        schedule_id = await client.schedule().create(route, "0 9 * * 1", b"cs019-payload")
+        evidence.append(f"schedule created id={schedule_id or route}")
+
+        await client.schedule().cancel(schedule_id or route)
+        evidence.append("schedule cancelled")
+
+        await sub.unsubscribe()
+        evidence.append("unsubscribed")
+    finally:
+        await client.close()
+
+    r = ScenarioResult(
+        "CS-019",
+        "schedule create/subscribe/cancel lifecycle",
         "P1",
         CLIENT_NAME,
         CONFORMANCE_TRANSPORT,

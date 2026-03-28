@@ -5,7 +5,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from fitz_py.domains.base import DomainClient
-from fitz_py.errors import QueueError
+from fitz_py.errors import QueueError, queue_error
 from fitz_py.protocol.buffer import BufferReader, BufferWriter
 from fitz_py.protocol.messages import (
     MSG_QUEUE_AVAILABILITY_NOTIFY,
@@ -69,7 +69,7 @@ class QueueClient(DomainClient):
         reader = BufferReader(await self.request_frame(MSG_QUEUE_ENQUEUE, writer.build()))
         status = reader.read_u8()
         if status != 0:
-            raise QueueError(f"ENQUEUE failed with status {status}", "ENQUEUE_FAILED", status)
+            raise queue_error(f"ENQUEUE failed with status {status}", status)
         return reader.read_u64_be() if not reader.is_eof() else 0
 
     async def reserve(
@@ -92,7 +92,7 @@ class QueueClient(DomainClient):
         reader = BufferReader(await self.request_frame(MSG_QUEUE_RESERVE, writer.build()))
         status = reader.read_u8()
         if status != 0:
-            raise QueueError(f"RESERVE failed with status {status}", "RESERVE_FAILED", status)
+            raise queue_error(f"RESERVE failed with status {status}", status)
         if reader.is_eof():
             return []
         count = reader.read_u32_be()
@@ -111,7 +111,7 @@ class QueueClient(DomainClient):
         reader = BufferReader(await self.request_frame(MSG_QUEUE_SUBSCRIBE, writer.build()))
         status = reader.read_u8()
         if status != 0:
-            raise QueueError(f"SUBSCRIBE failed with status {status}", "SUBSCRIBE_FAILED", status)
+            raise queue_error(f"SUBSCRIBE failed with status {status}", status)
         has_sub_id = reader.read_u8() if not reader.is_eof() else 0
         if has_sub_id != 1 or reader.is_eof():
             raise QueueError("SUBSCRIBE response missing subscription id", "MISSING_SUB_ID")
@@ -127,7 +127,7 @@ class QueueClient(DomainClient):
         reader = BufferReader(await self.request_frame(MSG_QUEUE_COMPLETE, writer.build()))
         status = reader.read_u8()
         if status != 0:
-            raise QueueError(f"COMPLETE failed with status {status}", "COMPLETE_FAILED", status)
+            raise queue_error(f"COMPLETE failed with status {status}", status)
 
     async def _extend(self, route: str, item_id: int, token: int, lease_seconds: int) -> None:
         writer = BufferWriter()
@@ -138,7 +138,7 @@ class QueueClient(DomainClient):
         reader = BufferReader(await self.request_frame(MSG_QUEUE_EXTEND, writer.build()))
         status = reader.read_u8()
         if status != 0:
-            raise QueueError(f"EXTEND failed with status {status}", "EXTEND_FAILED", status)
+            raise queue_error(f"EXTEND failed with status {status}", status)
 
     async def _unsubscribe(self, sub_id: int) -> None:
         subscription = self._subscriptions.pop(sub_id, None)

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from fitz_py.domains.base import DomainClient
-from fitz_py.errors import KvError
+from fitz_py.errors import KvError, kv_error
 from fitz_py.protocol.buffer import BufferReader, BufferWriter
 from fitz_py.protocol.messages import (
     MSG_KV_BEGIN,
@@ -63,7 +63,7 @@ class KvTransaction:
         reader = BufferReader(await self._connection.request(MSG_KV_GET, writer.build()))
         status = reader.read_u8()
         if status != 0:
-            raise KvError(f"GET failed with status {status}", "GET_FAILED", status)
+            raise kv_error(f"GET failed with status {status}", status)
         found = not reader.is_eof() and reader.read_u8() == 1
         if not found or reader.is_eof():
             return KvGetResult(found=False)
@@ -127,7 +127,7 @@ class KvTransaction:
         reader = BufferReader(await self._connection.request(MSG_KV_SCAN, writer.build()))
         status = reader.read_u8()
         if status != 0:
-            raise KvError(f"SCAN failed with status {status}", "SCAN_FAILED", status)
+            raise kv_error(f"SCAN failed with status {status}", status)
         if reader.is_eof():
             return KvScanResult(items=[])
         count = reader.read_u32_be()
@@ -166,11 +166,7 @@ class KvTransaction:
         reader = BufferReader(await self._connection.request(message_type, payload))
         status = reader.read_u8()
         if status != 0:
-            raise KvError(
-                f"{operation} failed with status {status}",
-                f"{operation}_FAILED",
-                status,
-            )
+            raise kv_error(f"{operation} failed with status {status}", status)
 
 
 class KvClient(DomainClient):
@@ -188,7 +184,7 @@ class KvClient(DomainClient):
         reader = BufferReader(await self.request_frame(MSG_KV_BEGIN, writer.build()))
         status = reader.read_u8()
         if status != 0:
-            raise KvError(f"BEGIN failed with status {status}", "BEGIN_FAILED", status)
+            raise kv_error(f"BEGIN failed with status {status}", status)
         tx_id = reader.read_u64_be() if not reader.is_eof() else None
         if tx_id is None:
             raise KvError("BEGIN response missing transaction id", "MISSING_TX_ID")

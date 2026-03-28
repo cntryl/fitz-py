@@ -5,7 +5,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from fitz_py.domains.base import DomainClient
-from fitz_py.errors import StreamError
+from fitz_py.errors import StreamError, stream_error
 from fitz_py.protocol.buffer import BufferReader, BufferWriter
 from fitz_py.protocol.messages import (
     MSG_STREAM_APPEND,
@@ -81,7 +81,7 @@ class StreamSession:
         reader = BufferReader(await self._connection.request(MSG_STREAM_APPEND, writer.build()))
         status = reader.read_u8()
         if status != 0:
-            raise StreamError(f"APPEND failed with status {status}", "APPEND_FAILED", status)
+            raise stream_error(f"APPEND failed with status {status}", status)
         if not reader.is_eof():
             has_session = reader.read_u8()
             if has_session == 1 and reader.remaining_bytes() >= 8:
@@ -110,11 +110,7 @@ class StreamSession:
         reader = BufferReader(await self._connection.request(message_type, payload))
         status = reader.read_u8() if not reader.is_eof() else 0
         if status != 0:
-            raise StreamError(
-                f"{operation} failed with status {status}",
-                f"{operation}_FAILED",
-                status,
-            )
+            raise stream_error(f"{operation} failed with status {status}", status)
 
 
 class StreamClient(DomainClient):
@@ -139,7 +135,7 @@ class StreamClient(DomainClient):
         reader = BufferReader(await self.request_frame(MSG_STREAM_BEGIN, writer.build()))
         status = reader.read_u8()
         if status != 0:
-            raise StreamError(f"BEGIN failed with status {status}", "BEGIN_FAILED", status)
+            raise stream_error(f"BEGIN failed with status {status}", status)
         has_session = reader.read_u8() if not reader.is_eof() else 0
         if has_session != 1 or reader.remaining_bytes() < 8:
             raise StreamError("BEGIN response missing session id", "MISSING_SESSION_ID")
@@ -162,7 +158,7 @@ class StreamClient(DomainClient):
         reader = BufferReader(await self.request_frame(MSG_STREAM_READ, writer.build()))
         status, data = _read_wrapped_stream_response(reader)
         if status != 0:
-            raise StreamError(f"READ failed with status {status}", "READ_FAILED", status)
+            raise stream_error(f"READ failed with status {status}", status)
         if not data:
             return []
         inner = BufferReader(data)
@@ -180,7 +176,7 @@ class StreamClient(DomainClient):
         reader = BufferReader(await self.request_frame(MSG_STREAM_LAST, writer.build()))
         status, data = _read_wrapped_stream_response(reader)
         if status != 0:
-            raise StreamError(f"LAST failed with status {status}", "LAST_FAILED", status)
+            raise stream_error(f"LAST failed with status {status}", status)
         if not data:
             return None
         inner = BufferReader(data)
@@ -192,7 +188,7 @@ class StreamClient(DomainClient):
         reader = BufferReader(await self.request_frame(MSG_STREAM_GET_METADATA, writer.build()))
         status, data = _read_wrapped_stream_response(reader)
         if status != 0:
-            raise StreamError(f"METADATA failed with status {status}", "METADATA_FAILED", status)
+            raise stream_error(f"METADATA failed with status {status}", status)
         if not data:
             return StreamMetadata(first_offset=0, last_offset=0, record_count=0)
         inner = BufferReader(data)
@@ -209,7 +205,7 @@ class StreamClient(DomainClient):
         reader = BufferReader(await self.request_frame(MSG_STREAM_SUBSCRIBE, writer.build()))
         status = reader.read_u8()
         if status != 0:
-            raise StreamError(f"SUBSCRIBE failed with status {status}", "SUBSCRIBE_FAILED", status)
+            raise stream_error(f"SUBSCRIBE failed with status {status}", status)
         has_sub_id = reader.read_u8() if not reader.is_eof() else 0
         if has_sub_id != 1 or reader.is_eof():
             raise StreamError("SUBSCRIBE response missing subscription id", "MISSING_SUB_ID")
