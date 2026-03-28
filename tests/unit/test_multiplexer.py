@@ -4,6 +4,7 @@ import asyncio
 
 import pytest
 
+from fitz_py.errors import TimeoutError
 from fitz_py.multiplexer import Multiplexer
 
 
@@ -28,3 +29,31 @@ def test_multiplexer_ignores_optional_response() -> None:
     mux.set_connected()
     mux.expect_optional_response(500)
     mux.dispatch(500, b"ok")
+
+
+@pytest.mark.asyncio
+async def test_multiplexer_clears_pending_on_send_failure() -> None:
+    mux = Multiplexer()
+    mux.set_connected()
+
+    async def send(_data: bytes) -> None:
+        raise RuntimeError("send failed")
+
+    with pytest.raises(RuntimeError, match="send failed"):
+        await mux.request(101, b"frame", send, 1000)
+
+    assert 101 not in mux._pending  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_multiplexer_times_out_and_clears_pending() -> None:
+    mux = Multiplexer()
+    mux.set_connected()
+
+    async def send(_data: bytes) -> None:
+        return None
+
+    with pytest.raises(TimeoutError, match="Request timeout"):
+        await mux.request(102, b"frame", send, 1)
+
+    assert 102 not in mux._pending  # type: ignore[attr-defined]

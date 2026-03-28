@@ -57,6 +57,7 @@ test-unit = "pytest tests/unit"
 test-integration = "pytest tests/integration -v"
 test-conformance = "pytest tests/conformance -v"
 test-spec = "pytest tests/conformance -v"
+bench-hotpath = "python artifacts/benchmarks/hotpath.py"
 verify = "ruff check . && pytest tests/unit && pytest tests/integration -v && pytest tests/conformance -v"
 
 [tool.ruff]

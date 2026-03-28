@@ -48,6 +48,14 @@ python -m ruff check .
 python -m pytest tests/unit
 ```
 
+Hot-path microbenchmarks:
+
+```bash
+python artifacts/benchmarks/hotpath.py --iterations 10000
+# or
+hatch run bench-hotpath
+```
+
 One-shot verification:
 
 ```bash

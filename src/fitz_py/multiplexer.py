@@ -63,12 +63,7 @@ class Multiplexer:
         future: asyncio.Future[bytes] = loop.create_future()
 
         def on_timeout() -> None:
-            queue = self._pending.get(message_type)
-            if queue is None:
-                return
-            self._pending[message_type] = deque(item for item in queue if item.future is not future)
-            if not self._pending[message_type]:
-                self._pending.pop(message_type, None)
+            self._remove_pending_future(message_type, future)
             if not future.done():
                 future.set_exception(
                     TimeoutError(
@@ -84,16 +79,22 @@ class Multiplexer:
         try:
             await send(frame_data)
             return await future
-        except Exception:
+        except BaseException:
             timeout_handle.cancel()
-            queue = self._pending.get(message_type)
-            if queue is not None:
-                self._pending[message_type] = deque(
-                    item for item in queue if item.future is not future
-                )
-                if not self._pending[message_type]:
-                    self._pending.pop(message_type, None)
+            self._remove_pending_future(message_type, future)
             raise
+
+    def _remove_pending_future(self, message_type: int, future: asyncio.Future[bytes]) -> None:
+        queue = self._pending.get(message_type)
+        if queue is None:
+            return
+
+        filtered = deque(item for item in queue if item.future is not future)
+        if filtered:
+            self._pending[message_type] = filtered
+            return
+
+        self._pending.pop(message_type, None)
 
     def dispatch(self, message_type: int, payload: bytes) -> None:
         queue = self._pending.get(message_type)

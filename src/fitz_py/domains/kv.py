@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from fitz_py.domains.base import DomainClient
-from fitz_py.errors import KvError, kv_error
+from fitz_py.errors import ErrKvOperationNotAllowed, KvError, kv_error
 from fitz_py.protocol.buffer import BufferReader, BufferWriter
 from fitz_py.protocol.messages import (
     MSG_KV_BEGIN,
@@ -46,6 +46,7 @@ class KvTransaction:
         self._route = route
         self._tx_id = tx_id
         self._closed = False
+        self._closed_reason: str | None = None
 
     async def __aenter__(self) -> "KvTransaction":
         return self
@@ -55,6 +56,7 @@ class KvTransaction:
             await self.rollback()
 
     async def get(self, key: bytes) -> KvGetResult:
+        self._ensure_open("GET")
         writer = BufferWriter()
         writer.write_u64_be(self._tx_id)
         writer.write_route(self._route)
@@ -77,6 +79,7 @@ class KvTransaction:
         await self._write(MSG_KV_INSERT, key, value, "INSERT")
 
     async def delete(self, key: bytes) -> None:
+        self._ensure_open("DELETE")
         writer = BufferWriter()
         writer.write_u64_be(self._tx_id)
         writer.write_route(self._route)
@@ -85,6 +88,7 @@ class KvTransaction:
         await self._expect_status(MSG_KV_DELETE, writer.build(), "DELETE")
 
     async def delete_range(self, start_key: bytes, end_key: bytes) -> None:
+        self._ensure_open("DELETE_RANGE")
         writer = BufferWriter()
         writer.write_u64_be(self._tx_id)
         writer.write_route(self._route)
@@ -102,6 +106,7 @@ class KvTransaction:
         limit: int | None = None,
         reverse: bool = False,
     ) -> KvScanResult:
+        self._ensure_open("SCAN")
         writer = BufferWriter()
         writer.write_u64_be(self._tx_id)
         writer.write_route(self._route)
@@ -146,6 +151,7 @@ class KvTransaction:
         await self._finalize(MSG_KV_ROLLBACK, "ROLLBACK")
 
     async def _write(self, message_type: int, key: bytes, value: bytes, operation: str) -> None:
+        self._ensure_open(operation)
         writer = BufferWriter()
         writer.write_u64_be(self._tx_id)
         writer.write_route(self._route)
@@ -156,11 +162,22 @@ class KvTransaction:
         await self._expect_status(message_type, writer.build(), operation)
 
     async def _finalize(self, message_type: int, operation: str) -> None:
+        self._ensure_open(operation)
         writer = BufferWriter()
         writer.write_u64_be(self._tx_id)
         writer.write_route(self._route)
         await self._expect_status(message_type, writer.build(), operation)
         self._closed = True
+        self._closed_reason = "committed" if operation == "COMMIT" else "rolled back"
+
+    def _ensure_open(self, operation: str) -> None:
+        if not self._closed:
+            return
+
+        reason = self._closed_reason or "closed"
+        raise ErrKvOperationNotAllowed(
+            f"{operation} not allowed: transaction already {reason}"
+        )
 
     async def _expect_status(self, message_type: int, payload: bytes, operation: str) -> None:
         reader = BufferReader(await self._connection.request(message_type, payload))
