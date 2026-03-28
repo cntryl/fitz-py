@@ -45,11 +45,14 @@ async def test_connection_emits_connected_before_authenticated() -> None:
 
     connection._set_state = record  # type: ignore[method-assign]
 
-    await connection.connect()
+    try:
+        await connection.connect()
 
-    assert seen[:4] == [
-        ConnectionState.CONNECTING,
-        ConnectionState.CONNECTED,
-        ConnectionState.AUTHENTICATING,
-        ConnectionState.AUTHENTICATED,
-    ]
+        assert seen[:4] == [
+            ConnectionState.CONNECTING,
+            ConnectionState.CONNECTED,
+            ConnectionState.AUTHENTICATING,
+            ConnectionState.AUTHENTICATED,
+        ]
+    finally:
+        await connection.close()
