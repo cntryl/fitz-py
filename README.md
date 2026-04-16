@@ -89,10 +89,17 @@ The conformance harness writes JSON results to `artifacts/conformance-results.js
 - `tests/integration`: broker-backed integration coverage
 - `tests/conformance`: release-gate conformance coverage
 
-## Canonical Spec
+## Canonical Docs
 
 Canonical client behavior is defined by the server-owned docs in the Fitz repository:
 
-- `fitz/docs/clients/CLIENT_SPEC.md`
-- `fitz/docs/clients/CLIENT_ACCEPTANCE_CRITERIA.md`
-- `fitz/docs/clients/CLIENT_IMPLEMENTATION_GUIDE.md`
+- [CLIENT_SPEC.md](../fitz/docs/clients/CLIENT_SPEC.md)
+- [CLIENT_ACCEPTANCE_CRITERIA.md](../fitz/docs/clients/CLIENT_ACCEPTANCE_CRITERIA.md)
+- [CLIENT_IMPLEMENTATION_GUIDE.md](../fitz/docs/clients/CLIENT_IMPLEMENTATION_GUIDE.md)
+- [CONNECTION_FLOW.md](../fitz/docs/clients/CONNECTION_FLOW.md)
+
+## Documentation
+
+- [`docs/README.md`](docs/README.md)
+- [`CLIENT_SPEC.md`](CLIENT_SPEC.md)
+- [`CLIENT_ACCEPTANCE_CRITERIA.md`](CLIENT_ACCEPTANCE_CRITERIA.md)
