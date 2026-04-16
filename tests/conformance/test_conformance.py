@@ -766,9 +766,9 @@ async def test_cs011_stream_receive_sequence() -> None:
     client = await _new_client()
     try:
         route = _unique_route("stream")
-        session = await client.stream().begin(route, expected_offset=0)
+        session = await client.stream().begin(route)
         for i in range(3):
-            await session.append(bytes([i * 10]))
+            await session.append(i, bytes([i * 10]))
         await session.commit()
         evidence.append("stream session appended 3 records")
 
@@ -819,9 +819,9 @@ async def test_cs012_stream_completion() -> None:
     client = await _new_client()
     try:
         route = _unique_route("stream")
-        session = await client.stream().begin(route, expected_offset=0)
-        await session.append(b"first")
-        await session.append(b"last")
+        session = await client.stream().begin(route)
+        await session.append(0, b"first")
+        await session.append(1, b"last")
         await session.commit()
         evidence.append("stream session committed")
 
@@ -861,20 +861,21 @@ async def test_cs013_stream_error_mid_flight() -> None:
     client = await _new_client()
     try:
         route = _unique_route("stream")
-        session = await client.stream().begin(route, expected_offset=0)
-        await session.append(b"record-1")
+        session = await client.stream().begin(route)
+        await session.append(0, b"record-1")
         await session.commit()
         evidence.append("written first record at offset 0")
 
         caught: Exception | None = None
         try:
-            # Expected offset 0 again — server should reject (stream already committed past 0)
-            await client.stream().begin(route, expected_offset=0)
+            # Expected offset 0 again — server should reject on append
+            wrong_session = await client.stream().begin(route)
+            await wrong_session.append(0, b"record-2")
         except Exception as exc:
             caught = exc
 
         assert caught is not None, "expected error on wrong expected offset"
-        evidence.append(f"begin with wrong offset raised {type(caught).__name__}: {caught}")
+        evidence.append(f"append with wrong offset raised {type(caught).__name__}: {caught}")
 
         # Client must remain usable
         kv_route = _unique_route("kv")

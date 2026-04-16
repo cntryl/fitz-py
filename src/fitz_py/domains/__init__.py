@@ -43,6 +43,7 @@ from fitz_py.domains.schedule import (
 )
 from fitz_py.domains.stream import (
     StreamClient,
+    StreamCommitMode,
     StreamCommitNotification,
     StreamHandler,
     StreamMetadata,
@@ -84,6 +85,7 @@ __all__ = [
     "ScheduleNotification",
     "ScheduleSubscription",
     "StreamClient",
+    "StreamCommitMode",
     "StreamCommitNotification",
     "StreamHandler",
     "StreamMetadata",

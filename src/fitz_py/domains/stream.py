@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from enum import IntEnum
 
 from fitz_py.domains.base import DomainClient
 from fitz_py.errors import StreamError, stream_error
@@ -36,10 +38,22 @@ class StreamMetadata:
     record_count: int
 
 
+class StreamCommitMode(IntEnum):
+    BUFFERED = 0
+    SYNC = 1
+
+
 @dataclass(slots=True)
 class StreamCommitNotification:
     route: str
-    payload: bytes
+    event: str = ""
+    first_resource_offset: int = 0
+    last_resource_offset: int = 0
+    first_area_offset: int = 0
+    last_area_offset: int = 0
+    first_realm_offset: int = 0
+    last_realm_offset: int = 0
+    batch_size: int = 0
 
 
 class StreamSubscription:
@@ -67,9 +81,12 @@ class StreamSession:
         if not self._closed:
             await self.rollback()
 
-    async def append(self, body: bytes, metadata: bytes | None = None) -> int | None:
+    async def append(
+        self, expected_offset: int, body: bytes, metadata: bytes | None = None
+    ) -> int | None:
         writer = BufferWriter()
         writer.write_u64_be(self._session_id)
+        writer.write_u64_be(expected_offset)
         writer.write_u32_be(len(body))
         writer.write_bytes(body)
         if metadata:
@@ -93,10 +110,10 @@ class StreamSession:
             return None
         return BufferReader(data).read_u64_be()
 
-    async def commit(self) -> None:
+    async def commit(self, mode: int | StreamCommitMode = StreamCommitMode.BUFFERED) -> None:
         writer = BufferWriter()
         writer.write_u64_be(self._session_id)
-        writer.write_u8(0)
+        writer.write_u8(int(mode))
         await self._expect_status(MSG_STREAM_COMMIT, writer.build(), "COMMIT")
         self._closed = True
 
@@ -121,11 +138,10 @@ class StreamClient(DomainClient):
         self.connection.on_reconnect(self._restore_subscriptions)
 
     async def begin(
-        self, route: str, expected_offset: int = 0, ingest_metadata: bytes | None = None
+        self, route: str, ingest_metadata: bytes | None = None
     ) -> StreamSession:
         writer = BufferWriter()
         writer.write_route(route)
-        writer.write_u64_be(expected_offset)
         if ingest_metadata:
             writer.write_u8(1)
             writer.write_u32_be(len(ingest_metadata))
@@ -235,7 +251,7 @@ class StreamClient(DomainClient):
                 subscription = self._subscriptions.get(sub_id)
                 if subscription is None:
                     return
-                result = subscription[1](StreamCommitNotification(route=route, payload=body))
+                result = subscription[1](_decode_stream_commit_notification(route, body))
                 if asyncio.iscoroutine(result):
                     asyncio.create_task(result)
             except Exception:
@@ -263,3 +279,31 @@ def _read_wrapped_stream_response(reader: BufferReader) -> tuple[int, bytes]:
     if reader.is_eof():
         return 0, b""
     return 0, reader.read_bytes(reader.read_u32_be())
+
+
+def _decode_stream_commit_notification(route: str, payload: bytes) -> StreamCommitNotification:
+    notification = StreamCommitNotification(route=route)
+    if not payload:
+        return notification
+
+    try:
+        decoded = json.loads(payload)
+        if not isinstance(decoded, dict):
+            return notification
+
+        event = decoded.get("event", "")
+        if not isinstance(event, str):
+            return notification
+
+        notification.event = event
+        notification.first_resource_offset = int(decoded.get("first_resource_offset", 0))
+        notification.last_resource_offset = int(decoded.get("last_resource_offset", 0))
+        notification.first_area_offset = int(decoded.get("first_area_offset", 0))
+        notification.last_area_offset = int(decoded.get("last_area_offset", 0))
+        notification.first_realm_offset = int(decoded.get("first_realm_offset", 0))
+        notification.last_realm_offset = int(decoded.get("last_realm_offset", 0))
+        notification.batch_size = int(decoded.get("batch_size", 0))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return StreamCommitNotification(route=route)
+
+    return notification
