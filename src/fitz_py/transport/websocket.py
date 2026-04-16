@@ -53,7 +53,7 @@ class WebSocketTransport(Transport):
             raise TransportError(f"WebSocket receive failed: {exc}") from exc
 
         if isinstance(data, str):
-            return data.encode()
+            raise TransportError("WebSocket transport received text frame")
         return data
 
     def get_url(self) -> str:
