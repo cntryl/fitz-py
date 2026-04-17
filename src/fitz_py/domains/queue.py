@@ -5,6 +5,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from fitz_py.domains.base import DomainClient
+from fitz_py.domains._routes import is_exact_route_shape, is_selector_route_shape
 from fitz_py.errors import QueueError, queue_error
 from fitz_py.protocol.buffer import BufferReader, BufferWriter
 from fitz_py.protocol.messages import (
@@ -58,6 +59,7 @@ class QueueClient(DomainClient):
         self.connection.on_reconnect(self._restore_subscriptions)
 
     async def enqueue(self, route: str, body: bytes, *, delay_ms: int | None = None) -> int:
+        _assert_queue_route(route)
         writer = BufferWriter()
         writer.write_route(route)
         writer.write_u32_be(len(body))
@@ -80,6 +82,7 @@ class QueueClient(DomainClient):
         batch_size: int = 1,
         wait_seconds: int = 0,
     ) -> list[QueueItem]:
+        _assert_queue_reserve_route(route)
         writer = BufferWriter()
         writer.write_route(route)
         writer.write_u64_be(lease_seconds)
@@ -105,6 +108,7 @@ class QueueClient(DomainClient):
         return items
 
     async def subscribe(self, pattern: str, handler: QueueAvailabilityHandler) -> QueueSubscription:
+        _assert_queue_subscription_pattern(pattern)
         self._init_notify_handler()
         writer = BufferWriter()
         writer.write_route(pattern)
@@ -178,3 +182,27 @@ class QueueClient(DomainClient):
         self._subscriptions.clear()
         for pattern, handler in snapshot:
             await self.subscribe(pattern, handler)
+
+
+def _assert_queue_route(route: str) -> None:
+    if not is_exact_route_shape(route, "queue", 3):
+        raise QueueError(
+            f"Invalid queue route: {route} (expected queue://{{realm}}/{{area}}/{{resource}}, no empty segments or wildcards)",
+            "INVALID_ROUTE",
+        )
+
+
+def _assert_queue_reserve_route(route: str) -> None:
+    if not is_selector_route_shape(route, "queue", 3):
+        raise QueueError(
+            f"Invalid queue route: {route} (expected queue://{{realm}}/{{area}}/{{resource}} or queue://{{realm}}/{{area}}/*, no empty segments or wildcards)",
+            "INVALID_ROUTE",
+        )
+
+
+def _assert_queue_subscription_pattern(pattern: str) -> None:
+    if not is_selector_route_shape(pattern, "queue", 3, allow_realm_wildcard=True):
+        raise QueueError(
+            f"Invalid queue pattern: {pattern} (expected queue://{{realm}}/{{area}}/{{resource}}, queue://{{realm}}/{{area}}/*, or queue://{{realm}}/**)",
+            "INVALID_ROUTE",
+        )

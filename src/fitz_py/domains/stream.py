@@ -140,6 +140,7 @@ class StreamClient(DomainClient):
     async def begin(
         self, route: str, ingest_metadata: bytes | None = None
     ) -> StreamSession:
+        _assert_stream_route(route)
         writer = BufferWriter()
         writer.write_route(route)
         if ingest_metadata:
@@ -164,6 +165,7 @@ class StreamClient(DomainClient):
         limit: int = 100,
         max_bytes: int | None = None,
     ) -> list[StreamRecord]:
+        _assert_stream_pattern(route)
         writer = BufferWriter()
         writer.write_route(route)
         writer.write_u64_be(start_offset)
@@ -187,6 +189,7 @@ class StreamClient(DomainClient):
         return records
 
     async def peek(self, route: str) -> StreamRecord | None:
+        _assert_stream_route(route)
         writer = BufferWriter()
         writer.write_route(route)
         reader = BufferReader(await self.request_frame(MSG_STREAM_LAST, writer.build()))
@@ -199,6 +202,7 @@ class StreamClient(DomainClient):
         return StreamRecord(offset=inner.read_u64_be(), body=inner.read_bytes(inner.read_u32_be()))
 
     async def metadata(self, route: str) -> StreamMetadata:
+        _assert_stream_route(route)
         writer = BufferWriter()
         writer.write_route(route)
         reader = BufferReader(await self.request_frame(MSG_STREAM_GET_METADATA, writer.build()))
@@ -215,6 +219,7 @@ class StreamClient(DomainClient):
         )
 
     async def subscribe(self, pattern: str, handler: StreamHandler) -> StreamSubscription:
+        _assert_stream_pattern(pattern)
         self._init_notify_handler()
         writer = BufferWriter()
         writer.write_route(pattern)
@@ -282,6 +287,19 @@ def _read_wrapped_stream_response(reader: BufferReader) -> tuple[int, bytes]:
 
 
 def _decode_stream_commit_notification(route: str, payload: bytes) -> StreamCommitNotification:
+    def _assert_stream_route(route: str) -> None:
+        if not is_exact_route_shape(route, "stream", 3):
+            raise StreamError(
+                f"Invalid stream route: {route} (expected stream://{{realm}}/{{area}}/{{resource}}, no empty segments or wildcards)",
+                "INVALID_ROUTE",
+            )
+
+    def _assert_stream_pattern(pattern: str) -> None:
+        if not is_selector_route_shape(pattern, "stream", 3, allow_realm_wildcard=True):
+            raise StreamError(
+                f"Invalid stream pattern: {pattern} (expected stream://{{realm}}/{{area}}/{{resource}}, stream://{{realm}}/{{area}}/*, or stream://{{realm}}/**)",
+                "INVALID_ROUTE",
+            )
     notification = StreamCommitNotification(route=route)
     if not payload:
         return notification

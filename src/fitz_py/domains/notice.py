@@ -5,6 +5,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 from fitz_py.domains.base import DomainClient
+from fitz_py.domains._routes import is_exact_route_shape, is_selector_route_shape
 from fitz_py.errors import NoticeError, notice_error
 from fitz_py.protocol.buffer import BufferReader, BufferWriter
 from fitz_py.protocol.messages import (
@@ -58,6 +59,7 @@ class NoticeClient(DomainClient):
         self.connection.on_reconnect(self._restore_subscriptions)
 
     async def publish(self, route: str, body: bytes) -> None:
+        _assert_notice_route(route)
         writer = BufferWriter()
         writer.write_route(route)
         writer.write_u32_be(len(body))
@@ -72,6 +74,7 @@ class NoticeClient(DomainClient):
             raise
 
     async def subscribe(self, pattern: str, handler: NoticeHandler) -> NoticeSubscription:
+        _assert_notice_pattern(pattern)
         self._init_notify_handler()
         existing = self._subscriptions_by_pattern.get(pattern)
         if existing is None:
@@ -155,3 +158,19 @@ class NoticeClient(DomainClient):
                 handlers=handlers,
             )
             self._patterns_by_sub_id[sub_id] = pattern
+
+
+def _assert_notice_route(route: str) -> None:
+    if not is_exact_route_shape(route, "notice", 3):
+        raise NoticeError(
+            f"Invalid notice route: {route} (expected notice://{{realm}}/{{area}}/{{resource}}, no empty segments or wildcards)",
+            "INVALID_ROUTE",
+        )
+
+
+def _assert_notice_pattern(pattern: str) -> None:
+    if not is_selector_route_shape(pattern, "notice", 3, allow_realm_wildcard=True):
+        raise NoticeError(
+            f"Invalid notice pattern: {pattern} (expected notice://{{realm}}/{{area}}/{{resource}}, notice://{{realm}}/{{area}}/*, or notice://{{realm}}/**)",
+            "INVALID_ROUTE",
+        )

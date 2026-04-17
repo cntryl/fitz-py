@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from fitz_py.domains.base import DomainClient
+from fitz_py.domains._routes import is_exact_route_shape
 from fitz_py.errors import ErrKvOperationNotAllowed, KvError, kv_error
 from fitz_py.protocol.buffer import BufferReader, BufferWriter
 from fitz_py.protocol.messages import (
@@ -194,6 +195,7 @@ class KvClient(DomainClient):
         mode: KVMode = "read_write",
         durability: KVDurability = "async",
     ) -> KvTransaction:
+        _assert_kv_route(route)
         writer = BufferWriter()
         writer.write_route(route)
         writer.write_u8(1 if mode == "read_write" else 0)
@@ -206,3 +208,11 @@ class KvClient(DomainClient):
         if tx_id is None:
             raise KvError("BEGIN response missing transaction id", "MISSING_TX_ID")
         return KvTransaction(self.connection, route, tx_id)
+
+
+def _assert_kv_route(route: str) -> None:
+    if not is_exact_route_shape(route, "kv", 3):
+        raise KvError(
+            f"Invalid kv route: {route} (expected kv://{{realm}}/{{area}}/{{resource}}, no empty segments or wildcards)",
+            "INVALID_ROUTE",
+        )

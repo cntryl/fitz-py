@@ -6,7 +6,8 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 
 from fitz_py.domains.base import DomainClient
-from fitz_py.errors import ConnectionError, ErrRpcTimeout, TransportError, rpc_error
+from fitz_py.domains._routes import is_concrete_route_shape
+from fitz_py.errors import ConnectionError, ErrRpcTimeout, RpcError, TransportError, rpc_error
 from fitz_py.protocol.buffer import BufferReader, BufferWriter
 from fitz_py.protocol.messages import (
     MSG_RPC_ACK,
@@ -118,6 +119,7 @@ class RpcClient(DomainClient):
         self.connection.on_reconnect(self._restore_workers)
 
     async def call(self, route: str, body: bytes, *, timeout_ms: int = 30000) -> RpcIterator:
+        _assert_rpc_route(route)
         self._init_handlers()
         correlation_id = os.urandom(16)
         iterator = RpcIterator(correlation_id, self, timeout_ms)
@@ -142,6 +144,7 @@ class RpcClient(DomainClient):
             raise
 
     async def register_worker(self, route: str, handler: RpcHandler) -> RpcSubscription:
+        _assert_rpc_route(route)
         self._init_handlers()
         writer = BufferWriter()
         writer.write_route(route)
@@ -234,3 +237,11 @@ def _is_benign_shutdown_error(error: Exception, connection) -> bool:
         return False
     lowered = str(error).lower()
     return "closed" in lowered or "not connected" in lowered or "reset" in lowered
+
+
+def _assert_rpc_route(route: str) -> None:
+    if not is_concrete_route_shape(route, "rpc"):
+        raise RpcError(
+            f"Invalid rpc route: {route} (expected rpc://{{realm}}/{{area}}/{{resource}} or any other concrete rpc route, no empty segments or wildcards)",
+            "INVALID_ROUTE",
+        )

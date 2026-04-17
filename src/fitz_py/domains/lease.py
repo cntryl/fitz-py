@@ -5,6 +5,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from fitz_py.domains.base import DomainClient
+from fitz_py.domains._routes import is_exact_route_shape
 from fitz_py.errors import LeaseError, lease_error
 from fitz_py.protocol.buffer import BufferReader, BufferWriter
 from fitz_py.protocol.messages import (
@@ -63,6 +64,7 @@ class LeaseClient(DomainClient):
         self.connection.on_reconnect(self._restore_subscriptions)
 
     async def acquire(self, route: str, ttl_secs: int) -> Lease:
+        _assert_lease_route(route)
         writer = BufferWriter()
         writer.write_route(route)
         writer.write_route("")
@@ -79,12 +81,14 @@ class LeaseClient(DomainClient):
         return Lease(route=route, token=token, _client=self)
 
     async def extend(self, route: str, token: int, ttl_secs: int) -> int | None:
+        _assert_lease_route(route)
         data = await self._send_token_ttl(MSG_LEASE_EXTEND, route, token, ttl_secs, "EXTEND")
         if data and len(data) >= 8:
             return BufferReader(data).read_u64_be()
         return None
 
     async def release(self, route: str, token: int) -> None:
+        _assert_lease_route(route)
         writer = BufferWriter()
         writer.write_route(route)
         writer.write_route("")
@@ -92,6 +96,7 @@ class LeaseClient(DomainClient):
         assert_success(await self.request_frame(MSG_LEASE_RELEASE, writer.build()), "RELEASE")
 
     async def query(self, route: str) -> LeaseInfo:
+        _assert_lease_route(route)
         writer = BufferWriter()
         writer.write_route(route)
         reader = BufferReader(await self.request_frame(MSG_LEASE_QUERY, writer.build()))
@@ -110,6 +115,7 @@ class LeaseClient(DomainClient):
         return LeaseInfo(is_held=True, owner=owner, ttl_remaining_secs=ttl_remaining_secs)
 
     async def subscribe(self, pattern: str, handler: LeaseHandler) -> LeaseSubscription:
+        _assert_lease_route(pattern)
         self._init_notify_handler()
         writer = BufferWriter()
         writer.write_route(pattern)
@@ -187,3 +193,11 @@ def _map_lease_protocol_error(message: str) -> LeaseError:
     if "invalid" in normalized or "token" in normalized or "fence" in normalized:
         return lease_error(message, 3)
     return LeaseError(message, "ERROR")
+
+
+def _assert_lease_route(route: str) -> None:
+    if not is_exact_route_shape(route, "lease", 3):
+        raise LeaseError(
+            f"Invalid lease route: {route} (expected lease://{{realm}}/{{area}}/{{resource}}, no empty segments or wildcards)",
+            "INVALID_ROUTE",
+        )

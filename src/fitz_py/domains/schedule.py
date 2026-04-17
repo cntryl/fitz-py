@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 from fitz_py.domains.base import DomainClient
+from fitz_py.domains._routes import is_exact_route_shape
 from fitz_py.errors import ScheduleError, schedule_error
 from fitz_py.protocol.buffer import BufferReader, BufferWriter
 from fitz_py.protocol.messages import (
@@ -19,8 +19,6 @@ from fitz_py.protocol.messages import (
 from fitz_py.protocol.response import parse_standard_response
 
 ScheduleHandler = Callable[["ScheduleNotification"], None | Awaitable[None]]
-
-_SCHEDULE_ROUTE_RE = re.compile(r"^schedule://([^/*]+)/([^/*]+)/([^/*]+)/([^/*]+)$")
 
 
 @dataclass(slots=True)
@@ -71,7 +69,7 @@ class ScheduleClient(DomainClient):
         self.connection.on_reconnect(self._restore_subscriptions)
 
     async def create(self, route: str, cron: str, payload: bytes = b"") -> str:
-        _assert_schedule_route(route, "route")
+        _assert_schedule_route(route)
         writer = BufferWriter()
         writer.write_route(route)
         writer.write_string(cron)
@@ -86,7 +84,7 @@ class ScheduleClient(DomainClient):
         return route
 
     async def cancel(self, route: str) -> None:
-        _assert_schedule_route(route, "route")
+        _assert_schedule_route(route)
         writer = BufferWriter()
         writer.write_route(route)
         self._assert_success(await self.request_frame(MSG_SCHEDULE_CANCEL, writer.build()), "CANCEL")
@@ -112,7 +110,7 @@ class ScheduleClient(DomainClient):
         return entries
 
     async def subscribe(self, pattern: str, handler: ScheduleHandler) -> ScheduleSubscription:
-        _assert_schedule_route(pattern, "pattern")
+        _assert_schedule_route(pattern)
         self._init_notify_handler()
 
         existing = self._subscriptions_by_pattern.get(pattern)
@@ -201,9 +199,12 @@ class ScheduleClient(DomainClient):
         raise _map_schedule_protocol_error(f"{operation} failed: {error_message}")
 
 
-def _assert_schedule_route(route: str, noun: str) -> None:
-    if not _SCHEDULE_ROUTE_RE.match(route):
-        raise ScheduleError(f"Invalid {noun}: {route}", "INVALID_ROUTE")
+def _assert_schedule_route(route: str) -> None:
+    if not is_exact_route_shape(route, "schedule", 4):
+        raise ScheduleError(
+            f"Invalid schedule route: {route} (expected schedule://{{realm}}/{{area}}/{{resource}}/{{operation}}, no empty segments or wildcards)",
+            "INVALID_ROUTE",
+        )
 
 
 def _decode_schedule_notification(payload: bytes) -> tuple[int, bytes]:

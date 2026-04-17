@@ -22,7 +22,7 @@ client = Client(
 
 await client.connect()
 
-tx = await client.kv().begin("kv://example/app")
+tx = await client.kv().begin("kv://example/app/users")
 result = await tx.get(b"key")
 await tx.rollback()
 
