@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from enum import IntEnum
 
 from fitz_py.domains.base import DomainClient
+from fitz_py.domains._routes import is_exact_route_shape, is_selector_route_shape
 from fitz_py.errors import StreamError, stream_error
 from fitz_py.protocol.buffer import BufferReader, BufferWriter
 from fitz_py.protocol.messages import (
@@ -286,20 +287,25 @@ def _read_wrapped_stream_response(reader: BufferReader) -> tuple[int, bytes]:
     return 0, reader.read_bytes(reader.read_u32_be())
 
 
-def _decode_stream_commit_notification(route: str, payload: bytes) -> StreamCommitNotification:
-    def _assert_stream_route(route: str) -> None:
-        if not is_exact_route_shape(route, "stream", 3):
-            raise StreamError(
-                f"Invalid stream route: {route} (expected stream://{{realm}}/{{area}}/{{resource}}, no empty segments or wildcards)",
-                "INVALID_ROUTE",
-            )
+def _assert_stream_route(route: str) -> None:
+    if not is_exact_route_shape(route, "stream", 3):
+        raise StreamError(
+            f"Invalid stream route: {route} (expected stream://{{realm}}/{{area}}/{{resource}}, no empty segments or wildcards)",
+            "INVALID_ROUTE",
+        )
 
-    def _assert_stream_pattern(pattern: str) -> None:
-        if not is_selector_route_shape(pattern, "stream", 3, allow_realm_wildcard=True):
-            raise StreamError(
-                f"Invalid stream pattern: {pattern} (expected stream://{{realm}}/{{area}}/{{resource}}, stream://{{realm}}/{{area}}/*, or stream://{{realm}}/**)",
-                "INVALID_ROUTE",
-            )
+
+def _assert_stream_pattern(pattern: str) -> None:
+    if not is_selector_route_shape(pattern, "stream", 3, allow_realm_wildcard=True):
+        raise StreamError(
+            f"Invalid stream pattern: {pattern} (expected stream://{{realm}}/{{area}}/{{resource}}, stream://{{realm}}/{{area}}/*, or stream://{{realm}}/**)",
+            "INVALID_ROUTE",
+        )
+
+
+def _decode_stream_commit_notification(route: str, payload: bytes) -> StreamCommitNotification:
+    _assert_stream_route(route)
+
     notification = StreamCommitNotification(route=route)
     if not payload:
         return notification
