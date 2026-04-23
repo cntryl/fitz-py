@@ -26,7 +26,9 @@ class _FakeConnection:
             return b"\x00\x01" + (7).to_bytes(8, "big")
         return b"\x00"
 
-    def register_notification_handler(self, message_type: int, handler: Callable[[bytes], None]) -> None:
+    def register_notification_handler(
+        self, message_type: int, handler: Callable[[bytes], None]
+    ) -> None:
         self.notification_handlers[message_type] = handler
 
     def on_reconnect(self, _handler: Callable[[], Awaitable[None]]) -> None:

@@ -168,9 +168,7 @@ class StreamClient(DomainClient):
         self._initialized = False
         self.connection.on_reconnect(self._restore_subscriptions)
 
-    async def begin(
-        self, route: str, ingest_metadata: bytes | None = None
-    ) -> StreamSession:
+    async def begin(self, route: str, ingest_metadata: bytes | None = None) -> StreamSession:
         _assert_stream_route(route)
         writer = BufferWriter()
         writer.write_route(route)

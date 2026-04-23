@@ -28,7 +28,9 @@ class TcpTransport(Transport):
         except TimeoutError:
             raise
         except asyncio.TimeoutError as exc:  # pragma: no cover - transport boundary
-            raise TimeoutError(f"TCP connection timeout after {int(self._timeout * 1000)}ms") from exc
+            raise TimeoutError(
+                f"TCP connection timeout after {int(self._timeout * 1000)}ms"
+            ) from exc
         except Exception as exc:  # pragma: no cover - transport boundary
             raise TransportError(f"TCP connect failed: {exc}") from exc
 

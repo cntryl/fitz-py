@@ -178,9 +178,7 @@ class KvTransaction:
             return
 
         reason = self._closed_reason or "closed"
-        raise ErrKvOperationNotAllowed(
-            f"{operation} not allowed: transaction already {reason}"
-        )
+        raise ErrKvOperationNotAllowed(f"{operation} not allowed: transaction already {reason}")
 
     def _invalidate(self) -> None:
         if self._closed:

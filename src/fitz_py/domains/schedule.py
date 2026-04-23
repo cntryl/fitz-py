@@ -87,7 +87,9 @@ class ScheduleClient(DomainClient):
         _assert_schedule_route(route)
         writer = BufferWriter()
         writer.write_route(route)
-        self._assert_success(await self.request_frame(MSG_SCHEDULE_CANCEL, writer.build()), "CANCEL")
+        self._assert_success(
+            await self.request_frame(MSG_SCHEDULE_CANCEL, writer.build()), "CANCEL"
+        )
 
     async def list(
         self, *, offset: int | None = None, limit: int | None = None
@@ -95,7 +97,9 @@ class ScheduleClient(DomainClient):
         writer = BufferWriter()
         writer.write_optional_u64(offset)
         writer.write_optional_u64(limit)
-        data = self._assert_success(await self.request_frame(MSG_SCHEDULE_LIST, writer.build()), "LIST")
+        data = self._assert_success(
+            await self.request_frame(MSG_SCHEDULE_LIST, writer.build()), "LIST"
+        )
         reader = BufferReader(data)
         if reader.remaining_bytes() >= 8:
             reader.read_u64_be()
@@ -123,7 +127,9 @@ class ScheduleClient(DomainClient):
         handler_id = self._next_handler_id
         self._next_handler_id += 1
         existing.handlers[handler_id] = handler
-        return ScheduleSubscription(existing.sub_id, pattern, handler, self._unsubscribe, handler_id)
+        return ScheduleSubscription(
+            existing.sub_id, pattern, handler, self._unsubscribe, handler_id
+        )
 
     async def _subscribe_wire(self, pattern: str) -> int:
         writer = BufferWriter()
