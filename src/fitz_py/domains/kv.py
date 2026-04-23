@@ -48,6 +48,7 @@ class KvTransaction:
         self._tx_id = tx_id
         self._closed = False
         self._closed_reason: str | None = None
+        self._disconnect_unregister = self._connection.on_disconnect(self._invalidate)
 
     async def __aenter__(self) -> "KvTransaction":
         return self
@@ -170,6 +171,7 @@ class KvTransaction:
         await self._expect_status(message_type, writer.build(), operation)
         self._closed = True
         self._closed_reason = "committed" if operation == "COMMIT" else "rolled back"
+        self._clear_disconnect_listener()
 
     def _ensure_open(self, operation: str) -> None:
         if not self._closed:
@@ -179,6 +181,20 @@ class KvTransaction:
         raise ErrKvOperationNotAllowed(
             f"{operation} not allowed: transaction already {reason}"
         )
+
+    def _invalidate(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._closed_reason = "disconnected"
+        self._clear_disconnect_listener()
+
+    def _clear_disconnect_listener(self) -> None:
+        unregister = getattr(self, "_disconnect_unregister", None)
+        if unregister is None:
+            return
+        self._disconnect_unregister = None
+        unregister()
 
     async def _expect_status(self, message_type: int, payload: bytes, operation: str) -> None:
         reader = BufferReader(await self._connection.request(message_type, payload))

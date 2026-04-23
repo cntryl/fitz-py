@@ -8,6 +8,7 @@ import pytest
 
 from fitz_py import StreamCommitMode, StreamCommitNotification
 from fitz_py.domains.stream import StreamClient, StreamSession
+from fitz_py.errors import ErrStreamSessionClosed
 from fitz_py.protocol.buffer import BufferReader, BufferWriter
 from fitz_py.protocol.messages import MSG_STREAM_COMMIT, MSG_STREAM_NOTIFY, MSG_STREAM_SUBSCRIBE
 
@@ -17,6 +18,7 @@ class _FakeConnection:
         self.requests: list[tuple[int, bytes]] = []
         self.notification_handlers: dict[int, Callable[[bytes], None]] = {}
         self.reconnect_handlers: list[Callable[[], Awaitable[None]]] = []
+        self.disconnect_handlers: list[Callable[[], None | Awaitable[None]]] = []
 
     async def request(self, message_type: int, payload: bytes) -> bytes:
         self.requests.append((message_type, payload))
@@ -30,6 +32,16 @@ class _FakeConnection:
     def on_reconnect(self, _handler: Callable[[], Awaitable[None]]) -> None:
         self.reconnect_handlers.append(_handler)
         return None
+
+    def on_disconnect(self, handler: Callable[[], None | Awaitable[None]]) -> None:
+        self.disconnect_handlers.append(handler)
+        return None
+
+    def emit_disconnect(self) -> None:
+        for handler in list(self.disconnect_handlers):
+            result = handler()
+            if asyncio.iscoroutine(result):
+                asyncio.create_task(result)
 
 
 @pytest.mark.asyncio
@@ -59,6 +71,17 @@ async def test_stream_session_commit_encodes_mode(
     assert reader.read_u64_be() == 42
     assert reader.read_u8() == expected_mode
     assert reader.is_eof()
+
+
+@pytest.mark.asyncio
+async def test_stream_session_invalidates_on_disconnect() -> None:
+    connection = _FakeConnection()
+    session = StreamSession(connection, 42)
+
+    connection.emit_disconnect()
+
+    with pytest.raises(ErrStreamSessionClosed, match="already disconnected"):
+        await session.append(0, b"payload")
 
 
 @pytest.mark.asyncio

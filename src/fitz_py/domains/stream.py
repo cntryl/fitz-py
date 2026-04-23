@@ -8,7 +8,7 @@ from enum import IntEnum
 
 from fitz_py.domains.base import DomainClient
 from fitz_py.domains._routes import is_exact_route_shape, is_selector_route_shape
-from fitz_py.errors import StreamError, stream_error
+from fitz_py.errors import ErrStreamSessionClosed, StreamError, stream_error
 from fitz_py.protocol.buffer import BufferReader, BufferWriter
 from fitz_py.protocol.messages import (
     MSG_STREAM_APPEND,
@@ -74,6 +74,8 @@ class StreamSession:
         self._connection = connection
         self._session_id = session_id
         self._closed = False
+        self._closed_reason: str | None = None
+        self._disconnect_unregister = self._connection.on_disconnect(self._invalidate)
 
     async def __aenter__(self) -> "StreamSession":
         return self
@@ -85,6 +87,7 @@ class StreamSession:
     async def append(
         self, expected_offset: int, body: bytes, metadata: bytes | None = None
     ) -> int | None:
+        self._ensure_open("APPEND")
         writer = BufferWriter()
         writer.write_u64_be(self._session_id)
         writer.write_u64_be(expected_offset)
@@ -112,23 +115,50 @@ class StreamSession:
         return BufferReader(data).read_u64_be()
 
     async def commit(self, mode: int | StreamCommitMode = StreamCommitMode.BUFFERED) -> None:
+        self._ensure_open("COMMIT")
         writer = BufferWriter()
         writer.write_u64_be(self._session_id)
         writer.write_u8(int(mode))
         await self._expect_status(MSG_STREAM_COMMIT, writer.build(), "COMMIT")
         self._closed = True
+        self._closed_reason = "committed"
+        self._clear_disconnect_listener()
 
     async def rollback(self) -> None:
+        self._ensure_open("ROLLBACK")
         writer = BufferWriter()
         writer.write_u64_be(self._session_id)
         await self._expect_status(MSG_STREAM_ROLLBACK, writer.build(), "ROLLBACK")
         self._closed = True
+        self._closed_reason = "rolled back"
+        self._clear_disconnect_listener()
 
     async def _expect_status(self, message_type: int, payload: bytes, operation: str) -> None:
         reader = BufferReader(await self._connection.request(message_type, payload))
         status = reader.read_u8() if not reader.is_eof() else 0
         if status != 0:
             raise stream_error(f"{operation} failed with status {status}", status)
+
+    def _ensure_open(self, operation: str) -> None:
+        if not self._closed:
+            return
+
+        reason = self._closed_reason or "closed"
+        raise ErrStreamSessionClosed(f"{operation} not allowed: session already {reason}")
+
+    def _invalidate(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._closed_reason = "disconnected"
+        self._clear_disconnect_listener()
+
+    def _clear_disconnect_listener(self) -> None:
+        unregister = getattr(self, "_disconnect_unregister", None)
+        if unregister is None:
+            return
+        self._disconnect_unregister = None
+        unregister()
 
 
 class StreamClient(DomainClient):

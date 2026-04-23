@@ -13,6 +13,7 @@ from fitz_py.types import ConnectionState, TokenProvider
 
 TransportFactory = Callable[[], Transport]
 ReconnectListener = Callable[[], None | Awaitable[None]]
+DisconnectListener = Callable[[], None | Awaitable[None]]
 
 
 async def _sleep_ms(delay_ms: int) -> None:
@@ -54,6 +55,7 @@ class Connection:
         self._frame_parser = FrameParser()
         self._receive_task: asyncio.Task[None] | None = None
         self._reconnect_listeners: set[ReconnectListener] = set()
+        self._disconnect_listeners: set[DisconnectListener] = set()
         self._auth_future: asyncio.Future[None] | None = None
         self._close_requested = False
         self._receive_loop_abort = False
@@ -73,6 +75,7 @@ class Connection:
             self._auth_future.set_exception(ConnectionError("Connection closed"))
         self._auth_future = None
         self._multiplexer.set_disconnected()
+        await self._notify_disconnect_listeners()
 
         receive_task = self._receive_task
         self._receive_task = None
@@ -126,6 +129,14 @@ class Connection:
 
         def unregister() -> None:
             self._reconnect_listeners.discard(listener)
+
+        return unregister
+
+    def on_disconnect(self, listener: DisconnectListener) -> Callable[[], None]:
+        self._disconnect_listeners.add(listener)
+
+        def unregister() -> None:
+            self._disconnect_listeners.discard(listener)
 
         return unregister
 
@@ -228,6 +239,7 @@ class Connection:
             return
 
         self._set_state(ConnectionState.DISCONNECTED)
+        await self._notify_disconnect_listeners()
         if not self._reconnect_enabled:
             return
 
@@ -251,6 +263,12 @@ class Connection:
 
     async def _restore_reconnect_state(self) -> None:
         for listener in list(self._reconnect_listeners):
+            result = listener()
+            if asyncio.iscoroutine(result):
+                await result
+
+    async def _notify_disconnect_listeners(self) -> None:
+        for listener in list(self._disconnect_listeners):
             result = listener()
             if asyncio.iscoroutine(result):
                 await result

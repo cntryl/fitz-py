@@ -9,10 +9,10 @@ from fitz_py.domains.queue import QueueClient
 from fitz_py.domains.rpc import RpcClient
 from fitz_py.domains.schedule import ScheduleClient
 from fitz_py.domains.stream import StreamClient
-from fitz_py.errors import KvError, LeaseError, NoticeError, QueueError, RpcError, ScheduleError, StreamError
 from fitz_py.protocol.messages import (
     MSG_KV_BEGIN,
     MSG_LEASE_ACQUIRE,
+    MSG_LEASE_SUBSCRIBE,
     MSG_NOTICE_PUBLISH,
     MSG_NOTICE_SUBSCRIBE,
     MSG_QUEUE_ENQUEUE,
@@ -20,10 +20,16 @@ from fitz_py.protocol.messages import (
     MSG_RPC_REQUEST,
     MSG_RPC_SUBSCRIBE_WORKER,
     MSG_SCHEDULE_CREATE,
+    MSG_SCHEDULE_SUBSCRIBE,
     MSG_STREAM_BEGIN,
     MSG_STREAM_READ,
     MSG_STREAM_SUBSCRIBE,
 )
+
+
+class _FakeMultiplexer:
+    def expect_optional_response(self, _message_type: int):
+        return lambda: None
 
 
 class _FakeConnection:
@@ -32,10 +38,14 @@ class _FakeConnection:
         self.requests: list[tuple[int, bytes]] = []
         self.notification_handlers: dict[int, object] = {}
         self.reconnect_handlers: list[object] = []
+        self._multiplexer = _FakeMultiplexer()
 
     async def request(self, message_type: int, payload: bytes) -> bytes:
         self.requests.append((message_type, payload))
         return self.response
+
+    async def send_fire_and_forget(self, message_type: int, payload: bytes) -> None:
+        self.requests.append((message_type, payload))
 
     def on_reconnect(self, handler) -> None:
         self.reconnect_handlers.append(handler)
@@ -43,6 +53,9 @@ class _FakeConnection:
 
     def register_notification_handler(self, message_type: int, handler) -> None:
         self.notification_handlers[message_type] = handler
+
+    def get_multiplexer(self) -> _FakeMultiplexer:
+        return self._multiplexer
 
 
 @pytest.mark.asyncio
@@ -58,25 +71,25 @@ async def test_kv_begin_accepts_exact_three_segment_route() -> None:
 
 
 @pytest.mark.asyncio
-async def test_kv_begin_rejects_short_route_before_request() -> None:
+async def test_kv_begin_forwards_short_route_without_local_validation() -> None:
     connection = _FakeConnection(b"\x00" + (42).to_bytes(8, "big"))
     client = KvClient(connection)
 
-    with pytest.raises(KvError, match="expected kv://"):
-        await client.begin("kv://example/app")
+    transaction = await client.begin("kv://example/app")
 
-    assert connection.requests == []
+    assert transaction is not None
+    assert connection.requests[0][0] == MSG_KV_BEGIN
 
 
 @pytest.mark.asyncio
-async def test_kv_begin_rejects_wrong_scheme_before_request() -> None:
+async def test_kv_begin_forwards_wrong_scheme_without_local_validation() -> None:
     connection = _FakeConnection(b"\x00" + (42).to_bytes(8, "big"))
     client = KvClient(connection)
 
-    with pytest.raises(KvError, match="expected kv://"):
-        await client.begin("queue://example/app/users")
+    transaction = await client.begin("queue://example/app/users")
 
-    assert connection.requests == []
+    assert transaction is not None
+    assert connection.requests[0][0] == MSG_KV_BEGIN
 
 
 @pytest.mark.asyncio
@@ -93,47 +106,47 @@ async def test_lease_acquire_accepts_exact_three_segment_route() -> None:
 
 
 @pytest.mark.asyncio
-async def test_lease_acquire_rejects_short_route_before_request() -> None:
+async def test_lease_acquire_forwards_short_route_without_local_validation() -> None:
     connection = _FakeConnection(b"\x00\x01" + (42).to_bytes(8, "big"))
     client = LeaseClient(connection)
 
-    with pytest.raises(LeaseError, match="expected lease://"):
-        await client.acquire("lease://example/app", 30)
+    lease = await client.acquire("lease://example/app", 30)
 
-    assert connection.requests == []
+    assert lease.route == "lease://example/app"
+    assert connection.requests[0][0] == MSG_LEASE_ACQUIRE
 
 
 @pytest.mark.asyncio
-async def test_lease_acquire_rejects_empty_segment_before_request() -> None:
+async def test_lease_acquire_forwards_empty_segment_route_without_local_validation() -> None:
     connection = _FakeConnection(b"\x00\x01" + (42).to_bytes(8, "big"))
     client = LeaseClient(connection)
 
-    with pytest.raises(LeaseError, match="expected lease://"):
-        await client.acquire("lease://example//leader", 30)
+    lease = await client.acquire("lease://example//leader", 30)
 
-    assert connection.requests == []
+    assert lease.route == "lease://example//leader"
+    assert connection.requests[0][0] == MSG_LEASE_ACQUIRE
 
 
 @pytest.mark.asyncio
-async def test_lease_subscribe_rejects_wildcard_pattern_before_request() -> None:
+async def test_lease_subscribe_forwards_wildcard_pattern_without_local_validation() -> None:
     connection = _FakeConnection(b"\x00\x01" + (42).to_bytes(8, "big"))
     client = LeaseClient(connection)
 
-    with pytest.raises(LeaseError, match="expected lease://"):
-        await client.subscribe("lease://example/**", lambda notification: None)
+    subscription = await client.subscribe("lease://example/**", lambda notification: None)
 
-    assert connection.requests == []
+    assert subscription.pattern == "lease://example/**"
+    assert connection.requests[0][0] == MSG_LEASE_SUBSCRIBE
 
 
 @pytest.mark.asyncio
-async def test_queue_enqueue_rejects_wildcard_route_before_request() -> None:
+async def test_queue_enqueue_forwards_wildcard_route_without_local_validation() -> None:
     connection = _FakeConnection(b"\x00")
     client = QueueClient(connection)
 
-    with pytest.raises(QueueError, match="expected queue://"):
-        await client.enqueue("queue://example/app/*", b"payload")
+    message_id = await client.enqueue("queue://example/app/*", b"payload")
 
-    assert connection.requests == []
+    assert message_id == 0
+    assert connection.requests[0][0] == MSG_QUEUE_ENQUEUE
 
 
 @pytest.mark.asyncio
@@ -148,14 +161,13 @@ async def test_queue_subscribe_accepts_realm_wildcard_pattern() -> None:
 
 
 @pytest.mark.asyncio
-async def test_notice_publish_rejects_wildcard_route_before_request() -> None:
+async def test_notice_publish_forwards_wildcard_route_without_local_validation() -> None:
     connection = _FakeConnection(b"\x00")
     client = NoticeClient(connection)
 
-    with pytest.raises(NoticeError, match="expected notice://"):
-        await client.publish("notice://example/**", b"payload")
+    await client.publish("notice://example/**", b"payload")
 
-    assert connection.requests == []
+    assert connection.requests[0][0] == MSG_NOTICE_PUBLISH
 
 
 @pytest.mark.asyncio
@@ -170,47 +182,47 @@ async def test_notice_subscribe_accepts_realm_wildcard_pattern() -> None:
 
 
 @pytest.mark.asyncio
-async def test_rpc_call_rejects_wildcard_route_before_request() -> None:
+async def test_rpc_call_forwards_wildcard_route_without_local_validation() -> None:
     connection = _FakeConnection(b"\x00")
     client = RpcClient(connection)
 
-    with pytest.raises(RpcError, match="expected rpc://"):
-        await client.call("rpc://example/*", b"payload")
+    iterator = await client.call("rpc://example/*", b"payload")
 
-    assert connection.requests == []
+    assert iterator is not None
+    assert connection.requests[0][0] == MSG_RPC_REQUEST
 
 
 @pytest.mark.asyncio
-async def test_rpc_register_worker_rejects_wildcard_route_before_request() -> None:
+async def test_rpc_register_worker_forwards_wildcard_route_without_local_validation() -> None:
     connection = _FakeConnection(b"\x00")
     client = RpcClient(connection)
 
-    with pytest.raises(RpcError, match="expected rpc://"):
-        await client.register_worker("rpc://example/**", lambda request, writer: None)
+    subscription = await client.register_worker("rpc://example/**", lambda request, writer: None)
 
-    assert connection.requests == []
+    assert subscription.route == "rpc://example/**"
+    assert connection.requests[0][0] == MSG_RPC_SUBSCRIBE_WORKER
 
 
 @pytest.mark.asyncio
-async def test_stream_begin_rejects_wildcard_route_before_request() -> None:
+async def test_stream_begin_forwards_wildcard_route_without_local_validation() -> None:
     connection = _FakeConnection(b"\x00\x01" + (42).to_bytes(8, "big"))
     client = StreamClient(connection)
 
-    with pytest.raises(StreamError, match="expected stream://"):
-        await client.begin("stream://example/app/*")
+    session = await client.begin("stream://example/app/*")
 
-    assert connection.requests == []
+    assert session is not None
+    assert connection.requests[0][0] == MSG_STREAM_BEGIN
 
 
 @pytest.mark.asyncio
-async def test_stream_subscribe_rejects_wildcard_pattern_before_request() -> None:
+async def test_stream_subscribe_forwards_wildcard_pattern_without_local_validation() -> None:
     connection = _FakeConnection(b"\x00\x01" + (7).to_bytes(8, "big"))
     client = StreamClient(connection)
 
-    with pytest.raises(StreamError, match="expected stream://"):
-        await client.subscribe("stream://example/area/**", lambda notification: None)
+    subscription = await client.subscribe("stream://example/area/**", lambda notification: None)
 
-    assert connection.requests == []
+    assert subscription.pattern == "stream://example/area/**"
+    assert connection.requests[0][0] == MSG_STREAM_SUBSCRIBE
 
 
 @pytest.mark.asyncio
@@ -237,44 +249,44 @@ async def test_schedule_create_accepts_exact_four_segment_route() -> None:
 
 
 @pytest.mark.asyncio
-async def test_schedule_create_rejects_short_route_before_request() -> None:
+async def test_schedule_create_forwards_short_route_without_local_validation() -> None:
     connection = _FakeConnection(b"\x00")
     client = ScheduleClient(connection)
 
-    with pytest.raises(ScheduleError, match="expected schedule://"):
-        await client.create("schedule://example/app", "0 0 * * *")
+    route = await client.create("schedule://example/app", "0 0 * * *")
 
-    assert connection.requests == []
+    assert route == "schedule://example/app"
+    assert connection.requests[0][0] == MSG_SCHEDULE_CREATE
 
 
 @pytest.mark.asyncio
-async def test_schedule_create_rejects_wrong_scheme_before_request() -> None:
+async def test_schedule_create_forwards_wrong_scheme_without_local_validation() -> None:
     connection = _FakeConnection(b"\x00")
     client = ScheduleClient(connection)
 
-    with pytest.raises(ScheduleError, match="expected schedule://"):
-        await client.create("queue://example/app/jobs/run", "0 0 * * *")
+    route = await client.create("queue://example/app/jobs/run", "0 0 * * *")
 
-    assert connection.requests == []
+    assert route == "queue://example/app/jobs/run"
+    assert connection.requests[0][0] == MSG_SCHEDULE_CREATE
 
 
 @pytest.mark.asyncio
-async def test_schedule_create_rejects_empty_segment_before_request() -> None:
+async def test_schedule_create_forwards_empty_segment_route_without_local_validation() -> None:
     connection = _FakeConnection(b"\x00")
     client = ScheduleClient(connection)
 
-    with pytest.raises(ScheduleError, match="expected schedule://"):
-        await client.create("schedule://example//jobs/run", "0 0 * * *")
+    route = await client.create("schedule://example//jobs/run", "0 0 * * *")
 
-    assert connection.requests == []
+    assert route == "schedule://example//jobs/run"
+    assert connection.requests[0][0] == MSG_SCHEDULE_CREATE
 
 
 @pytest.mark.asyncio
-async def test_schedule_subscribe_rejects_wildcard_route_before_request() -> None:
+async def test_schedule_subscribe_forwards_wildcard_route_without_local_validation() -> None:
     connection = _FakeConnection(b"\x00\x01" + (7).to_bytes(8, "big"))
     client = ScheduleClient(connection)
 
-    with pytest.raises(ScheduleError, match="expected schedule://"):
-        await client.subscribe("schedule://example/app/*", lambda notification: None)
+    subscription = await client.subscribe("schedule://example/app/*", lambda notification: None)
 
-    assert connection.requests == []
+    assert subscription.pattern == "schedule://example/app/*"
+    assert connection.requests[0][0] == MSG_SCHEDULE_SUBSCRIBE

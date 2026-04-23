@@ -56,3 +56,15 @@ async def test_connection_emits_connected_before_authenticated() -> None:
         ]
     finally:
         await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_connection_notifies_disconnect_listeners_on_close() -> None:
+    connection = Connection(lambda: _FakeTransport(), _empty_token)
+    seen: list[str] = []
+
+    connection.on_disconnect(lambda: seen.append("disconnect"))
+
+    await connection.close()
+
+    assert seen == ["disconnect"]
