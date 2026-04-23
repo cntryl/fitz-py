@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
@@ -83,15 +84,49 @@ class QueueClient(DomainClient):
         wait_seconds: int = 0,
     ) -> list[QueueItem]:
         _assert_queue_reserve_route(route)
+        if wait_seconds <= 0:
+            return await self._reserve_once(route, lease_seconds, batch_size)
+
+        items = await self._reserve_once(route, lease_seconds, batch_size)
+        if items:
+            return items
+
+        availability = asyncio.Event()
+        subscription = await self.subscribe(route, lambda _route: availability.set())
+        deadline = asyncio.get_running_loop().time() + wait_seconds
+
+        try:
+            while True:
+                items = await self._reserve_once(route, lease_seconds, batch_size)
+                if items:
+                    return items
+
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    return []
+
+                try:
+                    await asyncio.wait_for(availability.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    return []
+                finally:
+                    availability.clear()
+        finally:
+            with contextlib.suppress(Exception):
+                await subscription.unsubscribe()
+
+    async def _reserve_once(
+        self,
+        route: str,
+        lease_seconds: int,
+        batch_size: int,
+    ) -> list[QueueItem]:
         writer = BufferWriter()
         writer.write_route(route)
         writer.write_u64_be(lease_seconds)
         writer.write_u8(1 if batch_size > 0 else 0)
         if batch_size > 0:
             writer.write_u32_be(batch_size)
-        writer.write_u8(1 if wait_seconds > 0 else 0)
-        if wait_seconds > 0:
-            writer.write_u64_be(wait_seconds)
         reader = BufferReader(await self.request_frame(MSG_QUEUE_RESERVE, writer.build()))
         status = reader.read_u8()
         if status != 0:

@@ -35,4 +35,4 @@ class ClientConfig:
     transport: TransportType = "auto"
     reconnect: ReconnectOptions | None = None
     max_frame_size: int = 65535
-    auth_settle_delay_ms: int = 100
+    auth_settle_delay_ms: int = 500

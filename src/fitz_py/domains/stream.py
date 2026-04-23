@@ -214,9 +214,7 @@ class StreamClient(DomainClient):
         count = inner.read_u32_be()
         records: list[StreamRecord] = []
         for _ in range(count):
-            offset = inner.read_u64_be()
-            body = inner.read_bytes(inner.read_u32_be())
-            records.append(StreamRecord(offset=offset, body=body))
+            records.append(_read_stream_record(inner))
         return records
 
     async def peek(self, route: str) -> StreamRecord | None:
@@ -230,7 +228,7 @@ class StreamClient(DomainClient):
         if not data:
             return None
         inner = BufferReader(data)
-        return StreamRecord(offset=inner.read_u64_be(), body=inner.read_bytes(inner.read_u32_be()))
+        return _read_stream_record(inner)
 
     async def metadata(self, route: str) -> StreamMetadata:
         _assert_stream_route(route)
@@ -315,6 +313,28 @@ def _read_wrapped_stream_response(reader: BufferReader) -> tuple[int, bytes]:
     if reader.is_eof():
         return 0, b""
     return 0, reader.read_bytes(reader.read_u32_be())
+
+
+def _read_optional_u64(reader: BufferReader) -> int | None:
+    if reader.read_u8() == 0:
+        return None
+    return reader.read_u64_be()
+
+
+def _read_optional_bytes(reader: BufferReader) -> bytes | None:
+    if reader.read_u8() == 0:
+        return None
+    return reader.read_bytes(reader.read_u32_be())
+
+
+def _read_stream_record(reader: BufferReader) -> StreamRecord:
+    offset = reader.read_u64_be()
+    _read_optional_u64(reader)
+    _read_optional_u64(reader)
+    body = reader.read_bytes(reader.read_u32_be())
+    _read_optional_bytes(reader)
+    reader.read_u64_be()
+    return StreamRecord(offset=offset, body=body)
 
 
 def _assert_stream_route(route: str) -> None:

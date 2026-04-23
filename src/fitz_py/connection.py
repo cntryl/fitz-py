@@ -34,7 +34,7 @@ class Connection:
         token_provider: TokenProvider,
         *,
         timeout_ms: int = 30000,
-        auth_settle_delay_ms: int = 100,
+        auth_settle_delay_ms: int = 500,
         reconnect_enabled: bool = False,
         reconnect_max_attempts: int | float = float("inf"),
         reconnect_backoff_ms: int = 250,

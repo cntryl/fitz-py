@@ -81,6 +81,8 @@ python -m pip install dist/*.whl
 ```
 
 The conformance harness writes JSON results to `artifacts/conformance-results.json` by default.
+It currently executes 19 scenarios: CS-001..CS-015 mirror the shared cross-language suite,
+and CS-016..CS-019 cover fitz-py local lifecycle checks.
 
 ## Project Layout
 

@@ -1,8 +1,9 @@
 """
-Fitz cross-language conformance harness — Python / fitz-py
+Fitz conformance harness — Python / fitz-py
 
-Covers all 15 scenarios defined in:
-  fitz/docs/clients/cross-language-conformance-suite.yaml
+Covers 19 scenarios executed by this harness:
+    CS-001..CS-015 track fitz/docs/clients/cross-language-conformance-suite.yaml
+    CS-016..CS-019 are fitz-py local lifecycle checks
 
 Configuration via environment variables:
   CONFORMANCE_TRANSPORT   "ws" (default) | "tcp"
@@ -273,16 +274,15 @@ async def test_cs002_auth_failure() -> None:
         evidence.append("auth failure surfaced as error (correct)")
         if isinstance(connect_exc, AuthenticationError):
             evidence.append("error is typed AuthenticationError (ideal)")
-        verdict = "pass"
+            verdict = "pass"
     else:
-        evidence.append("connect did not raise (TCP silent-close model)")
-        # Try a domain operation — should fail
+        evidence.append("connect did not raise (unexpected)")
+        # Try a domain operation for diagnostic evidence only.
         try:
             await client.kv().begin(_unique_route("kv"))
             evidence.append("WARNING: domain request unexpectedly succeeded")
         except Exception as dom_exc:
             evidence.append(f"domain request failed post-auth: {dom_exc}")
-            verdict = "partial"
         finally:
             await client.close()
 
@@ -298,7 +298,7 @@ async def test_cs002_auth_failure() -> None:
         0,
     )
     _record(r)
-    assert r.verdict in ("pass", "partial")
+    assert r.verdict == "pass"
 
 
 # ---------------------------------------------------------------------------
@@ -647,10 +647,12 @@ async def test_cs009_disconnect_during_request() -> None:
     worker_client = await _new_client()
     caller_client = await _new_client()
     handler_finished = asyncio.Event()
+    handler_started = asyncio.Event()
     try:
         route = _unique_route("rpc")
 
         async def _slow_handler(req, writer) -> None:
+            handler_started.set()
             try:
                 await asyncio.sleep(1.5)
                 await writer.send(b"late", is_end=True)
@@ -665,8 +667,7 @@ async def test_cs009_disconnect_during_request() -> None:
                 pass
 
         task = asyncio.create_task(_do_call())
-        await asyncio.sleep(0.1)
-        task.cancel()
+        await asyncio.wait_for(handler_started.wait(), timeout=2.0)
         await caller_client.close()
 
         caught: BaseException | None = None
@@ -675,13 +676,9 @@ async def test_cs009_disconnect_during_request() -> None:
         except BaseException as exc:
             caught = exc
 
-        if caught is not None:
-            evidence.append(f"in-flight request raised: {type(caught).__name__}")
-            evidence.append("in-flight request interrupted by disconnect (correct)")
-            verdict: Verdict = "pass"
-        else:
-            evidence.append("in-flight request completed before close (race — partial)")
-            verdict = "partial"
+        assert caught is not None, "expected in-flight request to fail after disconnect"
+        evidence.append(f"in-flight request raised: {type(caught).__name__}")
+        evidence.append("in-flight request interrupted by disconnect (correct)")
         await sub.unsubscribe()
         try:
             await asyncio.wait_for(handler_finished.wait(), timeout=2.0)
@@ -703,12 +700,12 @@ async def test_cs009_disconnect_during_request() -> None:
         CLIENT_NAME,
         CONFORMANCE_TRANSPORT,
         CONFORMANCE_AUTH_MODE,
-        verdict,
+        "pass",
         evidence,
         0,
     )
     _record(r)
-    assert r.verdict in ("pass", "partial")
+    assert r.verdict == "pass"
 
 
 # ---------------------------------------------------------------------------
@@ -751,7 +748,7 @@ async def test_cs010_reconnect_behavior() -> None:
         0,
     )
     _record(r)
-    assert r.verdict in ("pass", "partial")
+    assert r.verdict == "pass"
 
 
 # ---------------------------------------------------------------------------
@@ -762,7 +759,6 @@ async def test_cs010_reconnect_behavior() -> None:
 @pytest.mark.asyncio
 async def test_cs011_stream_receive_sequence() -> None:
     evidence: list[str] = []
-    verdict: Verdict = "pass"
     client = await _new_client()
     try:
         route = _unique_route("stream")
@@ -773,19 +769,13 @@ async def test_cs011_stream_receive_sequence() -> None:
         evidence.append("stream session appended 3 records")
 
         records = await client.stream().read(route, start_offset=0, limit=10)
-        if len(records) < 3:
-            verdict = "partial"
-            evidence.append(f"expected >=3 stream records, got {len(records)}")
-        else:
-            evidence.append(f"read {len(records)} records after commit")
+        assert len(records) >= 3, f"expected >=3 stream records, got {len(records)}"
+        evidence.append(f"read {len(records)} records after commit")
 
         for i in range(1, len(records)):
-            if records[i].offset <= records[i - 1].offset:
-                verdict = "partial"
-                evidence.append(
-                    f"out-of-order offsets at {i}: {records[i].offset} <= {records[i - 1].offset}"
-                )
-                break
+            assert records[i].offset > records[i - 1].offset, (
+                f"out-of-order offsets at {i}: {records[i].offset} <= {records[i - 1].offset}"
+            )
 
         if records:
             evidence.append(f"first offset: {records[0].offset}, last: {records[-1].offset}")
@@ -799,12 +789,12 @@ async def test_cs011_stream_receive_sequence() -> None:
         CLIENT_NAME,
         CONFORMANCE_TRANSPORT,
         CONFORMANCE_AUTH_MODE,
-        verdict,
+        "pass",
         evidence,
         0,
     )
     _record(r)
-    assert r.verdict in ("pass", "partial")
+    assert r.verdict == "pass"
 
 
 # ---------------------------------------------------------------------------
@@ -815,7 +805,6 @@ async def test_cs011_stream_receive_sequence() -> None:
 @pytest.mark.asyncio
 async def test_cs012_stream_completion() -> None:
     evidence: list[str] = []
-    verdict: Verdict = "pass"
     client = await _new_client()
     try:
         route = _unique_route("stream")
@@ -826,11 +815,8 @@ async def test_cs012_stream_completion() -> None:
         evidence.append("stream session committed")
 
         records = await client.stream().read(route, start_offset=0, limit=100)
-        if len(records) < 2:
-            verdict = "partial"
-            evidence.append(f"expected >=2 records after commit, got {len(records)}")
-        else:
-            evidence.append(f"stream.read() completed cleanly with {len(records)} records")
+        assert len(records) >= 2, f"expected >=2 records after commit, got {len(records)}"
+        evidence.append(f"stream.read() completed cleanly with {len(records)} records")
         evidence.append("iterator/read closed cleanly (no resource leak)")
     finally:
         await client.close()
@@ -842,12 +828,12 @@ async def test_cs012_stream_completion() -> None:
         CLIENT_NAME,
         CONFORMANCE_TRANSPORT,
         CONFORMANCE_AUTH_MODE,
-        verdict,
+        "pass",
         evidence,
         0,
     )
     _record(r)
-    assert r.verdict in ("pass", "partial")
+    assert r.verdict == "pass"
 
 
 # ---------------------------------------------------------------------------
@@ -1008,7 +994,6 @@ async def test_cs015_shutdown_during_active_work() -> None:
 @pytest.mark.asyncio
 async def test_cs016_queue_enqueue_reserve_complete() -> None:
     evidence: list[str] = []
-    verdict: Verdict = "pass"
     client = await _new_client()
     try:
         route = _unique_route("queue")
@@ -1024,11 +1009,8 @@ async def test_cs016_queue_enqueue_reserve_complete() -> None:
         evidence.append("message completed")
 
         empty = await client.queue().reserve(route, 30, batch_size=1)
-        if empty:
-            verdict = "partial"
-            evidence.append(f"expected empty queue after complete, got {len(empty)} items")
-        else:
-            evidence.append("queue empty after complete")
+        assert not empty, f"expected empty queue after complete, got {len(empty)} items"
+        evidence.append("queue empty after complete")
     finally:
         await client.close()
 
@@ -1039,12 +1021,12 @@ async def test_cs016_queue_enqueue_reserve_complete() -> None:
         CLIENT_NAME,
         CONFORMANCE_TRANSPORT,
         CONFORMANCE_AUTH_MODE,
-        verdict,
+        "pass",
         evidence,
         0,
     )
     _record(r)
-    assert r.verdict in ("pass", "partial")
+    assert r.verdict == "pass"
 
 
 # ---------------------------------------------------------------------------
@@ -1104,7 +1086,6 @@ async def test_cs017_lease_acquire_contention_release() -> None:
 @pytest.mark.asyncio
 async def test_cs018_notice_subscribe_publish_deliver() -> None:
     evidence: list[str] = []
-    verdict: Verdict = "pass"
     client = await _new_client()
     try:
         route = _unique_route("notice")
@@ -1128,12 +1109,9 @@ async def test_cs018_notice_subscribe_publish_deliver() -> None:
 
         delivered.clear()
         await client.notice().publish(route, b"after-unsub")
-        try:
+        with pytest.raises(asyncio.TimeoutError):
             await asyncio.wait_for(delivered.wait(), timeout=0.5)
-            verdict = "partial"
-            evidence.append("message delivered after unsubscribe")
-        except asyncio.TimeoutError:
-            evidence.append("no delivery after unsubscribe")
+        evidence.append("no delivery after unsubscribe")
     finally:
         await client.close()
 
@@ -1144,12 +1122,12 @@ async def test_cs018_notice_subscribe_publish_deliver() -> None:
         CLIENT_NAME,
         CONFORMANCE_TRANSPORT,
         CONFORMANCE_AUTH_MODE,
-        verdict,
+        "pass",
         evidence,
         0,
     )
     _record(r)
-    assert r.verdict in ("pass", "partial")
+    assert r.verdict == "pass"
 
 
 # ---------------------------------------------------------------------------

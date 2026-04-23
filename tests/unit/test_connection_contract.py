@@ -5,6 +5,7 @@ import asyncio
 import pytest
 
 from fitz_py.connection import Connection
+from fitz_py.errors import AuthenticationError, TransportError
 from fitz_py.types import ConnectionState
 
 
@@ -23,6 +24,12 @@ class _FakeTransport:
 
     def get_url(self) -> str:
         return "ws://example.test"
+
+
+class _DelayedCloseTransport(_FakeTransport):
+    async def receive(self) -> bytes:
+        await asyncio.sleep(0.2)
+        raise TransportError("TCP connection closed")
 
 
 async def _empty_token() -> str:
@@ -68,3 +75,18 @@ async def test_connection_notifies_disconnect_listeners_on_close() -> None:
     await connection.close()
 
     assert seen == ["disconnect"]
+
+
+@pytest.mark.asyncio
+async def test_connection_surfaces_delayed_auth_close_as_authentication_error() -> None:
+    connection = Connection(
+        lambda: _DelayedCloseTransport(),
+        _empty_token,
+        auth_settle_delay_ms=500,
+    )
+
+    try:
+        with pytest.raises(AuthenticationError, match="TCP connection closed"):
+            await connection.connect()
+    finally:
+        await connection.close()
