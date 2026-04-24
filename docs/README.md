@@ -20,3 +20,5 @@ Use the canonical docs for protocol behavior and the local docs for Python-speci
 Python verification follows the repo README release gate. The conformance harness currently
 executes 19 scenarios: CS-001..CS-015 mirror the shared cross-language suite, and
 CS-016..CS-019 cover fitz-py local lifecycle checks.
+
+The top-level `Client` also supports `async with` for connect/close lifecycle management, matching the existing domain-level context manager pattern.
