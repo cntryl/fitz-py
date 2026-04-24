@@ -59,6 +59,13 @@ class Client:
         )
         await self._connection.connect()
 
+    async def __aenter__(self) -> "Client":
+        await self.connect()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.close()
+
     async def close(self) -> None:
         if self._connection is not None:
             await self._connection.close()

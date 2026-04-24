@@ -15,7 +15,7 @@ The Python SDK follows the canonical Fitz client docs in the server repository u
 - [../CLIENT_SPEC.md](../CLIENT_SPEC.md)
 - [../CLIENT_ACCEPTANCE_CRITERIA.md](../CLIENT_ACCEPTANCE_CRITERIA.md)
 
-Use the canonical docs for protocol behavior and the local docs for Python-specific verification and parity notes.
+Use the canonical docs for protocol behavior and the local docs for Python-specific verification, parity evidence, and setup notes.
 
 Python verification follows the repo README release gate. The conformance harness currently
 executes 19 scenarios: CS-001..CS-015 mirror the shared cross-language suite, and
