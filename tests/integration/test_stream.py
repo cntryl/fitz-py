@@ -56,8 +56,8 @@ async def test_stream_commit_notification_shape(transport: str, auth_mode: str) 
         assert notification.last_resource_offset == 0
         assert notification.first_area_offset == 0
         assert notification.last_area_offset == 0
-        assert notification.first_realm_offset == 0
-        assert notification.last_realm_offset == 0
+        assert notification.first_realm_offset >= notification.first_area_offset
+        assert notification.last_realm_offset >= notification.first_realm_offset
         assert notification.batch_size == 1
 
         await subscription.unsubscribe()

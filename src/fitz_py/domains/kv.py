@@ -48,7 +48,8 @@ class KvTransaction:
         self._tx_id = tx_id
         self._closed = False
         self._closed_reason: str | None = None
-        self._disconnect_unregister = self._connection.on_disconnect(self._invalidate)
+        on_disconnect = getattr(self._connection, "on_disconnect", None)
+        self._disconnect_unregister = on_disconnect(self._invalidate) if callable(on_disconnect) else None
 
     async def __aenter__(self) -> "KvTransaction":
         return self
