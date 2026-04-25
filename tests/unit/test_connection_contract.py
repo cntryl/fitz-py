@@ -10,10 +10,14 @@ from fitz_py.types import ConnectionState
 
 
 class _FakeTransport:
+    def __init__(self) -> None:
+        self.connected = False
+
     async def connect(self) -> None:
-        return None
+        self.connected = True
 
     async def close(self) -> None:
+        self.connected = False
         return None
 
     async def send(self, _data: bytes) -> None:
@@ -30,6 +34,32 @@ class _DelayedCloseTransport(_FakeTransport):
     async def receive(self) -> bytes:
         await asyncio.sleep(0.2)
         raise TransportError("TCP connection closed")
+
+
+class _ControllableTransport(_FakeTransport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.connect_started = False
+        self._pending_read: asyncio.Future[bytes] | None = None
+
+    async def connect(self) -> None:
+        self.connect_started = True
+        await super().connect()
+
+    async def receive(self) -> bytes:
+        loop = asyncio.get_running_loop()
+        self._pending_read = loop.create_future()
+        return await self._pending_read
+
+    def fail(self, exc: Exception) -> None:
+        if self._pending_read is not None and not self._pending_read.done():
+            self.connected = False
+            self._pending_read.set_exception(exc)
+
+    async def close(self) -> None:
+        if self._pending_read is not None and not self._pending_read.done():
+            self._pending_read.set_exception(TransportError("closed"))
+        await super().close()
 
 
 async def _empty_token() -> str:
@@ -90,3 +120,38 @@ async def test_connection_surfaces_delayed_auth_close_as_authentication_error() 
             await connection.connect()
     finally:
         await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_connection_does_not_reconnect_after_close_during_reconnect_backoff() -> None:
+    first = _ControllableTransport()
+    second = _ControllableTransport()
+    transports = [first, second]
+
+    def factory() -> _ControllableTransport:
+        return transports.pop(0)
+
+    connection = Connection(
+        factory,
+        _empty_token,
+        auth_settle_delay_ms=0,
+        reconnect_enabled=True,
+        reconnect_max_attempts=1,
+        reconnect_backoff_ms=50,
+        reconnect_max_backoff_ms=50,
+    )
+
+    await connection.connect()
+    first.fail(TransportError("boom"))
+
+    async def wait_for_reconnecting() -> None:
+        while connection.get_state() is not ConnectionState.RECONNECTING:
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(wait_for_reconnecting(), timeout=1)
+
+    await connection.close()
+    await asyncio.sleep(0.075)
+
+    assert second.connect_started is False
+    assert connection.get_state() is ConnectionState.CLOSED

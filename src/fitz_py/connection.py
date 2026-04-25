@@ -254,11 +254,20 @@ class Connection:
             attempts += 1
             self._set_state(ConnectionState.RECONNECTING)
             await _sleep_ms(delay_ms)
+            if self._close_requested:
+                self._set_state(ConnectionState.CLOSED)
+                return
             try:
                 await self._open_and_authenticate(True)
                 return
             except Exception:
+                if self._close_requested:
+                    self._set_state(ConnectionState.CLOSED)
+                    return
                 delay_ms = min(delay_ms * 2, self._reconnect_max_backoff_ms)
+        if self._close_requested:
+            self._set_state(ConnectionState.CLOSED)
+            return
         self._set_state(ConnectionState.DISCONNECTED)
 
     async def _restore_reconnect_state(self) -> None:
