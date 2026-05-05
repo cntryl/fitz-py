@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from fitz_py import StreamCommitMode, StreamCommitNotification
+from fitz_py import StreamCommitMode, StreamCommitNotification, StreamFilterClause, StreamFilterSet
 from tests.integration.fixture.fixture import IntegrationFixture, unique_route
 
 
@@ -22,6 +22,26 @@ async def test_stream_round_trip(transport: str, auth_mode: str) -> None:
 
         records = await fixture.client.stream().read(route, start_offset=0, limit=10)
         assert [record.body for record in records[:2]] == [b"first", b"second"]
+    finally:
+        await fixture.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["tcp", "ws"])
+@pytest.mark.parametrize("auth_mode", ["anonymous", "valid_jwt"])
+async def test_stream_filtered_round_trip(transport: str, auth_mode: str) -> None:
+    fixture = await IntegrationFixture.connect_or_fail(transport, auth_mode)  # type: ignore[arg-type]
+    try:
+        route = unique_route("stream")
+        session = await fixture.client.stream().begin(route)
+        await session.append(0, b"alpha", discriminator="proj.alpha")
+        await session.append(1, b"beta", discriminator="audit.beta")
+        await session.commit()
+
+        stream_filter = StreamFilterSet(clauses=[StreamFilterClause(kind="Equals", value="proj.alpha")])
+        records = await fixture.client.stream().read(route, start_offset=0, limit=10, stream_filter=stream_filter)
+
+        assert [record.body for record in records] == [b"alpha"]
     finally:
         await fixture.close()
 

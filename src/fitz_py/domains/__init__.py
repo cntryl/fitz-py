@@ -50,6 +50,8 @@ from fitz_py.domains.stream import (
     StreamRecord,
     StreamSession,
     StreamSubscription,
+    StreamFilterClause,
+    StreamFilterSet,
 )
 
 __all__ = [
@@ -92,4 +94,6 @@ __all__ = [
     "StreamRecord",
     "StreamSession",
     "StreamSubscription",
+    "StreamFilterClause",
+    "StreamFilterSet",
 ]

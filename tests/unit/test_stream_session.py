@@ -6,11 +6,22 @@ from collections.abc import Awaitable, Callable
 
 import pytest
 
-from fitz_py import StreamCommitMode, StreamCommitNotification
+from fitz_py import (
+    StreamCommitMode,
+    StreamCommitNotification,
+    StreamFilterClause,
+    StreamFilterSet,
+)
 from fitz_py.domains.stream import StreamClient, StreamSession
 from fitz_py.errors import ErrStreamSessionClosed
 from fitz_py.protocol.buffer import BufferReader, BufferWriter
-from fitz_py.protocol.messages import MSG_STREAM_COMMIT, MSG_STREAM_NOTIFY, MSG_STREAM_SUBSCRIBE
+from fitz_py.protocol.messages import (
+    MSG_STREAM_APPEND,
+    MSG_STREAM_COMMIT,
+    MSG_STREAM_NOTIFY,
+    MSG_STREAM_READ,
+    MSG_STREAM_SUBSCRIBE,
+)
 
 
 class _FakeConnection:
@@ -72,6 +83,53 @@ async def test_stream_session_commit_encodes_mode(
     reader = BufferReader(payload)
     assert reader.read_u64_be() == 42
     assert reader.read_u8() == expected_mode
+    assert reader.is_eof()
+
+
+@pytest.mark.asyncio
+async def test_stream_session_append_encodes_discriminator() -> None:
+    connection = _FakeConnection()
+    session = StreamSession(connection, 42)
+
+    await session.append(12, b"entry", b"meta", "proj.alpha")
+
+    assert connection.requests[0][0] == MSG_STREAM_APPEND
+    reader = BufferReader(connection.requests[0][1])
+    assert reader.read_u64_be() == 42
+    assert reader.read_u64_be() == 12
+    assert reader.read_u32_be() == 5
+    assert reader.read_bytes(5) == b"entry"
+    assert reader.read_u8() == 1
+    assert reader.read_u32_be() == 4
+    assert reader.read_bytes(4) == b"meta"
+    assert reader.read_u8() == 1
+    assert reader.read_string() == "proj.alpha"
+
+
+@pytest.mark.asyncio
+async def test_stream_read_encodes_filter_payload() -> None:
+    connection = _FakeConnection()
+    client = StreamClient(connection)
+
+    stream_filter = StreamFilterSet(clauses=[StreamFilterClause(kind="Equals", value="proj.alpha")])
+    records = await client.read("stream://realm/area/resource", 5, 10, stream_filter)
+
+    assert records == []
+    assert connection.requests[0][0] == MSG_STREAM_READ
+    reader = BufferReader(connection.requests[0][1])
+    assert reader.read_route() == "stream://realm/area/resource"
+    assert reader.read_u64_be() == 5
+    assert reader.read_u64_be() == 10
+    assert reader.read_u8() == 1
+    filter_length = reader.read_u32_be()
+    expected_filter = (
+        (1).to_bytes(8, "little")
+        + (0).to_bytes(4, "little")
+        + (10).to_bytes(8, "little")
+        + b"proj.alpha"
+    )
+    assert filter_length == len(expected_filter)
+    assert reader.read_bytes(filter_length) == expected_filter
     assert reader.is_eof()
 
 

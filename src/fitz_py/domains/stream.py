@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import struct
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
 
 from fitz_py.domains.base import DomainClient
@@ -37,6 +38,18 @@ class StreamMetadata:
     first_offset: int
     last_offset: int
     record_count: int
+
+
+@dataclass(slots=True)
+class StreamFilterClause:
+    kind: str
+    value: str = ""
+    values: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class StreamFilterSet:
+    clauses: list[StreamFilterClause] = field(default_factory=list)
 
 
 class StreamCommitMode(IntEnum):
@@ -86,7 +99,11 @@ class StreamSession:
             await self.rollback()
 
     async def append(
-        self, expected_offset: int, body: bytes, metadata: bytes | None = None
+        self,
+        expected_offset: int,
+        body: bytes,
+        metadata: bytes | None = None,
+        discriminator: str | None = None,
     ) -> int | None:
         self._ensure_open("APPEND")
         writer = BufferWriter()
@@ -98,6 +115,11 @@ class StreamSession:
             writer.write_u8(1)
             writer.write_u32_be(len(metadata))
             writer.write_bytes(metadata)
+        else:
+            writer.write_u8(0)
+        if discriminator:
+            writer.write_u8(1)
+            writer.write_string(discriminator)
         else:
             writer.write_u8(0)
         reader = BufferReader(await self._connection.request(MSG_STREAM_APPEND, writer.build()))
@@ -193,16 +215,18 @@ class StreamClient(DomainClient):
         route: str,
         start_offset: int,
         limit: int = 100,
-        max_bytes: int | None = None,
+        stream_filter: StreamFilterSet | None = None,
     ) -> list[StreamRecord]:
         _assert_stream_pattern(route)
         writer = BufferWriter()
         writer.write_route(route)
         writer.write_u64_be(start_offset)
         writer.write_u64_be(limit)
-        writer.write_u8(1 if max_bytes is not None else 0)
-        if max_bytes is not None:
-            writer.write_u64_be(max_bytes)
+        filter_bytes = _encode_stream_filter_set(stream_filter)
+        writer.write_u8(1 if filter_bytes else 0)
+        if filter_bytes:
+            writer.write_u32_be(len(filter_bytes))
+            writer.write_bytes(filter_bytes)
         reader = BufferReader(await self.request_frame(MSG_STREAM_READ, writer.build()))
         status, data = _read_wrapped_stream_response(reader)
         if status != 0:
@@ -380,3 +404,39 @@ def _decode_stream_commit_notification(route: str, payload: bytes) -> StreamComm
         return StreamCommitNotification(route=route)
 
     return notification
+
+
+def _encode_stream_filter_set(stream_filter: StreamFilterSet | None) -> bytes:
+    if stream_filter is None or not stream_filter.clauses:
+        return b""
+
+    buffer = bytearray()
+    buffer.extend(struct.pack("<Q", len(stream_filter.clauses)))
+    for clause in stream_filter.clauses:
+        buffer.extend(_encode_stream_filter_clause(clause))
+    return bytes(buffer)
+
+
+def _encode_stream_filter_clause(clause: StreamFilterClause) -> bytes:
+    buffer = bytearray()
+    if clause.kind == "Equals":
+        buffer.extend(struct.pack("<I", 0))
+        _write_bincode_string(buffer, clause.value)
+    elif clause.kind == "NotEquals":
+        buffer.extend(struct.pack("<I", 1))
+        _write_bincode_string(buffer, clause.value)
+    elif clause.kind == "StartsWith":
+        buffer.extend(struct.pack("<I", 2))
+        _write_bincode_string(buffer, clause.value)
+    elif clause.kind == "AnyOf":
+        buffer.extend(struct.pack("<I", 3))
+        buffer.extend(struct.pack("<Q", len(clause.values)))
+        for value in clause.values:
+            _write_bincode_string(buffer, value)
+    return bytes(buffer)
+
+
+def _write_bincode_string(buffer: bytearray, value: str) -> None:
+    encoded = value.encode("utf-8")
+    buffer.extend(struct.pack("<Q", len(encoded)))
+    buffer.extend(encoded)

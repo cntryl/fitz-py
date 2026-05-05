@@ -39,6 +39,8 @@ from fitz_py.domains import (
     StreamRecord,
     StreamSession,
     StreamSubscription,
+    StreamFilterClause,
+    StreamFilterSet,
 )
 from fitz_py.errors import (
     AuthenticationError,
@@ -173,6 +175,8 @@ __all__ = [
     "ScheduleNotification",
     "ScheduleSubscription",
     "StreamClient",
+    "StreamFilterClause",
+    "StreamFilterSet",
     "StreamCommitMode",
     "StreamCommitNotification",
     "StreamError",
