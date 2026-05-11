@@ -3,8 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from fitz_py.domains.base import DomainClient
 from fitz_py.domains._routes import is_exact_route_shape
+from fitz_py.domains.base import DomainClient
 from fitz_py.errors import ErrKvOperationNotAllowed, KvError, kv_error
 from fitz_py.protocol.buffer import BufferReader, BufferWriter
 from fitz_py.protocol.messages import (
@@ -49,7 +49,9 @@ class KvTransaction:
         self._closed = False
         self._closed_reason: str | None = None
         on_disconnect = getattr(self._connection, "on_disconnect", None)
-        self._disconnect_unregister = on_disconnect(self._invalidate) if callable(on_disconnect) else None
+        self._disconnect_unregister = (
+            on_disconnect(self._invalidate) if callable(on_disconnect) else None
+        )
 
     async def __aenter__(self) -> "KvTransaction":
         return self

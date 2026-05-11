@@ -31,6 +31,31 @@ await client.close()
 
 The package is `asyncio`-first and does not provide a synchronous wrapper.
 
+## Stream replay
+
+```python
+from fitz_py import StreamFilterClause, StreamFilterSet
+
+stream_filter = StreamFilterSet(clauses=[StreamFilterClause(kind="Equals", value="proj.alpha")])
+
+records = await client.stream().read(
+    "stream://example/app/events",
+    start_offset=0,
+    limit=100,
+    stream_filter=stream_filter,
+)
+page = await client.stream().read_page(
+    "stream://example/app/events",
+    start_offset=0,
+    limit=100,
+    stream_filter=stream_filter,
+)
+
+# `read()` preserves the compatibility event-only shape.
+# `read_page()` exposes filtered markers and cursor metadata.
+assert page.cursor.last_resource_offset >= 0
+```
+
 ## Parity Goals
 
 `fitz-py` tracks the Fitz client behavior implemented in `fitz-go` and `fitz-ts`.
@@ -44,6 +69,7 @@ Fast local checks:
 
 ```bash
 python -m pip install -e ".[dev]"
+python -m ruff format --check .
 python -m ruff check .
 python -m pytest tests/unit
 ```
@@ -61,6 +87,8 @@ One-shot verification:
 ```bash
 hatch run verify
 ```
+
+The local quality bar is formatter first, then lint, then unit tests.
 
 Broker-backed verification:
 

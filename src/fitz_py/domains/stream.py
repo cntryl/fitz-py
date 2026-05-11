@@ -5,10 +5,10 @@ import json
 import struct
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from enum import IntEnum
+from enum import Enum, IntEnum
 
-from fitz_py.domains.base import DomainClient
 from fitz_py.domains._routes import is_exact_route_shape, is_selector_route_shape
+from fitz_py.domains.base import DomainClient
 from fitz_py.errors import ErrStreamSessionClosed, StreamError, stream_error
 from fitz_py.protocol.buffer import BufferReader, BufferWriter
 from fitz_py.protocol.messages import (
@@ -30,7 +30,11 @@ StreamHandler = Callable[["StreamCommitNotification"], None | Awaitable[None]]
 @dataclass(slots=True)
 class StreamRecord:
     offset: int
-    body: bytes
+    area_offset: int | None = None
+    realm_offset: int | None = None
+    body: bytes = b""
+    metadata: bytes | None = None
+    timestamp: int = 0
 
 
 @dataclass(slots=True)
@@ -50,6 +54,42 @@ class StreamFilterClause:
 @dataclass(slots=True)
 class StreamFilterSet:
     clauses: list[StreamFilterClause] = field(default_factory=list)
+
+
+class StreamFilteredReason(str, Enum):
+    SERVER_FILTER = "server_filter"
+    PERMISSION = "permission"
+    PROJECTION = "projection"
+
+
+class StreamReadItemKind(str, Enum):
+    EVENT = "event"
+    FILTERED = "filtered"
+    FILTERED_RANGE = "filtered_range"
+
+
+@dataclass(slots=True)
+class StreamReadCursor:
+    last_resource_offset: int = 0
+    last_area_offset: int | None = None
+    last_realm_offset: int | None = None
+    has_more: bool = False
+
+
+@dataclass(slots=True)
+class StreamReadItem:
+    kind: StreamReadItemKind
+    record: StreamRecord | None = None
+    offset: int = 0
+    from_offset: int = 0
+    to_offset: int = 0
+    reason: StreamFilteredReason | None = None
+
+
+@dataclass(slots=True)
+class StreamReadPage:
+    items: list[StreamReadItem] = field(default_factory=list)
+    cursor: StreamReadCursor = field(default_factory=StreamReadCursor)
 
 
 class StreamCommitMode(IntEnum):
@@ -89,7 +129,9 @@ class StreamSession:
         self._closed = False
         self._closed_reason: str | None = None
         on_disconnect = getattr(self._connection, "on_disconnect", None)
-        self._disconnect_unregister = on_disconnect(self._invalidate) if callable(on_disconnect) else None
+        self._disconnect_unregister = (
+            on_disconnect(self._invalidate) if callable(on_disconnect) else None
+        )
 
     async def __aenter__(self) -> "StreamSession":
         return self
@@ -216,12 +258,37 @@ class StreamClient(DomainClient):
         start_offset: int,
         limit: int = 100,
         stream_filter: StreamFilterSet | None = None,
+        *,
+        max_bytes: int | None = None,
     ) -> list[StreamRecord]:
+        page = await self.read_page(
+            route,
+            start_offset,
+            limit=limit,
+            stream_filter=stream_filter,
+            max_bytes=max_bytes,
+        )
+        return _flatten_stream_read_items(page.items)
+
+    async def read_page(
+        self,
+        route: str,
+        start_offset: int,
+        limit: int = 100,
+        stream_filter: StreamFilterSet | None = None,
+        *,
+        max_bytes: int | None = None,
+    ) -> StreamReadPage:
         _assert_stream_pattern(route)
         writer = BufferWriter()
         writer.write_route(route)
         writer.write_u64_be(start_offset)
         writer.write_u64_be(limit)
+        if max_bytes is None:
+            writer.write_u8(0)
+        else:
+            writer.write_u8(1)
+            writer.write_u64_be(max_bytes)
         filter_bytes = _encode_stream_filter_set(stream_filter)
         writer.write_u8(1 if filter_bytes else 0)
         if filter_bytes:
@@ -232,13 +299,8 @@ class StreamClient(DomainClient):
         if status != 0:
             raise stream_error(f"READ failed with status {status}", status)
         if not data:
-            return []
-        inner = BufferReader(data)
-        count = inner.read_u32_be()
-        records: list[StreamRecord] = []
-        for _ in range(count):
-            records.append(_read_stream_record(inner))
-        return records
+            return StreamReadPage()
+        return _read_stream_read_page(data)
 
     async def peek(self, route: str) -> StreamRecord | None:
         _assert_stream_route(route)
@@ -352,12 +414,80 @@ def _read_optional_bytes(reader: BufferReader) -> bytes | None:
 
 def _read_stream_record(reader: BufferReader) -> StreamRecord:
     offset = reader.read_u64_be()
-    _read_optional_u64(reader)
-    _read_optional_u64(reader)
+    area_offset = _read_optional_u64(reader)
+    realm_offset = _read_optional_u64(reader)
     body = reader.read_bytes(reader.read_u32_be())
-    _read_optional_bytes(reader)
-    reader.read_u64_be()
-    return StreamRecord(offset=offset, body=body)
+    metadata = _read_optional_bytes(reader)
+    timestamp = reader.read_u64_be()
+    return StreamRecord(
+        offset=offset,
+        area_offset=area_offset,
+        realm_offset=realm_offset,
+        body=body,
+        metadata=metadata,
+        timestamp=timestamp,
+    )
+
+
+def _read_stream_read_page(data: bytes) -> StreamReadPage:
+    reader = BufferReader(data)
+    count = reader.read_u32_be()
+    items = [_read_stream_read_item(reader) for _ in range(count)]
+    cursor = StreamReadCursor(
+        last_resource_offset=reader.read_u64_be(),
+        last_area_offset=_read_optional_u64(reader),
+        last_realm_offset=_read_optional_u64(reader),
+        has_more=_read_bool_u8(reader),
+    )
+    return StreamReadPage(items=items, cursor=cursor)
+
+
+def _read_stream_read_item(reader: BufferReader) -> StreamReadItem:
+    tag = reader.read_u8()
+    if tag == 0:
+        return StreamReadItem(kind=StreamReadItemKind.EVENT, record=_read_stream_record(reader))
+    if tag == 1:
+        return StreamReadItem(
+            kind=StreamReadItemKind.FILTERED,
+            offset=reader.read_u64_be(),
+            reason=_read_filtered_reason(reader),
+        )
+    if tag == 2:
+        return StreamReadItem(
+            kind=StreamReadItemKind.FILTERED_RANGE,
+            from_offset=reader.read_u64_be(),
+            to_offset=reader.read_u64_be(),
+            reason=_read_filtered_reason(reader),
+        )
+    raise StreamError(f"Unknown stream read item tag: {tag}", "INVALID_READ_ITEM")
+
+
+def _read_filtered_reason(reader: BufferReader) -> StreamFilteredReason | None:
+    tag = reader.read_u8()
+    if tag == 0:
+        return None
+    if tag == 1:
+        return StreamFilteredReason.SERVER_FILTER
+    if tag == 2:
+        return StreamFilteredReason.PERMISSION
+    if tag == 3:
+        return StreamFilteredReason.PROJECTION
+    raise StreamError(f"Invalid filtered reason tag: {tag}", "INVALID_FILTERED_REASON")
+
+
+def _read_bool_u8(reader: BufferReader) -> bool:
+    value = reader.read_u8()
+    if value not in (0, 1):
+        raise StreamError(f"Invalid boolean flag: {value}", "INVALID_BOOLEAN_FLAG")
+    return value == 1
+
+
+def _flatten_stream_read_items(items: list[StreamReadItem]) -> list[StreamRecord]:
+    return [
+        item.record
+        for item in items
+        if item.kind is StreamReadItemKind.EVENT and item.record is not None
+    ]
 
 
 def _assert_stream_route(route: str) -> None:

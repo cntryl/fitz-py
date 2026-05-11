@@ -4,8 +4,8 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
-from fitz_py.domains.base import DomainClient
 from fitz_py.domains._routes import is_exact_route_shape
+from fitz_py.domains.base import DomainClient
 from fitz_py.errors import ScheduleError, schedule_error
 from fitz_py.protocol.buffer import BufferReader, BufferWriter
 from fitz_py.protocol.messages import (

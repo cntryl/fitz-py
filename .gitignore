@@ -12,7 +12,10 @@ env/
 .tox/
 .coverage
 .coverage.*
-artifacts/
+artifacts/*
+!artifacts/benchmarks/
+artifacts/benchmarks/*
+!artifacts/benchmarks/hotpath.py
 conformance-results.json
 htmlcov/
 build/

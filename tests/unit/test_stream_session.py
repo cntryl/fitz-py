@@ -10,7 +10,9 @@ from fitz_py import (
     StreamCommitMode,
     StreamCommitNotification,
     StreamFilterClause,
+    StreamFilteredReason,
     StreamFilterSet,
+    StreamReadItemKind,
 )
 from fitz_py.domains.stream import StreamClient, StreamSession
 from fitz_py.errors import ErrStreamSessionClosed
@@ -30,9 +32,12 @@ class _FakeConnection:
         self.notification_handlers: dict[int, Callable[[bytes], None]] = {}
         self.reconnect_handlers: list[Callable[[], Awaitable[None]]] = []
         self.disconnect_handlers: list[Callable[[], None | Awaitable[None]]] = []
+        self.responses: dict[int, bytes] = {}
 
     async def request(self, message_type: int, payload: bytes) -> bytes:
         self.requests.append((message_type, payload))
+        if message_type in self.responses:
+            return self.responses[message_type]
         if message_type == MSG_STREAM_SUBSCRIBE:
             return b"\x00\x01" + (7).to_bytes(8, "big")
         return b"\x00"
@@ -120,6 +125,7 @@ async def test_stream_read_encodes_filter_payload() -> None:
     assert reader.read_route() == "stream://realm/area/resource"
     assert reader.read_u64_be() == 5
     assert reader.read_u64_be() == 10
+    assert reader.read_u8() == 0
     assert reader.read_u8() == 1
     filter_length = reader.read_u32_be()
     expected_filter = (
@@ -131,6 +137,61 @@ async def test_stream_read_encodes_filter_payload() -> None:
     assert filter_length == len(expected_filter)
     assert reader.read_bytes(filter_length) == expected_filter
     assert reader.is_eof()
+
+
+@pytest.mark.asyncio
+async def test_stream_read_page_decodes_filtered_items_and_cursor() -> None:
+    connection = _FakeConnection()
+    client = StreamClient(connection)
+
+    inner = bytearray()
+    inner.extend((3).to_bytes(4, "big"))
+    inner.extend(b"\x00")
+    inner.extend((41).to_bytes(8, "big"))
+    inner.extend(b"\x01")
+    inner.extend((51).to_bytes(8, "big"))
+    inner.extend(b"\x00")
+    inner.extend((5).to_bytes(4, "big"))
+    inner.extend(b"alpha")
+    inner.extend(b"\x00")
+    inner.extend((111).to_bytes(8, "big"))
+    inner.extend(b"\x01")
+    inner.extend((42).to_bytes(8, "big"))
+    inner.extend(b"\x01")
+    inner.extend(b"\x02")
+    inner.extend((43).to_bytes(8, "big"))
+    inner.extend((45).to_bytes(8, "big"))
+    inner.extend(b"\x02")
+    inner.extend((45).to_bytes(8, "big"))
+    inner.extend(b"\x01")
+    inner.extend((52).to_bytes(8, "big"))
+    inner.extend(b"\x00")
+    inner.extend(b"\x01")
+
+    response = bytearray(b"\x00\x00")
+    response.extend(len(inner).to_bytes(4, "big"))
+    response.extend(inner)
+    connection.responses[MSG_STREAM_READ] = bytes(response)
+
+    page = await client.read_page("stream://realm/area/resource", 0, 10)
+
+    assert page.cursor.last_resource_offset == 45
+    assert page.cursor.last_area_offset == 52
+    assert page.cursor.last_realm_offset is None
+    assert page.cursor.has_more is True
+    assert len(page.items) == 3
+    assert page.items[0].kind is StreamReadItemKind.EVENT
+    assert page.items[0].record is not None
+    assert page.items[0].record.offset == 41
+    assert page.items[0].record.area_offset == 51
+    assert page.items[0].record.body == b"alpha"
+    assert page.items[1].kind is StreamReadItemKind.FILTERED
+    assert page.items[1].offset == 42
+    assert page.items[1].reason is StreamFilteredReason.SERVER_FILTER
+    assert page.items[2].kind is StreamReadItemKind.FILTERED_RANGE
+    assert page.items[2].from_offset == 43
+    assert page.items[2].to_offset == 45
+    assert page.items[2].reason is StreamFilteredReason.PERMISSION
 
 
 @pytest.mark.asyncio

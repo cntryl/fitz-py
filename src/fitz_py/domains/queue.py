@@ -5,8 +5,8 @@ import contextlib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
-from fitz_py.domains.base import DomainClient
 from fitz_py.domains._routes import is_exact_route_shape, is_selector_route_shape
+from fitz_py.domains.base import DomainClient
 from fitz_py.errors import QueueError, queue_error
 from fitz_py.protocol.buffer import BufferReader, BufferWriter
 from fitz_py.protocol.messages import (

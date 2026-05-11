@@ -5,8 +5,8 @@ import os
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 
-from fitz_py.domains.base import DomainClient
 from fitz_py.domains._routes import is_concrete_route_shape
+from fitz_py.domains.base import DomainClient
 from fitz_py.errors import ConnectionError, ErrRpcTimeout, RpcError, TransportError, rpc_error
 from fitz_py.protocol.buffer import BufferReader, BufferWriter
 from fitz_py.protocol.messages import (

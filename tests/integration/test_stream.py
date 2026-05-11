@@ -4,7 +4,14 @@ import asyncio
 
 import pytest
 
-from fitz_py import StreamCommitMode, StreamCommitNotification, StreamFilterClause, StreamFilterSet
+from fitz_py import (
+    StreamCommitMode,
+    StreamCommitNotification,
+    StreamFilterClause,
+    StreamFilteredReason,
+    StreamFilterSet,
+    StreamReadItemKind,
+)
 from tests.integration.fixture.fixture import IntegrationFixture, unique_route
 
 
@@ -38,10 +45,26 @@ async def test_stream_filtered_round_trip(transport: str, auth_mode: str) -> Non
         await session.append(1, b"beta", discriminator="audit.beta")
         await session.commit()
 
-        stream_filter = StreamFilterSet(clauses=[StreamFilterClause(kind="Equals", value="proj.alpha")])
-        records = await fixture.client.stream().read(route, start_offset=0, limit=10, stream_filter=stream_filter)
+        stream_filter = StreamFilterSet(
+            clauses=[StreamFilterClause(kind="Equals", value="proj.alpha")]
+        )
+        records = await fixture.client.stream().read(
+            route, start_offset=0, limit=10, stream_filter=stream_filter
+        )
+        page = await fixture.client.stream().read_page(
+            route, start_offset=0, limit=10, stream_filter=stream_filter
+        )
 
         assert [record.body for record in records] == [b"alpha"]
+        assert page.cursor.last_resource_offset == 1
+        assert page.cursor.has_more is False
+        assert len(page.items) == 2
+        assert page.items[0].kind is StreamReadItemKind.EVENT
+        assert page.items[0].record is not None
+        assert page.items[0].record.body == b"alpha"
+        assert page.items[1].kind is StreamReadItemKind.FILTERED
+        assert page.items[1].offset == 1
+        assert page.items[1].reason is StreamFilteredReason.SERVER_FILTER
     finally:
         await fixture.close()
 

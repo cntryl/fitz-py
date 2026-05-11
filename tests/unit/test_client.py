@@ -11,7 +11,9 @@ def test_client_starts_disconnected() -> None:
 
 
 @pytest.mark.asyncio
-async def test_client_async_context_manager_connects_and_closes(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_client_async_context_manager_connects_and_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     client = Client(ClientConfig(url="ws://localhost:4190/ws"))
     calls: list[str] = []
 
