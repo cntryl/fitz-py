@@ -1,3 +1,5 @@
+"""Shared SDK configuration, transport, token, and connection-state types."""
+
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
@@ -10,6 +12,8 @@ TokenProvider: TypeAlias = Callable[[], str | Awaitable[str]]
 
 
 class ConnectionState(str, Enum):
+    """Lifecycle states for a Fitz client connection."""
+
     DISCONNECTED = "DISCONNECTED"
     CONNECTING = "CONNECTING"
     CONNECTED = "CONNECTED"
@@ -21,6 +25,8 @@ class ConnectionState(str, Enum):
 
 @dataclass(slots=True)
 class ReconnectOptions:
+    """Reconnect policy settings for automatic transport recovery."""
+
     enabled: bool = False
     max_attempts: int | float = float("inf")
     backoff_ms: int = 250
@@ -29,6 +35,8 @@ class ReconnectOptions:
 
 @dataclass(slots=True)
 class ClientConfig:
+    """Configuration used to construct a high-level Fitz client."""
+
     url: str
     token_provider: TokenProvider | None = None
     timeout_ms: int = 30000

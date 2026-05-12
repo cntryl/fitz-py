@@ -1,3 +1,5 @@
+"""Route-shape helper predicates used by domain validation routines."""
+
 from __future__ import annotations
 
 

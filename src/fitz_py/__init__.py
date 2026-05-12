@@ -1,3 +1,5 @@
+"""Public exports for the Fitz Python SDK."""
+
 from fitz_py.client import Client
 from fitz_py.domains import (
     InboundRpcRequest,

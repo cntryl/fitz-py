@@ -1,3 +1,5 @@
+"""Schedule domain client, schedule models, and schedule notifications."""
+
 from __future__ import annotations
 
 import asyncio
@@ -23,11 +25,15 @@ ScheduleHandler = Callable[["ScheduleNotification"], None | Awaitable[None]]
 
 @dataclass(slots=True)
 class ScheduleNotification:
+    """Notification payload delivered when a schedule fires."""
+
     payload: bytes
 
 
 @dataclass(slots=True)
 class ScheduleEntry:
+    """Schedule record returned by list operations."""
+
     id: str
     route: str
     cron: str
@@ -36,11 +42,15 @@ class ScheduleEntry:
 
 @dataclass(slots=True)
 class _ScheduleSubscriptionState:
+    """Internal handler registry for a subscribed schedule pattern."""
+
     sub_id: int
     handlers: dict[int, ScheduleHandler] = field(default_factory=dict)
 
 
 class ScheduleSubscription:
+    """Handle for an active schedule subscription."""
+
     def __init__(
         self,
         sub_id: int,
@@ -60,6 +70,8 @@ class ScheduleSubscription:
 
 
 class ScheduleClient(DomainClient):
+    """Schedule domain operations for create, cancel, list, and subscribe."""
+
     def __init__(self, connection) -> None:
         super().__init__(connection)
         self._subscriptions_by_pattern: dict[str, _ScheduleSubscriptionState] = {}

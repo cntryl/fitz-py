@@ -1,3 +1,5 @@
+"""Lease domain client, lease handles, and lease change subscriptions."""
+
 from __future__ import annotations
 
 import asyncio
@@ -24,6 +26,8 @@ LeaseHandler = Callable[[str], None | Awaitable[None]]
 
 @dataclass(slots=True)
 class LeaseInfo:
+    """Current lease ownership and TTL information for a route."""
+
     is_held: bool
     owner: str | None = None
     ttl_remaining_secs: int | None = None
@@ -31,6 +35,8 @@ class LeaseInfo:
 
 @dataclass(slots=True)
 class Lease:
+    """Client-side lease handle with extend and release helpers."""
+
     route: str
     token: int
     _client: "LeaseClient"
@@ -45,6 +51,8 @@ class Lease:
 
 
 class LeaseSubscription:
+    """Handle for an active lease change subscription."""
+
     def __init__(
         self, sub_id: int, pattern: str, unsubscribe: Callable[[int], Awaitable[None]]
     ) -> None:
@@ -57,6 +65,8 @@ class LeaseSubscription:
 
 
 class LeaseClient(DomainClient):
+    """Lease domain operations for acquire, extend, release, query, and subscribe."""
+
     def __init__(self, connection) -> None:
         super().__init__(connection)
         self._subscriptions: dict[int, tuple[str, LeaseHandler]] = {}

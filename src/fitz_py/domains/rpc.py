@@ -1,3 +1,5 @@
+"""RPC domain client, request/response streaming, and worker registration."""
+
 from __future__ import annotations
 
 import asyncio
@@ -23,12 +25,16 @@ RpcHandler = Callable[["InboundRpcRequest", "ResponseWriter"], None | Awaitable[
 
 @dataclass(slots=True)
 class ResponseFrame:
+    """Single response frame emitted by an RPC call stream."""
+
     body: bytes
     sequence: int
 
 
 @dataclass(slots=True)
 class InboundRpcRequest:
+    """Inbound RPC request payload delivered to a registered worker."""
+
     correlation_id: bytes
     route: str
     reply_route: str
@@ -36,6 +42,8 @@ class InboundRpcRequest:
 
 
 class ResponseWriter:
+    """Sends streamed RPC response frames back to the broker."""
+
     def __init__(self, connection, correlation_id: bytes) -> None:
         self._connection = connection
         self._correlation_id = correlation_id
@@ -59,6 +67,8 @@ class ResponseWriter:
 
 
 class RpcSubscription:
+    """Handle for an active RPC worker registration."""
+
     def __init__(self, route: str, unsubscribe: Callable[[str], Awaitable[None]]) -> None:
         self.route = route
         self._unsubscribe = unsubscribe
@@ -68,6 +78,8 @@ class RpcSubscription:
 
 
 class RpcIterator(AsyncIterator[ResponseFrame]):
+    """Async iterator over streamed RPC response frames."""
+
     def __init__(self, correlation_id: bytes, client: "RpcClient", timeout_ms: int) -> None:
         self._correlation_id = correlation_id
         self._client = client
@@ -111,6 +123,8 @@ class RpcIterator(AsyncIterator[ResponseFrame]):
 
 
 class RpcClient(DomainClient):
+    """RPC domain entry point for issuing calls and registering workers."""
+
     def __init__(self, connection) -> None:
         super().__init__(connection)
         self._pending: dict[str, RpcIterator] = {}

@@ -1,3 +1,5 @@
+"""Queue domain client, queue items, and availability subscriptions."""
+
 from __future__ import annotations
 
 import asyncio
@@ -23,6 +25,8 @@ QueueAvailabilityHandler = Callable[[str], None | Awaitable[None]]
 
 
 class QueueSubscription:
+    """Handle for an active queue availability subscription."""
+
     def __init__(
         self, sub_id: int, pattern: str, unsubscribe: Callable[[int], Awaitable[None]]
     ) -> None:
@@ -36,6 +40,8 @@ class QueueSubscription:
 
 @dataclass(slots=True)
 class QueueItem:
+    """Reserved queue item with completion and lease-extension helpers."""
+
     route: str
     id: int
     token: int
@@ -53,6 +59,8 @@ class QueueItem:
 
 
 class QueueClient(DomainClient):
+    """Queue domain operations for enqueue, reserve, and availability subscribe."""
+
     def __init__(self, connection) -> None:
         super().__init__(connection)
         self._subscriptions: dict[int, tuple[str, QueueAvailabilityHandler]] = {}

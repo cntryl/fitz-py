@@ -1,3 +1,5 @@
+"""KV domain client and transaction primitives for Fitz."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -25,23 +27,31 @@ KVDurability = Literal["none", "async", "sync"]
 
 @dataclass(slots=True)
 class KvGetResult:
+    """Result of a KV get operation."""
+
     found: bool
     value: bytes | None = None
 
 
 @dataclass(slots=True)
 class KvPair:
+    """A single key/value pair returned by KV scans."""
+
     key: bytes
     value: bytes
 
 
 @dataclass(slots=True)
 class KvScanResult:
+    """Batch result from a KV scan operation."""
+
     items: list[KvPair]
     has_more: bool = False
 
 
 class KvTransaction:
+    """Scoped transactional KV operations for a single begin/commit lifecycle."""
+
     def __init__(self, connection, route: str, tx_id: int) -> None:
         self._connection = connection
         self._route = route
@@ -205,6 +215,8 @@ class KvTransaction:
 
 
 class KvClient(DomainClient):
+    """KV domain entry point for creating transactions."""
+
     async def begin(
         self,
         route: str,

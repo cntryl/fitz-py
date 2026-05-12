@@ -1,3 +1,5 @@
+"""Notice domain publish/subscribe client and notification models."""
+
 from __future__ import annotations
 
 import asyncio
@@ -20,17 +22,23 @@ NoticeHandler = Callable[["NoticeMessage"], None | Awaitable[None]]
 
 @dataclass(slots=True)
 class NoticeMessage:
+    """Notice payload delivered to a subscriber callback."""
+
     route: str
     body: bytes
 
 
 @dataclass(slots=True)
 class _NoticeSubscriptionState:
+    """Internal handler registry for a single subscribed notice pattern."""
+
     sub_id: int
     handlers: dict[int, NoticeHandler] = field(default_factory=dict)
 
 
 class NoticeSubscription:
+    """Handle for an active notice pattern subscription."""
+
     def __init__(
         self,
         sub_id: int,
@@ -50,6 +58,8 @@ class NoticeSubscription:
 
 
 class NoticeClient(DomainClient):
+    """Notice domain operations for publish and pattern subscriptions."""
+
     def __init__(self, connection) -> None:
         super().__init__(connection)
         self._subscriptions_by_pattern: dict[str, _NoticeSubscriptionState] = {}

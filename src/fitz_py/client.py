@@ -1,3 +1,5 @@
+"""High-level Fitz SDK client and domain accessors."""
+
 from __future__ import annotations
 
 from fitz_py.connection import Connection
@@ -14,6 +16,8 @@ from fitz_py.types import ClientConfig, ConnectionState, TokenProvider
 
 
 class Client:
+    """Top-level Fitz client that manages a connection and domain clients."""
+
     def __init__(self, config: ClientConfig) -> None:
         if not config.url:
             raise ValueError("url is required")

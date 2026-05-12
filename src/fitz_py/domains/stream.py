@@ -1,3 +1,5 @@
+"""Stream domain client, sessions, filters, read models, and subscriptions."""
+
 from __future__ import annotations
 
 import asyncio
@@ -29,6 +31,8 @@ StreamHandler = Callable[["StreamCommitNotification"], None | Awaitable[None]]
 
 @dataclass(slots=True)
 class StreamRecord:
+    """Single stream event record with offsets and payload data."""
+
     offset: int
     area_offset: int | None = None
     realm_offset: int | None = None
@@ -39,6 +43,8 @@ class StreamRecord:
 
 @dataclass(slots=True)
 class StreamMetadata:
+    """Aggregate stream metadata returned by metadata queries."""
+
     first_offset: int
     last_offset: int
     record_count: int
@@ -46,6 +52,8 @@ class StreamMetadata:
 
 @dataclass(slots=True)
 class StreamFilterClause:
+    """One stream filter clause used in read filter sets."""
+
     kind: str
     value: str = ""
     values: list[str] = field(default_factory=list)
@@ -53,16 +61,22 @@ class StreamFilterClause:
 
 @dataclass(slots=True)
 class StreamFilterSet:
+    """Collection of filter clauses applied to stream reads."""
+
     clauses: list[StreamFilterClause] = field(default_factory=list)
 
 
 class StreamFilteredReason(str, Enum):
+    """Reason a read item was filtered instead of returned as an event."""
+
     SERVER_FILTER = "server_filter"
     PERMISSION = "permission"
     PROJECTION = "projection"
 
 
 class StreamReadItemKind(str, Enum):
+    """Discriminator for stream read page item variants."""
+
     EVENT = "event"
     FILTERED = "filtered"
     FILTERED_RANGE = "filtered_range"
@@ -70,6 +84,8 @@ class StreamReadItemKind(str, Enum):
 
 @dataclass(slots=True)
 class StreamReadCursor:
+    """Pagination cursor state for subsequent stream reads."""
+
     last_resource_offset: int = 0
     last_area_offset: int | None = None
     last_realm_offset: int | None = None
@@ -78,6 +94,8 @@ class StreamReadCursor:
 
 @dataclass(slots=True)
 class StreamReadItem:
+    """One item in a stream read page, event or filtered marker."""
+
     kind: StreamReadItemKind
     record: StreamRecord | None = None
     offset: int = 0
@@ -88,17 +106,23 @@ class StreamReadItem:
 
 @dataclass(slots=True)
 class StreamReadPage:
+    """Paged stream read payload containing items and next-cursor state."""
+
     items: list[StreamReadItem] = field(default_factory=list)
     cursor: StreamReadCursor = field(default_factory=StreamReadCursor)
 
 
 class StreamCommitMode(IntEnum):
+    """Durability mode used when committing a stream session."""
+
     BUFFERED = 0
     SYNC = 1
 
 
 @dataclass(slots=True)
 class StreamCommitNotification:
+    """Payload delivered for stream commit notifications."""
+
     route: str
     event: str = ""
     first_resource_offset: int = 0
@@ -111,6 +135,8 @@ class StreamCommitNotification:
 
 
 class StreamSubscription:
+    """Handle for an active stream commit subscription."""
+
     def __init__(
         self, sub_id: int, pattern: str, unsubscribe: Callable[[str], Awaitable[None]]
     ) -> None:
@@ -123,6 +149,8 @@ class StreamSubscription:
 
 
 class StreamSession:
+    """Mutable append session returned by stream begin operations."""
+
     def __init__(self, connection, session_id: int) -> None:
         self._connection = connection
         self._session_id = session_id
@@ -227,6 +255,8 @@ class StreamSession:
 
 
 class StreamClient(DomainClient):
+    """Stream domain operations for write sessions, reads, and notifications."""
+
     def __init__(self, connection) -> None:
         super().__init__(connection)
         self._subscriptions: dict[int, tuple[str, StreamHandler]] = {}

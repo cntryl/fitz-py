@@ -1,3 +1,5 @@
+"""Connection lifecycle, authentication, request/response, and reconnect logic."""
+
 from __future__ import annotations
 
 import asyncio
@@ -28,6 +30,8 @@ async def _resolve_token(token_provider: TokenProvider) -> str:
 
 
 class Connection:
+    """Owns the transport, multiplexer, and Fitz connection state machine."""
+
     def __init__(
         self,
         transport_factory: TransportFactory,

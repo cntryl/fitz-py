@@ -1,3 +1,5 @@
+"""In-flight request correlation and notification dispatch for framed messages."""
+
 from __future__ import annotations
 
 import asyncio
@@ -13,11 +15,15 @@ NotificationHandler = Callable[[bytes], None]
 
 @dataclass(slots=True)
 class PendingRequest:
+    """Tracks a pending request future and its timeout handle."""
+
     future: asyncio.Future[bytes]
     timeout_handle: asyncio.TimerHandle
 
 
 class Multiplexer:
+    """Routes response frames to awaiters and notification frames to handlers."""
+
     def __init__(self) -> None:
         self._pending: dict[int, deque[PendingRequest]] = defaultdict(deque)
         self._notification_handlers: dict[int, NotificationHandler] = {}

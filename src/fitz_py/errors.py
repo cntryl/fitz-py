@@ -1,3 +1,5 @@
+"""SDK error hierarchy and protocol-status error mapping helpers."""
+
 from __future__ import annotations
 
 from collections.abc import Callable
