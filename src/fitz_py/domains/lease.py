@@ -38,16 +38,16 @@ class Lease:
     """Client-side lease handle with extend and release helpers."""
 
     route: str
-    token: int
+    _token: int
     _client: "LeaseClient"
 
     async def extend(self, ttl_secs: int) -> None:
-        new_token = await self._client.extend(self.route, self.token, ttl_secs)
+        new_token = await self._client.extend(self.route, self._token, ttl_secs)
         if new_token is not None:
-            self.token = new_token
+            self._token = new_token
 
     async def release(self) -> None:
-        await self._client.release(self.route, self.token)
+        await self._client.release(self.route, self._token)
 
 
 class LeaseSubscription:
@@ -56,12 +56,12 @@ class LeaseSubscription:
     def __init__(
         self, sub_id: int, pattern: str, unsubscribe: Callable[[int], Awaitable[None]]
     ) -> None:
-        self.sub_id = sub_id
+        self._sub_id = sub_id
         self.pattern = pattern
         self._unsubscribe = unsubscribe
 
     async def unsubscribe(self) -> None:
-        await self._unsubscribe(self.sub_id)
+        await self._unsubscribe(self._sub_id)
 
 
 class LeaseClient(DomainClient):
@@ -88,7 +88,7 @@ class LeaseClient(DomainClient):
         token = reader.read_u64_be() if not reader.is_eof() else None
         if token is None:
             raise LeaseError("ACQUIRE response missing fencing token", "MISSING_TOKEN")
-        return Lease(route=route, token=token, _client=self)
+        return Lease(route=route, _token=token, _client=self)
 
     async def extend(self, route: str, token: int, ttl_secs: int) -> int | None:
         _assert_lease_route(route)

@@ -60,7 +60,7 @@ async def test_notice_multiple_local_subscribers_same_pattern(
         sub_one = await fixture.client.notice().subscribe(route, handler_one)
         sub_two = await fixture.client.notice().subscribe(route, handler_two)
 
-        assert sub_one.sub_id == sub_two.sub_id
+        assert sub_one._sub_id == sub_two._sub_id
         assert sub_one.pattern == sub_two.pattern == route
 
         await fixture.client.notice().publish(route, b"fanout")

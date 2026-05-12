@@ -140,7 +140,7 @@ class StreamSubscription:
     def __init__(
         self, sub_id: int, pattern: str, unsubscribe: Callable[[str], Awaitable[None]]
     ) -> None:
-        self.sub_id = sub_id
+        self._sub_id = sub_id
         self.pattern = pattern
         self._unsubscribe = unsubscribe
 

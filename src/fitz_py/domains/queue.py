@@ -30,12 +30,12 @@ class QueueSubscription:
     def __init__(
         self, sub_id: int, pattern: str, unsubscribe: Callable[[int], Awaitable[None]]
     ) -> None:
-        self.sub_id = sub_id
+        self._sub_id = sub_id
         self.pattern = pattern
         self._unsubscribe = unsubscribe
 
     async def unsubscribe(self) -> None:
-        await self._unsubscribe(self.sub_id)
+        await self._unsubscribe(self._sub_id)
 
 
 @dataclass(slots=True)
@@ -43,19 +43,19 @@ class QueueItem:
     """Reserved queue item with completion and lease-extension helpers."""
 
     route: str
-    id: int
-    token: int
+    _id: int
+    _token: int
     body: bytes
     _client: "QueueClient"
 
     async def extend(self, lease_seconds: int) -> None:
-        await self._client._extend(self.route, self.id, self.token, lease_seconds)
+        await self._client._extend(self.route, self._id, self._token, lease_seconds)
 
     async def complete(self) -> None:
-        await self._client._complete(self.route, self.id, self.token)
+        await self._client._complete(self.route, self._id, self._token)
 
     async def complete_with_token(self, token: int) -> None:
-        await self._client._complete(self.route, self.id, token)
+        await self._client._complete(self.route, self._id, token)
 
 
 class QueueClient(DomainClient):
@@ -147,7 +147,7 @@ class QueueClient(DomainClient):
             item_id = reader.read_u64_be()
             token = reader.read_u64_be()
             body = reader.read_bytes(reader.read_u32_be())
-            items.append(QueueItem(route=route, id=item_id, token=token, body=body, _client=self))
+            items.append(QueueItem(route=route, _id=item_id, _token=token, body=body, _client=self))
         return items
 
     async def subscribe(self, pattern: str, handler: QueueAvailabilityHandler) -> QueueSubscription:

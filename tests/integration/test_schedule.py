@@ -49,12 +49,12 @@ async def test_schedule_multiple_local_subscribers_same_pattern(
         sub_one = await fixture.client.schedule().subscribe(route, handler_one)
         sub_two = await fixture.client.schedule().subscribe(route, handler_two)
 
-        assert sub_one.sub_id == sub_two.sub_id
+        assert sub_one._sub_id == sub_two._sub_id
         assert sub_one.pattern == sub_two.pattern == route
 
         payload = len(b"fanout").to_bytes(4, "big") + b"fanout"
         fixture.client.schedule().connection.get_multiplexer().dispatch(  # type: ignore[attr-defined]
-            705, sub_one.sub_id.to_bytes(8, "big") + payload
+            705, sub_one._sub_id.to_bytes(8, "big") + payload
         )
         await asyncio.sleep(0)
 
@@ -63,7 +63,7 @@ async def test_schedule_multiple_local_subscribers_same_pattern(
 
         await sub_one.unsubscribe()
         fixture.client.schedule().connection.get_multiplexer().dispatch(  # type: ignore[attr-defined]
-            705, sub_two.sub_id.to_bytes(8, "big") + payload
+            705, sub_two._sub_id.to_bytes(8, "big") + payload
         )
         await asyncio.sleep(0)
         assert received_one == [b"fanout"]

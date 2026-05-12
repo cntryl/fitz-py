@@ -218,10 +218,10 @@ async def test_stream_subscribe_decodes_commit_notification() -> None:
         delivered.set()
 
     subscription = await client.subscribe(route, handler)
-    assert subscription.sub_id == 7
+    assert subscription._sub_id == 7
 
     writer = BufferWriter()
-    writer.write_u64_be(subscription.sub_id)
+    writer.write_u64_be(subscription._sub_id)
     writer.write_route(route)
     payload = json.dumps(
         {

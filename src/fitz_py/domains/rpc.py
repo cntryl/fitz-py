@@ -35,7 +35,6 @@ class ResponseFrame:
 class InboundRpcRequest:
     """Inbound RPC request payload delivered to a registered worker."""
 
-    correlation_id: bytes
     route: str
     reply_route: str
     body: bytes
@@ -216,12 +215,7 @@ class RpcClient(DomainClient):
                 handler = self._workers.get(route)
                 if handler is None:
                     return
-                request = InboundRpcRequest(
-                    correlation_id=correlation_id,
-                    route=route,
-                    reply_route=reply_route,
-                    body=body,
-                )
+                request = InboundRpcRequest(route=route, reply_route=reply_route, body=body)
                 response_writer = ResponseWriter(self.connection, correlation_id)
                 result = handler(request, response_writer)
                 if asyncio.iscoroutine(result):

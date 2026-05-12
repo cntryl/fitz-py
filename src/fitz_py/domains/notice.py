@@ -47,7 +47,7 @@ class NoticeSubscription:
         unsubscribe: Callable[[str, int], Awaitable[None]],
         handler_id: int,
     ) -> None:
-        self.sub_id = sub_id
+        self._sub_id = sub_id
         self.pattern = pattern
         self.handler = handler
         self._unsubscribe = unsubscribe
