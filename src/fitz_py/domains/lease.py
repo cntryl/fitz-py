@@ -41,6 +41,10 @@ class Lease:
     _token: int
     _client: "LeaseClient"
 
+    @property
+    def token(self) -> int:
+        return self._token
+
     async def extend(self, ttl_secs: int) -> None:
         new_token = await self._client.extend(self.route, self._token, ttl_secs)
         if new_token is not None:

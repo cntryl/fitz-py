@@ -30,6 +30,7 @@ class Client:
             reconnect=config.reconnect,
             max_frame_size=config.max_frame_size,
             auth_settle_delay_ms=config.auth_settle_delay_ms,
+            max_in_flight_requests=config.max_in_flight_requests,
         )
         self._connection: Connection | None = None
         self._kv_client: KvClient | None = None
@@ -60,6 +61,7 @@ class Client:
             reconnect_max_attempts=reconnect.max_attempts if reconnect else float("inf"),
             reconnect_backoff_ms=reconnect.backoff_ms if reconnect else 250,
             reconnect_max_backoff_ms=reconnect.max_backoff_ms if reconnect else 5000,
+            max_in_flight_requests=self._config.max_in_flight_requests,
         )
         await self._connection.connect()
 

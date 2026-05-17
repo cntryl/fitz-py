@@ -79,13 +79,20 @@ class RpcSubscription:
 class RpcIterator(AsyncIterator[ResponseFrame]):
     """Async iterator over streamed RPC response frames."""
 
-    def __init__(self, correlation_id: bytes, client: "RpcClient", timeout_ms: int) -> None:
+    def __init__(
+        self,
+        correlation_id: bytes,
+        client: "RpcClient",
+        timeout_ms: int,
+        release_gate: Callable[[], None] | None = None,
+    ) -> None:
         self._correlation_id = correlation_id
         self._client = client
         self._timeout_ms = timeout_ms
         self._buffer: list[ResponseFrame] = []
         self._done = False
         self._waiter: asyncio.Future[ResponseFrame | None] | None = None
+        self._release_gate = release_gate
 
     def push(self, frame: ResponseFrame) -> None:
         if self._waiter is not None and not self._waiter.done():
@@ -96,6 +103,7 @@ class RpcIterator(AsyncIterator[ResponseFrame]):
 
     def end(self) -> None:
         self._done = True
+        self._release_gate_if_needed()
         if self._waiter is not None and not self._waiter.done():
             self._waiter.set_result(None)
             self._waiter = None
@@ -111,6 +119,7 @@ class RpcIterator(AsyncIterator[ResponseFrame]):
         except TimeoutError as exc:
             self._client.cleanup_pending_rpc(self._correlation_id)
             self._done = True
+            self._release_gate_if_needed()
             raise ErrRpcTimeout("RPC call timeout") from exc
         if frame is None:
             raise StopAsyncIteration
@@ -119,6 +128,14 @@ class RpcIterator(AsyncIterator[ResponseFrame]):
     async def aclose(self) -> None:
         self._done = True
         self._client.cleanup_pending_rpc(self._correlation_id)
+        self._release_gate_if_needed()
+
+    def _release_gate_if_needed(self) -> None:
+        release_gate = self._release_gate
+        if release_gate is None:
+            return
+        self._release_gate = None
+        release_gate()
 
 
 class RpcClient(DomainClient):
@@ -135,7 +152,16 @@ class RpcClient(DomainClient):
         _assert_rpc_route(route)
         self._init_handlers()
         correlation_id = os.urandom(16)
-        iterator = RpcIterator(correlation_id, self, timeout_ms)
+        admission_reserved = await self._reserve_admission_if_supported()
+        release_gate = getattr(self.connection, "release_admission_nowait", None)
+        if not callable(release_gate):
+            release_gate = None
+        iterator = RpcIterator(
+            correlation_id,
+            self,
+            timeout_ms,
+            release_gate=release_gate,
+        )
         self._pending[correlation_id.hex()] = iterator
 
         writer = BufferWriter()
@@ -146,14 +172,18 @@ class RpcClient(DomainClient):
         writer.write_u32_be(len(body))
         writer.write_bytes(body)
         try:
-            reader = BufferReader(await self.request_frame(MSG_RPC_REQUEST, writer.build()))
+            reader = BufferReader(
+                await self._request_without_admission(MSG_RPC_REQUEST, writer.build())
+            )
             status = reader.read_u8()
             if status != 0:
                 self._pending.pop(correlation_id.hex(), None)
+                await self._release_admission_if_supported(admission_reserved)
                 raise rpc_error(f"REQUEST failed with status {status}", status)
             return iterator
         except Exception:
             self._pending.pop(correlation_id.hex(), None)
+            await self._release_admission_if_supported(admission_reserved)
             raise
 
     async def register_worker(self, route: str, handler: RpcHandler) -> RpcSubscription:
@@ -170,6 +200,30 @@ class RpcClient(DomainClient):
 
     def cleanup_pending_rpc(self, correlation_id: bytes) -> None:
         self._pending.pop(correlation_id.hex(), None)
+
+    async def _reserve_admission_if_supported(self) -> bool:
+        reserve_admission = getattr(self.connection, "reserve_admission", None)
+        if not callable(reserve_admission):
+            return False
+        await reserve_admission()
+        return True
+
+    async def _release_admission_if_supported(self, admission_reserved: bool) -> None:
+        if not admission_reserved:
+            return
+        release_admission = getattr(self.connection, "release_admission", None)
+        if callable(release_admission):
+            await release_admission()
+            return
+        release_admission_nowait = getattr(self.connection, "release_admission_nowait", None)
+        if callable(release_admission_nowait):
+            release_admission_nowait()
+
+    async def _request_without_admission(self, message_type: int, payload: bytes) -> bytes:
+        request_without_admission = getattr(self.connection, "request_without_admission", None)
+        if callable(request_without_admission):
+            return await request_without_admission(message_type, payload)
+        return await self.connection.request(message_type, payload)
 
     async def _unregister_worker(self, route: str) -> None:
         self._workers.pop(route, None)

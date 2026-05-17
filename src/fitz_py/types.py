@@ -44,3 +44,4 @@ class ClientConfig:
     reconnect: ReconnectOptions | None = None
     max_frame_size: int = 65535
     auth_settle_delay_ms: int = 500
+    max_in_flight_requests: int = 256

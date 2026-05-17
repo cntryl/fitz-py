@@ -22,7 +22,7 @@ from fitz_py.protocol.messages import (
 )
 
 KVMode = Literal["read_only", "read_write"]
-KVDurability = Literal["none", "async", "sync"]
+KVDurability = Literal["buffered", "sync"]
 
 
 @dataclass(slots=True)
@@ -222,7 +222,7 @@ class KvClient(DomainClient):
         route: str,
         *,
         mode: KVMode = "read_write",
-        durability: KVDurability = "async",
+        durability: KVDurability,
     ) -> KvTransaction:
         _assert_kv_route(route)
         writer = BufferWriter()

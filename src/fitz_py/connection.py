@@ -18,6 +18,35 @@ ReconnectListener = Callable[[], None | Awaitable[None]]
 DisconnectListener = Callable[[], None | Awaitable[None]]
 
 
+class AdmissionGate:
+    def __init__(self, max_in_flight_requests: int) -> None:
+        self._max_in_flight_requests = max(1, max_in_flight_requests)
+        self._active = 0
+        self._closed = False
+        self._condition = asyncio.Condition()
+
+    async def acquire(self) -> None:
+        async with self._condition:
+            while self._active >= self._max_in_flight_requests and not self._closed:
+                await self._condition.wait()
+
+            if self._closed:
+                raise ConnectionError("Connection closed")
+
+            self._active += 1
+
+    async def release(self) -> None:
+        async with self._condition:
+            if self._active > 0:
+                self._active -= 1
+            self._condition.notify()
+
+    async def close(self) -> None:
+        async with self._condition:
+            self._closed = True
+            self._condition.notify_all()
+
+
 async def _sleep_ms(delay_ms: int) -> None:
     await asyncio.sleep(delay_ms / 1000)
 
@@ -43,6 +72,7 @@ class Connection:
         reconnect_max_attempts: int | float = float("inf"),
         reconnect_backoff_ms: int = 250,
         reconnect_max_backoff_ms: int = 5000,
+        max_in_flight_requests: int = 256,
     ) -> None:
         self._transport_factory = transport_factory
         self._token_provider = token_provider
@@ -52,6 +82,7 @@ class Connection:
         self._reconnect_max_attempts = reconnect_max_attempts
         self._reconnect_backoff_ms = reconnect_backoff_ms
         self._reconnect_max_backoff_ms = reconnect_max_backoff_ms
+        self._max_in_flight_requests = max(1, max_in_flight_requests)
 
         self._transport: Transport | None = None
         self._state = ConnectionState.DISCONNECTED
@@ -64,6 +95,7 @@ class Connection:
         self._close_requested = False
         self._receive_loop_abort = False
         self._reconnect_task: asyncio.Task[None] | None = None
+        self._admission_gate = AdmissionGate(self._max_in_flight_requests)
 
     async def connect(self) -> None:
         self._close_requested = False
@@ -75,6 +107,7 @@ class Connection:
         self._close_requested = True
         self._receive_loop_abort = True
         self._set_state(ConnectionState.CLOSED)
+        await asyncio.shield(self._admission_gate.close())
         if self._auth_future is not None and not self._auth_future.done():
             self._auth_future.set_exception(ConnectionError("Connection closed"))
         self._auth_future = None
@@ -94,31 +127,44 @@ class Connection:
 
     async def request(self, message_type: int, payload: bytes) -> bytes:
         self._ensure_authenticated()
-        transport = self._ensure_transport()
-        frame = FrameCodec.encode_frame(message_type, payload)
+        await self._admission_gate.acquire()
         try:
-            return await self._multiplexer.request(
-                message_type,
-                frame,
-                transport.send,
-                self._timeout_ms,
-            )
+            return await self._request_without_admission(message_type, payload)
         except Exception as exc:
             self._handle_possible_transport_failure(exc)
             raise
+        finally:
+            await asyncio.shield(self._admission_gate.release())
+
+    async def request_without_admission(self, message_type: int, payload: bytes) -> bytes:
+        self._ensure_authenticated()
+        return await self._request_without_admission(message_type, payload)
 
     async def send(self, message_type: int, payload: bytes) -> None:
         self._ensure_authenticated()
-        transport = self._ensure_transport()
-        frame = FrameCodec.encode_frame(message_type, payload)
+        await self._admission_gate.acquire()
         try:
+            transport = self._ensure_transport()
+            frame = FrameCodec.encode_frame(message_type, payload)
             await transport.send(frame)
         except Exception as exc:
             self._handle_possible_transport_failure(exc)
             raise
+        finally:
+            await asyncio.shield(self._admission_gate.release())
 
     async def send_fire_and_forget(self, message_type: int, payload: bytes) -> None:
         await self.send(message_type, payload)
+
+    async def reserve_admission(self) -> None:
+        self._ensure_authenticated()
+        await self._admission_gate.acquire()
+
+    async def release_admission(self) -> None:
+        await asyncio.shield(self._admission_gate.release())
+
+    def release_admission_nowait(self) -> None:
+        asyncio.create_task(self.release_admission())
 
     def register_notification_handler(
         self, message_type: int, handler: Callable[[bytes], None]
@@ -158,6 +204,7 @@ class Connection:
 
     async def _open_and_authenticate(self, is_reconnect: bool) -> None:
         self._receive_loop_abort = False
+        self._admission_gate = AdmissionGate(self._max_in_flight_requests)
         self._transport = self._transport_factory()
         self._set_state(
             ConnectionState.RECONNECTING if is_reconnect else ConnectionState.CONNECTING
@@ -228,6 +275,7 @@ class Connection:
 
     async def _handle_connection_loss(self, exc: Exception) -> None:
         self._multiplexer.set_disconnected()
+        await asyncio.shield(self._admission_gate.close())
 
         if (
             self._state is ConnectionState.AUTHENTICATING
@@ -297,6 +345,20 @@ class Connection:
 
     def _set_state(self, state: ConnectionState) -> None:
         self._state = state
+
+    async def _request_without_admission(self, message_type: int, payload: bytes) -> bytes:
+        transport = self._ensure_transport()
+        frame = FrameCodec.encode_frame(message_type, payload)
+        try:
+            return await self._multiplexer.request(
+                message_type,
+                frame,
+                transport.send,
+                self._timeout_ms,
+            )
+        except Exception as exc:
+            self._handle_possible_transport_failure(exc)
+            raise
 
     def _handle_possible_transport_failure(self, exc: Exception) -> None:
         if self._close_requested:

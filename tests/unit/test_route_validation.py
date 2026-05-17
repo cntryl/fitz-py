@@ -63,7 +63,7 @@ async def test_kv_begin_accepts_exact_three_segment_route() -> None:
     connection = _FakeConnection(b"\x00" + (42).to_bytes(8, "big"))
     client = KvClient(connection)
 
-    transaction = await client.begin("kv://example/app/users")
+    transaction = await client.begin("kv://example/app/users", durability="sync")
 
     assert transaction is not None
     assert connection.requests[0][0] == MSG_KV_BEGIN
@@ -75,7 +75,7 @@ async def test_kv_begin_forwards_short_route_without_local_validation() -> None:
     connection = _FakeConnection(b"\x00" + (42).to_bytes(8, "big"))
     client = KvClient(connection)
 
-    transaction = await client.begin("kv://example/app")
+    transaction = await client.begin("kv://example/app", durability="sync")
 
     assert transaction is not None
     assert connection.requests[0][0] == MSG_KV_BEGIN
@@ -86,7 +86,7 @@ async def test_kv_begin_forwards_wrong_scheme_without_local_validation() -> None
     connection = _FakeConnection(b"\x00" + (42).to_bytes(8, "big"))
     client = KvClient(connection)
 
-    transaction = await client.begin("queue://example/app/users")
+    transaction = await client.begin("queue://example/app/users", durability="sync")
 
     assert transaction is not None
     assert connection.requests[0][0] == MSG_KV_BEGIN

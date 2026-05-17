@@ -12,11 +12,11 @@ async def test_kv_round_trip(transport: str, auth_mode: str) -> None:
     fixture = await IntegrationFixture.connect_or_fail(transport, auth_mode)  # type: ignore[arg-type]
     try:
         route = unique_route("kv")
-        tx = await fixture.client.kv().begin(route)
+        tx = await fixture.client.kv().begin(route, durability="sync")
         await tx.put(b"hello", b"world")
         await tx.commit()
 
-        rtx = await fixture.client.kv().begin(route, mode="read_only")
+        rtx = await fixture.client.kv().begin(route, mode="read_only", durability="sync")
         result = await rtx.get(b"hello")
         await rtx.rollback()
 

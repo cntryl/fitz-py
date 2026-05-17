@@ -115,7 +115,7 @@ def test_public_domain_types_hide_wire_identifiers() -> None:
     assert not hasattr(queue_item, "token")
 
     lease = Lease(route="lease://realm/area/lock", _token=3, _client=object())
-    assert not hasattr(lease, "token")
+    assert lease.token == 3
 
     queue_subscription = QueueSubscription(4, "queue://realm/area/*", lambda _sub_id: None)
     assert not hasattr(queue_subscription, "sub_id")
