@@ -1,135 +1,97 @@
 # fitz-py
 
-`fitz-py` is the async-first Python SDK for Fitz.
-
-## Install
+`fitz-py` is the typed, asyncio-native Python client for the Fitz broker. Version 0.2 is a
+deliberate clean break: clients are configured once, domain clients are cached properties, streamed
+results are async iterators, and network/runtime queues are bounded.
 
 ```bash
 python -m pip install cntryl-fitz
 ```
 
-## Quick Start
+## Connect
 
 ```python
 from fitz_py import Client, ClientConfig
 
-client = Client(
+async with Client(
     ClientConfig(
         url="ws://localhost:4190/ws",
         token_provider=lambda: "",
     )
-)
-
-await client.connect()
-
-tx = await client.kv().begin("kv://example/app/users")
-result = await tx.get(b"key")
-await tx.rollback()
-
-await client.close()
+) as client:
+    async with await client.kv.begin("kv://example/app/users") as tx:
+        await tx.put(b"alice", b"active")
+        await tx.commit()
 ```
 
-The package is `asyncio`-first and does not provide a synchronous wrapper.
+`Client.close()` is permanent and idempotent. Reconnect is enabled by default after the first
+successful authentication; an authentication rejection permanently closes the client. Configure
+timeouts, bounded concurrency, retry, heartbeat, logging, metrics, and lifecycle events with the
+frozen policies on `ClientConfig`.
 
-## Stream replay
+## Domains
+
+- `client.kv`: transactions, scans, range deletes, durability, and mutation subscriptions.
+- `client.queue`: delayed enqueue, broker-native long-poll reserve, fenced items, and availability.
+- `client.rpc`: streamed calls and wildcard worker registrations with bounded handler dispatch.
+- `client.lease`: queued fenced acquisition, query, change subscriptions, and managed renewal.
+- `client.notice`: fire-and-forget publish and one-wire/many-consumer subscriptions.
+- `client.stream`: append sessions, filtered replay, global cursors/watermarks, and commit events.
+- `client.schedule`: delivery modes, total-count pagination, cancel, and routed notifications.
+
+Subscriptions are independently closable async iterators:
 
 ```python
-from fitz_py import StreamFilterClause, StreamFilterSet
-
-stream_filter = StreamFilterSet(clauses=[StreamFilterClause(kind="Equals", value="proj.alpha")])
-
-records = await client.stream().read(
-    "stream://example/app/events",
-    start_offset=0,
-    limit=100,
-    stream_filter=stream_filter,
-)
-page = await client.stream().read_page(
-    "stream://example/app/events",
-    start_offset=0,
-    limit=100,
-    stream_filter=stream_filter,
-)
-
-# `read()` preserves the compatibility event-only shape.
-# `read_page()` exposes filtered markers and cursor metadata.
-assert page.cursor.last_resource_offset >= 0
+async with await client.notice.subscribe("notice://example/app/*") as notices:
+    async for notice in notices:
+        print(notice.route, notice.body)
 ```
 
-## Parity Goals
+Reserve waits are performed by the broker rather than local polling:
 
-`fitz-py` tracks the Fitz client behavior implemented in `fitz-go` and `fitz-ts`.
-The Python SDK now exposes the same seven domains, typed Fitz/domain errors, retryability
-helpers via `is_retryable()`, reconnect-aware subscription restoration, and extended
-integration/conformance coverage for queue, lease, notice, and schedule lifecycle flows.
+```python
+items = await client.queue.reserve("queue://example/work/*", lease=30, wait=10)
+for item in items:
+    try:
+        await process(item.body)
+    except Exception:
+        raise
+    else:
+        await item.complete()
+```
+
+Managed leases renew at one third of their TTL and preserve both renewal and release failures:
+
+```python
+async with client.lease.hold("lease://example/jobs/leader", ttl=30, wait=10) as lease:
+    await run_leader(lease.token)
+```
+
+## Errors and cancellation
+
+All library failures derive from `FitzError`. Transport, connection, timeout, protocol, bounded
+queue, stale-handle, and domain failures have stable string codes and structured context. Task
+cancellation is preserved. Requests cancelled after transmission leave a FIFO tombstone so a late
+reply cannot corrupt the next same-type request.
 
 ## Verification
-
-Fast local checks:
 
 ```bash
 python -m pip install -e ".[dev]"
 python -m ruff format --check .
 python -m ruff check .
+python -m pyright src
 python -m pytest tests/unit
-```
 
-Hot-path microbenchmarks:
+docker compose up -d
+python -m pytest tests/integration
+python -m pytest tests/conformance
+docker compose down --volumes
 
-```bash
-python artifacts/benchmarks/hotpath.py --iterations 10000
-# or
-hatch run bench-hotpath
-```
-
-One-shot verification:
-
-```bash
-hatch run verify
-```
-
-The local quality bar is formatter first, then lint, then unit tests.
-
-Broker-backed verification:
-
-```bash
-docker compose -f ../fitz-go/compose.yml up -d
-python -m pytest tests/integration -v
-CONFORMANCE_TRANSPORT=ws CONFORMANCE_AUTH_MODE=anonymous \
-CONFORMANCE_OUTPUT=artifacts/conformance-results.json \
-python -m pytest tests/conformance -v
-docker compose -f ../fitz-go/compose.yml down --volumes
-```
-
-Package smoke verification:
-
-```bash
+python -m benchmarks.hotpath
 python -m build
-python -m pip install dist/*.whl
 ```
 
-The conformance harness writes JSON results to `artifacts/conformance-results.json` by default.
-It currently executes 19 scenarios: CS-001..CS-015 mirror the shared cross-language suite,
-and CS-016..CS-019 cover fitz-py local lifecycle checks.
-
-## Project Layout
-
-- `src/fitz_py`: package code
-- `tests/unit`: fast unit coverage
-- `tests/integration`: broker-backed integration coverage
-- `tests/conformance`: release-gate conformance coverage
-
-## Canonical Docs
-
-Canonical client behavior is defined by the server-owned docs in the Fitz repository:
-
-- [CLIENT_SPEC.md](../fitz/docs/clients/CLIENT_SPEC.md)
-- [CLIENT_ACCEPTANCE_CRITERIA.md](../fitz/docs/clients/CLIENT_ACCEPTANCE_CRITERIA.md)
-- [CLIENT_IMPLEMENTATION_GUIDE.md](../fitz/docs/clients/CLIENT_IMPLEMENTATION_GUIDE.md)
-- [CONNECTION_FLOW.md](../fitz/docs/clients/CONNECTION_FLOW.md)
-
-## Documentation
-
-- [`docs/README.md`](docs/README.md)
-- [`CLIENT_SPEC.md`](CLIENT_SPEC.md)
-- [`CLIENT_ACCEPTANCE_CRITERIA.md`](CLIENT_ACCEPTANCE_CRITERIA.md)
+The repository owns its broker Compose stack and a vendored copy of the canonical 17-scenario
+cross-language suite. CI runs Python 3.11-3.13, wheel smoke tests, TCP/WebSocket, and
+anonymous/JWT broker legs. Canonical behavior remains owned by the Fitz server documentation.

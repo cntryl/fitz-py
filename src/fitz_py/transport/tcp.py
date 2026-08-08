@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 from urllib.parse import urlparse
 
 from fitz_py.errors import TimeoutError, TransportError
@@ -25,6 +26,10 @@ class TcpTransport(Transport):
                 asyncio.open_connection(self._host, self._port),
                 timeout=self._timeout,
             )
+            sock = self._writer.get_extra_info("socket")
+            if sock is not None:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         except TimeoutError:
             raise
         except asyncio.TimeoutError as exc:  # pragma: no cover - transport boundary
@@ -70,13 +75,13 @@ class TcpTransport(Transport):
             raise TransportError("TCP transport is not connected")
 
         try:
-            header = await asyncio.wait_for(reader.readexactly(4), timeout=self._timeout)
+            header = await reader.readexactly(4)
             frame_length = int.from_bytes(header, "big")
             if frame_length > self._max_frame_size:
                 raise TransportError(
                     f"TCP frame length {frame_length} exceeds max frame size {self._max_frame_size}"
                 )
-            return await asyncio.wait_for(reader.readexactly(frame_length), timeout=self._timeout)
+            return await reader.readexactly(frame_length)
         except asyncio.IncompleteReadError as exc:  # pragma: no cover - transport boundary
             raise TransportError("TCP connection closed") from exc
         except asyncio.TimeoutError as exc:  # pragma: no cover - transport boundary
@@ -88,3 +93,9 @@ class TcpTransport(Transport):
 
     def get_url(self) -> str:
         return self._url
+
+    async def heartbeat(self, timeout: float) -> None:
+        _ = timeout
+        writer = self._writer
+        if writer is None or writer.is_closing():
+            raise TransportError("TCP transport is not connected")

@@ -21,5 +21,9 @@ class Transport(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    async def heartbeat(self, timeout: float) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
     def get_url(self) -> str:
         raise NotImplementedError

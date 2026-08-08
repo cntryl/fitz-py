@@ -1,80 +1,63 @@
 name: CI
 
 on:
+  workflow_dispatch:
   push:
   pull_request:
 
 jobs:
   fast:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
-
-      - name: Install package and dev dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e ".[dev]"
-
-      - name: Format
-        run: python -m ruff format --check .
-
-      - name: Lint
-        run: python -m ruff check .
-
-      - name: Run unit tests
-        run: python -m pytest tests/unit
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev]"
+      - run: python -m ruff format --check .
+      - run: python -m ruff check .
+      - run: python -m pyright src
+      - run: python -m pytest tests/unit --cov=fitz_py --cov-report=term-missing
 
   package:
-    runs-on: ubuntu-latest
     needs: fast
+    runs-on: ubuntu-latest
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-
-      - name: Build distributions
+          cache: pip
+      - run: python -m pip install --upgrade pip build
+      - run: python -m build
+      - name: Smoke test wheel
         run: |
-          python -m pip install --upgrade pip build
-          python -m build
-
-      - name: Smoke install built wheel
-        run: |
-          python -m venv artifacts/smoke/.venv
-          . artifacts/smoke/.venv/bin/activate
-          python -m pip install --upgrade pip
-          python -m pip install dist/*.whl
-          python - <<'PY'
+          python -m venv artifacts/smoke
+          artifacts/smoke/bin/python -m pip install dist/*.whl
+          artifacts/smoke/bin/python - <<'PY'
           from fitz_py import Client, ClientConfig
-
-          client = Client(ClientConfig(url="ws://localhost:4190/ws"))
-          print(type(client).__name__)
-          print(type(client.kv()).__name__)
+          client = Client(ClientConfig(url="tcp://localhost:4191"))
+          assert client.kv is client.kv
+          assert client.queue is client.queue
           PY
-
-      - name: Upload distributions
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: fitz-py-dist
           path: dist/*
 
-  spec:
-    runs-on: ubuntu-latest
+  broker:
     needs: fast
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        transport: [ws, tcp]
-        auth_mode: [anonymous, valid_jwt]
+        transport: [tcp, ws]
+        auth-mode: [anonymous, valid_jwt]
     env:
       FITZ_BROKER_ANON_TCP_ADDR: localhost:4191
       FITZ_BROKER_ANON_WS_ADDR: ws://localhost:4190/ws
@@ -82,57 +65,41 @@ jobs:
       FITZ_BROKER_AUTH_WS_ADDR: ws://localhost:4090/ws
       FITZ_BROKER_JWT_HMAC_SECRET: test-secret-key
       FITZ_BROKER_JWT_AUDIENCE: fitz
-      CONFORMANCE_OUTPUT: artifacts/conformance-results.json
+      CONFORMANCE_TRANSPORT: ${{ matrix.transport }}
+      CONFORMANCE_AUTH_MODE: ${{ matrix.auth-mode }}
+      CONFORMANCE_OUTPUT: artifacts/conformance-${{ matrix.transport }}-${{ matrix.auth-mode }}.json
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-
-      - name: Install package and dev dependencies
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev]"
+      - run: docker compose up -d
+      - name: Wait for brokers
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e ".[dev]"
-
-      - name: Start broker stack
-        run: docker compose -f ../fitz-go/compose.yml up -d
-
-      - name: Run conformance suite
-        env:
-          CONFORMANCE_TRANSPORT: ${{ matrix.transport }}
-          CONFORMANCE_AUTH_MODE: ${{ matrix.auth_mode }}
-        run: python -m pytest tests/conformance -v
-
-      - name: Run invalid JWT auth scenario
-        run: |
-          CONFORMANCE_TRANSPORT=${{ matrix.transport }} CONFORMANCE_AUTH_MODE=anonymous python -m pytest tests/conformance/test_conformance.py -k cs002 -v
-
-      - name: Enforce full conformance
+          for port in 4090 4091 4190 4191; do
+            timeout 60 bash -c "until (echo > /dev/tcp/127.0.0.1/$port) 2>/dev/null; do sleep 1; done"
+          done
+      - run: python -m pytest tests/integration -v
+      - run: python -m pytest tests/conformance -v
+      - name: Enforce canonical conformance
         run: |
           python - <<'PY'
-          import json
+          import json, os
           from pathlib import Path
-          required = {f"CS-{index:03d}" for index in range(1, 16)}
-          path = Path("artifacts/conformance-results.json")
-          data = json.loads(path.read_text(encoding="utf-8"))
-          observed = {s["scenario_id"] for s in data["scenarios"]}
-          missing = sorted(required - observed)
-          failing = sorted(s["scenario_id"] for s in data["scenarios"] if s["scenario_id"] in required and s["verdict"] != "pass")
-          print(f"transport={data['transport']} auth={data['auth_mode']} p0={data['p0_pass_rate']:.0%} p1={data['p1_pass_rate']:.0%} failing={failing} missing={missing}")
-          if data.get("overall_status") != "pass" or failing or missing:
-              raise SystemExit(1)
+          data = json.loads(Path(os.environ["CONFORMANCE_OUTPUT"]).read_text())
+          required = {f"CS-{index:03d}" for index in range(1, 18)}
+          observed = {item["scenario_id"] for item in data["scenarios"] if item["verdict"] == "pass"}
+          assert data["overall_status"] == "pass"
+          assert observed == required, sorted(required - observed)
           PY
-
-      - name: Upload conformance results
+      - uses: actions/upload-artifact@v4
         if: always()
-        uses: actions/upload-artifact@v4
         with:
-          name: fitz-py-conformance-${{ matrix.transport }}-${{ matrix.auth_mode }}
-          path: artifacts/conformance-results.json
-
-      - name: Stop broker stack
-        if: always()
-        run: docker compose -f ../fitz-go/compose.yml down --volumes
+          name: conformance-${{ matrix.transport }}-${{ matrix.auth-mode }}
+          path: artifacts/conformance-*.json
+          if-no-files-found: warn
+      - if: always()
+        run: docker compose down --volumes

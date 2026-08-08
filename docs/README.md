@@ -1,24 +1,17 @@
-# fitz-py Documentation
+# Design notes
 
-The Python SDK follows the canonical Fitz client docs in the server repository under [../../fitz/docs/clients](../../fitz/docs/clients).
+The public API is intentionally asyncio-native and compatibility-free. See the root README for
+usage. The implementation follows these invariants:
 
-## Canonical Docs
+- one serialized transport writer and FIFO per-message response queues;
+- tombstones for timed-out or cancelled requests that were already transmitted;
+- bounded request admission, handler dispatch, and subscription buffers;
+- generation-bound transactional, queue, lease, stream, and response-writer handles;
+- best-effort reconnect restoration with per-registration failure isolation;
+- one broker subscription shared by multiple independent local async iterators;
+- exact route-bearing wildcard results and notifications;
+- cryptographically random 16-byte RPC correlation identifiers;
+- no response shim for fire-and-forget Notice publish or RPC call submission.
 
-- [CLIENT_SPEC.md](../../fitz/docs/clients/CLIENT_SPEC.md)
-- [CLIENT_ACCEPTANCE_CRITERIA.md](../../fitz/docs/clients/CLIENT_ACCEPTANCE_CRITERIA.md)
-- [CLIENT_IMPLEMENTATION_GUIDE.md](../../fitz/docs/clients/CLIENT_IMPLEMENTATION_GUIDE.md)
-- [CONNECTION_FLOW.md](../../fitz/docs/clients/CONNECTION_FLOW.md)
-
-## Local Docs
-
-- [../README.md](../README.md)
-- [../CLIENT_SPEC.md](../CLIENT_SPEC.md)
-- [../CLIENT_ACCEPTANCE_CRITERIA.md](../CLIENT_ACCEPTANCE_CRITERIA.md)
-
-Use the canonical docs for protocol behavior and the local docs for Python-specific verification, parity evidence, and setup notes.
-
-Python verification follows the repo README release gate. The conformance harness currently
-executes 19 scenarios: CS-001..CS-015 mirror the shared cross-language suite, and
-CS-016..CS-019 cover fitz-py local lifecycle checks.
-
-The top-level `Client` also supports `async with` for connect/close lifecycle management, matching the existing domain-level context manager pattern.
+The vendored conformance YAML in `tests/conformance` is copied from the canonical Fitz server
+suite. Changes to client-wide behavior must update the canonical server documentation first.

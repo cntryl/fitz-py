@@ -7,18 +7,30 @@ from fitz_py.transport.base import Transport
 
 
 class WebSocketTransport(Transport):
-    def __init__(self, url: str, timeout_ms: int = 30000, max_frame_size: int = 65535) -> None:
+    def __init__(
+        self,
+        url: str,
+        timeout_ms: int = 30000,
+        max_frame_size: int = 65535,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self._url = url
         self._timeout = timeout_ms / 1000
         self._max_frame_size = max_frame_size
         self._socket = None
+        self._headers = headers or {}
 
     async def connect(self) -> None:
         try:
             import websockets
 
             self._socket = await asyncio.wait_for(
-                websockets.connect(self._url, max_size=self._max_frame_size),
+                websockets.connect(
+                    self._url,
+                    max_size=self._max_frame_size,
+                    ping_interval=None,
+                    additional_headers=self._headers or None,
+                ),
                 timeout=self._timeout,
             )
         except Exception as exc:  # pragma: no cover - transport boundary
@@ -48,7 +60,7 @@ class WebSocketTransport(Transport):
         if socket is None:
             raise TransportError("WebSocket transport is not connected")
         try:
-            data = await asyncio.wait_for(socket.recv(), timeout=self._timeout)
+            data = await socket.recv()
         except Exception as exc:  # pragma: no cover - transport boundary
             raise TransportError(f"WebSocket receive failed: {exc}") from exc
 
@@ -58,3 +70,13 @@ class WebSocketTransport(Transport):
 
     def get_url(self) -> str:
         return self._url
+
+    async def heartbeat(self, timeout: float) -> None:
+        socket = self._socket
+        if socket is None:
+            raise TransportError("WebSocket transport is not connected")
+        try:
+            pong = await socket.ping()
+            await asyncio.wait_for(pong, timeout=timeout)
+        except Exception as exc:
+            raise TransportError(f"WebSocket heartbeat failed: {exc}") from exc

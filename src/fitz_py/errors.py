@@ -1,9 +1,10 @@
-"""SDK error hierarchy and protocol-status error mapping helpers."""
+"""Python-native Fitz exception hierarchy and retry classification."""
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from typing import TypeVar
+from collections.abc import Mapping
+from types import MappingProxyType
+from typing import Any
 
 
 class FitzError(Exception):
@@ -12,33 +13,32 @@ class FitzError(Exception):
         message: str,
         code: str,
         domain_code: int | None = None,
+        context: Mapping[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.domain_code = domain_code
+        self.context = MappingProxyType(dict(context or {}))
 
 
-TError = TypeVar("TError", bound=FitzError)
+class FitzTransportError(FitzError):
+    def __init__(self, message: str, context: Mapping[str, Any] | None = None) -> None:
+        super().__init__(message, "TRANSPORT_ERROR", context=context)
 
 
-class TransportError(FitzError):
-    def __init__(self, message: str) -> None:
-        super().__init__(message, "TRANSPORT_ERROR")
-
-
-class ConnectionError(FitzError):
-    def __init__(self, message: str) -> None:
-        super().__init__(message, "CONNECTION_ERROR")
+class FitzConnectionError(FitzError):
+    def __init__(self, message: str, context: Mapping[str, Any] | None = None) -> None:
+        super().__init__(message, "CONNECTION_ERROR", context=context)
 
 
 class AuthenticationError(FitzError):
-    def __init__(self, message: str) -> None:
-        super().__init__(message, "AUTH_ERROR")
+    def __init__(self, message: str, context: Mapping[str, Any] | None = None) -> None:
+        super().__init__(message, "AUTH_ERROR", context=context)
 
 
-class TimeoutError(FitzError):
-    def __init__(self, message: str) -> None:
-        super().__init__(message, "TIMEOUT")
+class FitzTimeoutError(FitzError):
+    def __init__(self, message: str, context: Mapping[str, Any] | None = None) -> None:
+        super().__init__(message, "TIMEOUT", context=context)
 
 
 class ProtocolError(FitzError):
@@ -51,337 +51,140 @@ class CodecError(FitzError):
         super().__init__(message, "CODEC_ERROR")
 
 
-class KvError(FitzError):
-    def __init__(self, message: str, code: str, domain_code: int | None = None) -> None:
-        super().__init__(message, f"KV_{code}", domain_code)
+class RequestQueueFullError(FitzError):
+    def __init__(self) -> None:
+        super().__init__("Request queue is full", "REQUEST_QUEUE_FULL")
 
 
-class ErrKvTransactionAborted(KvError):
-    def __init__(self, message: str = "KV transaction aborted") -> None:
-        super().__init__(message, "TRANSACTION_ABORTED", 1)
+class SubscriptionBackpressureError(FitzError):
+    def __init__(self) -> None:
+        super().__init__("Subscription consumer fell behind", "SUBSCRIPTION_BACKPRESSURE")
 
 
-class ErrKvLeaseExpired(KvError):
-    def __init__(self, message: str = "KV lease expired") -> None:
-        super().__init__(message, "LEASE_EXPIRED", 2)
+class StaleHandleError(FitzError):
+    def __init__(self, kind: str) -> None:
+        super().__init__(f"{kind} is stale after disconnect", "STALE_HANDLE")
 
 
-class ErrKvConflictingWrite(KvError):
-    def __init__(self, message: str = "KV conflicting write") -> None:
-        super().__init__(message, "CONFLICTING_WRITE", 3)
+class ReconnectRestoreError(FitzError):
+    def __init__(self, domain: str, registration: str, cause: BaseException) -> None:
+        super().__init__(
+            f"Failed to restore {domain} registration {registration}: {cause}",
+            "RECONNECT_RESTORE_FAILED",
+            context={"domain": domain, "registration": registration},
+        )
 
 
-class ErrKvKeyNotFound(KvError):
-    def __init__(self, message: str = "KV key not found") -> None:
-        super().__init__(message, "KEY_NOT_FOUND", 4)
+class LeaseLostError(FitzError):
+    def __init__(self, message: str = "Lease ownership was lost") -> None:
+        super().__init__(message, "LEASE_LOST")
 
 
-class ErrKvOperationNotAllowed(KvError):
-    def __init__(self, message: str = "KV operation not allowed") -> None:
-        super().__init__(message, "OPERATION_NOT_ALLOWED", 5)
+class LeaseLifecycleError(FitzError):
+    def __init__(self, causes: list[BaseException]) -> None:
+        super().__init__(
+            "Multiple failures occurred while managing a lease",
+            "LEASE_LIFECYCLE_MULTIPLE_FAILURES",
+            context={"causes": tuple(causes)},
+        )
+        self.causes = tuple(causes)
 
 
-class QueueError(FitzError):
-    def __init__(self, message: str, code: str, domain_code: int | None = None) -> None:
-        super().__init__(message, f"QUEUE_{code}", domain_code)
+class DomainError(FitzError):
+    prefix = "DOMAIN"
 
+    def __init__(self, message: str, reason: str, domain_code: int | None = None) -> None:
+        super().__init__(message, f"{self.prefix}_{reason}", domain_code)
+        self.reason = reason
 
-class ErrQueueNotFound(QueueError):
-    def __init__(self, message: str = "Queue not found") -> None:
-        super().__init__(message, "NOT_FOUND", 1)
 
+class KvError(DomainError):
+    prefix = "KV"
 
-class ErrQueueMessageNotFound(QueueError):
-    def __init__(self, message: str = "Queue message not found") -> None:
-        super().__init__(message, "MESSAGE_NOT_FOUND", 2)
 
+class QueueError(DomainError):
+    prefix = "QUEUE"
 
-class ErrQueueInvalidToken(QueueError):
-    def __init__(self, message: str = "Queue invalid token") -> None:
-        super().__init__(message, "INVALID_TOKEN", 3)
 
+class NoticeError(DomainError):
+    prefix = "NOTICE"
 
-class ErrQueueFull(QueueError):
-    def __init__(self, message: str = "Queue full") -> None:
-        super().__init__(message, "FULL", 4)
 
+class RpcError(DomainError):
+    prefix = "RPC"
 
-class ErrQueueInvalidDelay(QueueError):
-    def __init__(self, message: str = "Queue invalid delay") -> None:
-        super().__init__(message, "INVALID_DELAY", 5)
 
+class LeaseError(DomainError):
+    prefix = "LEASE"
 
-class NoticeError(FitzError):
-    def __init__(self, message: str, code: str, domain_code: int | None = None) -> None:
-        super().__init__(message, f"NOTICE_{code}", domain_code)
 
+class StreamError(DomainError):
+    prefix = "STREAM"
 
-class ErrNoticeGeneral(NoticeError):
-    def __init__(self, message: str = "Notice error") -> None:
-        super().__init__(message, "GENERAL", 1)
 
+class ScheduleError(DomainError):
+    prefix = "SCHEDULE"
 
-class RpcError(FitzError):
-    def __init__(self, message: str, code: str, domain_code: int | None = None) -> None:
-        super().__init__(message, f"RPC_{code}", domain_code)
 
-
-class ErrRpcTimeout(RpcError):
-    def __init__(self, message: str = "RPC timeout") -> None:
-        super().__init__(message, "TIMEOUT", 1)
-
-
-class ErrRpcHandlerNotFound(RpcError):
-    def __init__(self, message: str = "RPC handler not found") -> None:
-        super().__init__(message, "HANDLER_NOT_FOUND", 2)
-
-
-class ErrRpcHandlerError(RpcError):
-    def __init__(self, message: str = "RPC handler error") -> None:
-        super().__init__(message, "HANDLER_ERROR", 3)
-
-
-class ErrRpcInvalidRequest(RpcError):
-    def __init__(self, message: str = "RPC invalid request") -> None:
-        super().__init__(message, "INVALID_REQUEST", 4)
-
-
-class LeaseError(FitzError):
-    def __init__(self, message: str, code: str, domain_code: int | None = None) -> None:
-        super().__init__(message, f"LEASE_{code}", domain_code)
-
-
-class ErrLeaseHeld(LeaseError):
-    def __init__(self, message: str = "Lease is already held") -> None:
-        super().__init__(message, "HELD", 1)
-
-
-class ErrLeaseNotFound(LeaseError):
-    def __init__(self, message: str = "Lease not found") -> None:
-        super().__init__(message, "NOT_FOUND", 2)
-
-
-class ErrLeaseInvalidToken(LeaseError):
-    def __init__(self, message: str = "Lease invalid token") -> None:
-        super().__init__(message, "INVALID_TOKEN", 3)
-
-
-class StreamError(FitzError):
-    def __init__(self, message: str, code: str, domain_code: int | None = None) -> None:
-        super().__init__(message, f"STREAM_{code}", domain_code)
-
-
-class ErrStreamNotFound(StreamError):
-    def __init__(self, message: str = "Stream not found") -> None:
-        super().__init__(message, "NOT_FOUND", 1)
-
-
-class ErrStreamOffsetOutOfRange(StreamError):
-    def __init__(self, message: str = "Stream offset out of range") -> None:
-        super().__init__(message, "OFFSET_OUT_OF_RANGE", 2)
-
-
-class ErrStreamInvalidOffset(StreamError):
-    def __init__(self, message: str = "Stream invalid offset") -> None:
-        super().__init__(message, "INVALID_OFFSET", 3)
-
-
-class ErrStreamFull(StreamError):
-    def __init__(self, message: str = "Stream full") -> None:
-        super().__init__(message, "FULL", 4)
-
-
-class ErrStreamSessionNotFound(StreamError):
-    def __init__(self, message: str = "Stream session not found") -> None:
-        super().__init__(message, "SESSION_NOT_FOUND", 5)
-
-
-class ErrStreamSessionClosed(StreamError):
-    def __init__(self, message: str = "Stream session closed") -> None:
-        super().__init__(message, "SESSION_CLOSED", 6)
-
-
-class ErrStreamExpectedOffsetMismatch(StreamError):
-    def __init__(self, message: str = "Stream expected offset mismatch") -> None:
-        super().__init__(message, "EXPECTED_OFFSET_MISMATCH", 7)
-
-
-class ScheduleError(FitzError):
-    def __init__(self, message: str, code: str, domain_code: int | None = None) -> None:
-        super().__init__(message, f"SCHEDULE_{code}", domain_code)
-
-
-class ErrScheduleNotFound(ScheduleError):
-    def __init__(self, message: str = "Schedule not found") -> None:
-        super().__init__(message, "NOT_FOUND", 1)
-
-
-class ErrScheduleTaskNotFound(ScheduleError):
-    def __init__(self, message: str = "Schedule task not found") -> None:
-        super().__init__(message, "TASK_NOT_FOUND", 2)
-
-
-class ErrScheduleInvalidCron(ScheduleError):
-    def __init__(self, message: str = "Schedule invalid cron") -> None:
-        super().__init__(message, "INVALID_CRON", 3)
-
-
-class ErrScheduleInvalidDelay(ScheduleError):
-    def __init__(self, message: str = "Schedule invalid delay") -> None:
-        super().__init__(message, "INVALID_DELAY", 4)
-
-
-class ErrScheduleInvalidTimestamp(ScheduleError):
-    def __init__(self, message: str = "Schedule invalid timestamp") -> None:
-        super().__init__(message, "INVALID_TIMESTAMP", 5)
-
-
-_KV_STATUS_MAP: dict[int, type[KvError]] = {
-    1: ErrKvTransactionAborted,
-    2: ErrKvLeaseExpired,
-    3: ErrKvConflictingWrite,
-    4: ErrKvKeyNotFound,
-    5: ErrKvOperationNotAllowed,
+_RETRYABLE = {
+    ("KV", 3),
+    ("KV", 1004),
+    ("KV", 1009),
+    ("QUEUE", 4),
+    ("QUEUE", 4005),
+    ("LEASE", 1),
+    ("LEASE", 5001),
+    ("RPC", 6001),
+    ("RPC", 6002),
+    ("RPC", 6003),
+    ("RPC", 6004),
 }
-
-_QUEUE_STATUS_MAP: dict[int, type[QueueError]] = {
-    1: ErrQueueNotFound,
-    2: ErrQueueMessageNotFound,
-    3: ErrQueueInvalidToken,
-    4: ErrQueueFull,
-    5: ErrQueueInvalidDelay,
-}
-
-_RPC_STATUS_MAP: dict[int, type[RpcError]] = {
-    1: ErrRpcTimeout,
-    2: ErrRpcHandlerNotFound,
-    3: ErrRpcHandlerError,
-    4: ErrRpcInvalidRequest,
-}
-
-_LEASE_STATUS_MAP: dict[int, type[LeaseError]] = {
-    1: ErrLeaseHeld,
-    2: ErrLeaseNotFound,
-    3: ErrLeaseInvalidToken,
-}
-
-_NOTICE_STATUS_MAP: dict[int, type[NoticeError]] = {
-    1: ErrNoticeGeneral,
-}
-
-_STREAM_STATUS_MAP: dict[int, type[StreamError]] = {
-    1: ErrStreamNotFound,
-    2: ErrStreamOffsetOutOfRange,
-    3: ErrStreamInvalidOffset,
-    4: ErrStreamFull,
-    5: ErrStreamSessionNotFound,
-    6: ErrStreamSessionClosed,
-    7: ErrStreamExpectedOffsetMismatch,
-}
-
-_SCHEDULE_STATUS_MAP: dict[int, type[ScheduleError]] = {
-    1: ErrScheduleNotFound,
-    2: ErrScheduleTaskNotFound,
-    3: ErrScheduleInvalidCron,
-    4: ErrScheduleInvalidDelay,
-    5: ErrScheduleInvalidTimestamp,
-}
-
-_RETRYABLE_ERROR_CODES = {
-    "KV_4",
-    "QUEUE_4",
-    "LEASE_1",
-    "NOTICE_1",
-    "STREAM_1",
-    "STREAM_2",
-    "STREAM_3",
-    "STREAM_4",
-    "RPC_1",
-}
-
-
-def _build_domain_error(
-    mapping: dict[int, type[TError]],
-    fallback: Callable[[str, int | None], TError],
-    message: str,
-    domain_code: int | None,
-) -> TError:
-    if domain_code is not None:
-        error_type = mapping.get(domain_code)
-        if error_type is not None:
-            return error_type(message)
-    return fallback(message, domain_code)
-
-
-def kv_error(message: str, domain_code: int | None = None) -> KvError:
-    return _build_domain_error(
-        _KV_STATUS_MAP,
-        lambda msg, code: KvError(msg, "ERROR", code),
-        message,
-        domain_code,
-    )
-
-
-def queue_error(message: str, domain_code: int | None = None) -> QueueError:
-    return _build_domain_error(
-        _QUEUE_STATUS_MAP,
-        lambda msg, code: QueueError(msg, "ERROR", code),
-        message,
-        domain_code,
-    )
-
-
-def rpc_error(message: str, domain_code: int | None = None) -> RpcError:
-    return _build_domain_error(
-        _RPC_STATUS_MAP,
-        lambda msg, code: RpcError(msg, "ERROR", code),
-        message,
-        domain_code,
-    )
-
-
-def lease_error(message: str, domain_code: int | None = None) -> LeaseError:
-    return _build_domain_error(
-        _LEASE_STATUS_MAP,
-        lambda msg, code: LeaseError(msg, "ERROR", code),
-        message,
-        domain_code,
-    )
-
-
-def notice_error(message: str, domain_code: int | None = None) -> NoticeError:
-    return _build_domain_error(
-        _NOTICE_STATUS_MAP,
-        lambda msg, code: NoticeError(msg, "ERROR", code),
-        message,
-        domain_code,
-    )
-
-
-def stream_error(message: str, domain_code: int | None = None) -> StreamError:
-    return _build_domain_error(
-        _STREAM_STATUS_MAP,
-        lambda msg, code: StreamError(msg, "ERROR", code),
-        message,
-        domain_code,
-    )
-
-
-def schedule_error(message: str, domain_code: int | None = None) -> ScheduleError:
-    return _build_domain_error(
-        _SCHEDULE_STATUS_MAP,
-        lambda msg, code: ScheduleError(msg, "ERROR", code),
-        message,
-        domain_code,
-    )
 
 
 def is_retryable(error: object) -> bool:
-    if not isinstance(error, FitzError):
-        return False
-    if isinstance(error, (TimeoutError, TransportError)):
+    if isinstance(error, (FitzTransportError, FitzTimeoutError, RequestQueueFullError)):
         return True
-    if error.domain_code is None:
+    if not isinstance(error, DomainError) or error.domain_code is None:
         return False
-    prefix = error.code.split("_")[0]
-    return f"{prefix}_{error.domain_code}" in _RETRYABLE_ERROR_CODES
+    return (error.prefix, error.domain_code) in _RETRYABLE
+
+
+def domain_error(
+    error_type: type[DomainError], operation: str, status: int, message: str | None = None
+) -> DomainError:
+    reason = message or f"status {status}"
+    return error_type(f"{operation} failed: {reason}", operation, status)
+
+
+# Transitional internal aliases. They are deliberately not exported publicly.
+ConnectionError = FitzConnectionError
+TransportError = FitzTransportError
+TimeoutError = FitzTimeoutError
+
+
+def kv_error(message: str, domain_code: int | None = None) -> KvError:
+    return KvError(message, "ERROR", domain_code)
+
+
+def queue_error(message: str, domain_code: int | None = None) -> QueueError:
+    return QueueError(message, "ERROR", domain_code)
+
+
+def rpc_error(message: str, domain_code: int | None = None) -> RpcError:
+    return RpcError(message, "ERROR", domain_code)
+
+
+def lease_error(message: str, domain_code: int | None = None) -> LeaseError:
+    return LeaseError(message, "ERROR", domain_code)
+
+
+def notice_error(message: str, domain_code: int | None = None) -> NoticeError:
+    return NoticeError(message, "ERROR", domain_code)
+
+
+def stream_error(message: str, domain_code: int | None = None) -> StreamError:
+    return StreamError(message, "ERROR", domain_code)
+
+
+def schedule_error(message: str, domain_code: int | None = None) -> ScheduleError:
+    return ScheduleError(message, "ERROR", domain_code)
