@@ -1,13 +1,17 @@
-"""KV domain client and transaction primitives for Fitz."""
+"""Transactional KV operations and mutation subscriptions."""
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import Literal
+from enum import StrEnum
 
-from fitz_py.domains._routes import is_exact_route_shape
+from fitz_py._runtime import AsyncSubscription
+from fitz_py.domains._routes import is_exact_route_shape, is_selector_route_shape
+from fitz_py.domains._subscriptions import SubscriptionRegistry
 from fitz_py.domains.base import DomainClient
-from fitz_py.errors import ErrKvOperationNotAllowed, KvError, kv_error
+from fitz_py.errors import KvError, StaleHandleError, domain_error
 from fitz_py.protocol.buffer import BufferReader, BufferWriter
 from fitz_py.protocol.messages import (
     MSG_KV_BEGIN,
@@ -16,232 +20,284 @@ from fitz_py.protocol.messages import (
     MSG_KV_DELETE_RANGE,
     MSG_KV_GET,
     MSG_KV_INSERT,
+    MSG_KV_NOTIFY,
     MSG_KV_PUT,
     MSG_KV_ROLLBACK,
     MSG_KV_SCAN,
+    MSG_KV_SUBSCRIBE,
+    MSG_KV_UNSUBSCRIBE,
 )
 
-KVMode = Literal["read_only", "read_write"]
-KVDurability = Literal["buffered", "sync"]
+
+class KvMode(StrEnum):
+    READ_ONLY = "read_only"
+    READ_WRITE = "read_write"
 
 
-@dataclass(slots=True)
+class KvDurability(StrEnum):
+    BUFFERED = "buffered"
+    SYNC = "sync"
+
+
+@dataclass(frozen=True, slots=True)
 class KvGetResult:
-    """Result of a KV get operation."""
-
     found: bool
     value: bytes | None = None
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class KvPair:
-    """A single key/value pair returned by KV scans."""
-
     key: bytes
     value: bytes
 
 
-@dataclass(slots=True)
-class KvScanResult:
-    """Batch result from a KV scan operation."""
+@dataclass(frozen=True, slots=True)
+class KvScanPage:
+    entries: tuple[KvPair, ...]
+    has_more: bool
 
-    items: list[KvPair]
-    has_more: bool = False
+
+@dataclass(frozen=True, slots=True)
+class KvNotification:
+    route: str
+    mutation_count: int
 
 
 class KvTransaction:
-    """Scoped transactional KV operations for a single begin/commit lifecycle."""
-
     def __init__(self, connection, route: str, tx_id: int) -> None:
         self._connection = connection
         self._route = route
         self._tx_id = tx_id
+        self._generation = connection.generation
         self._closed = False
-        self._closed_reason: str | None = None
-        on_disconnect = getattr(self._connection, "on_disconnect", None)
-        self._disconnect_unregister = (
-            on_disconnect(self._invalidate) if callable(on_disconnect) else None
-        )
+        self._lock = asyncio.Lock()
+        self._disconnect = connection.on_disconnect(self._invalidate)
 
-    async def __aenter__(self) -> "KvTransaction":
+    async def __aenter__(self) -> KvTransaction:
         return self
 
-    async def __aexit__(self, exc_type, exc, tb) -> None:
-        if not self._closed:
-            await self.rollback()
+    async def __aexit__(self, *_args: object) -> None:
+        await self.rollback()
+
+    def _ensure_open(self) -> None:
+        if self._generation != self._connection.generation:
+            raise StaleHandleError("KV transaction")
+        if self._closed:
+            raise KvError("Transaction is closed", "TX_CLOSED")
+
+    def _invalidate(self) -> None:
+        self._closed = True
 
     async def get(self, key: bytes) -> KvGetResult:
-        self._ensure_open("GET")
-        writer = BufferWriter()
-        writer.write_u64_be(self._tx_id)
-        writer.write_route(self._route)
-        writer.write_u32_be(len(key))
-        writer.write_bytes(key)
-        reader = BufferReader(await self._connection.request(MSG_KV_GET, writer.build()))
-        status = reader.read_u8()
-        if status != 0:
-            raise kv_error(f"GET failed with status {status}", status)
-        found = not reader.is_eof() and reader.read_u8() == 1
-        if not found or reader.is_eof():
-            return KvGetResult(found=False)
-        value = reader.read_bytes(reader.read_u32_be())
-        return KvGetResult(found=True, value=value)
+        async with self._lock:
+            self._ensure_open()
+
+            async def operation() -> KvGetResult:
+                writer = self._prefix()
+                writer.write_u32_be(len(key))
+                writer.write_bytes(key)
+                reader = BufferReader(await self._connection.request(MSG_KV_GET, writer.build()))
+                self._status(reader, "GET")
+                found = not reader.is_eof() and reader.read_u8() == 1
+                if not found:
+                    return KvGetResult(False)
+                return KvGetResult(True, reader.read_bytes(reader.read_u32_be()))
+
+            return await self._connection.run_with_retry(operation, replay_safe=True)
 
     async def put(self, key: bytes, value: bytes) -> None:
-        await self._write(MSG_KV_PUT, key, value, "PUT")
+        await self._write(MSG_KV_PUT, "PUT", key, value)
 
     async def insert(self, key: bytes, value: bytes) -> None:
-        await self._write(MSG_KV_INSERT, key, value, "INSERT")
+        await self._write(MSG_KV_INSERT, "INSERT", key, value)
 
     async def delete(self, key: bytes) -> None:
-        self._ensure_open("DELETE")
-        writer = BufferWriter()
-        writer.write_u64_be(self._tx_id)
-        writer.write_route(self._route)
-        writer.write_u32_be(len(key))
-        writer.write_bytes(key)
-        await self._expect_status(MSG_KV_DELETE, writer.build(), "DELETE")
+        async with self._lock:
+            self._ensure_open()
+            writer = self._prefix()
+            writer.write_u32_be(len(key))
+            writer.write_bytes(key)
+            self._status(
+                BufferReader(await self._connection.request(MSG_KV_DELETE, writer.build())),
+                "DELETE",
+            )
 
     async def delete_range(self, start_key: bytes, end_key: bytes) -> None:
-        self._ensure_open("DELETE_RANGE")
-        writer = BufferWriter()
-        writer.write_u64_be(self._tx_id)
-        writer.write_route(self._route)
-        writer.write_u32_be(len(start_key))
-        writer.write_bytes(start_key)
-        writer.write_u32_be(len(end_key))
-        writer.write_bytes(end_key)
-        await self._expect_status(MSG_KV_DELETE_RANGE, writer.build(), "DELETE_RANGE")
+        if start_key >= end_key:
+            raise KvError("Range start must be less than end", "INVALID_RANGE")
+        async with self._lock:
+            self._ensure_open()
+            writer = self._prefix()
+            for key in (start_key, end_key):
+                writer.write_u32_be(len(key))
+                writer.write_bytes(key)
+            self._status(
+                BufferReader(await self._connection.request(MSG_KV_DELETE_RANGE, writer.build())),
+                "DELETE_RANGE",
+            )
 
-    async def scan(
+    async def scan_page(
         self,
         *,
         start_key: bytes | None = None,
         end_key: bytes | None = None,
         limit: int | None = None,
         reverse: bool = False,
-    ) -> KvScanResult:
-        self._ensure_open("SCAN")
-        writer = BufferWriter()
-        writer.write_u64_be(self._tx_id)
-        writer.write_route(self._route)
-        if start_key is not None:
-            writer.write_u8(1)
-            writer.write_u32_be(len(start_key))
-            writer.write_bytes(start_key)
-        else:
-            writer.write_u8(0)
-        if end_key is not None:
-            writer.write_u8(1)
-            writer.write_u32_be(len(end_key))
-            writer.write_bytes(end_key)
-        else:
-            writer.write_u8(0)
-        if limit is not None and limit > 0:
-            writer.write_u8(1)
-            writer.write_u32_be(limit)
-        else:
-            writer.write_u8(0)
-        writer.write_u8(1 if reverse else 0)
+    ) -> KvScanPage:
+        if start_key is not None and end_key is not None and start_key >= end_key:
+            raise KvError("Range start must be less than end", "INVALID_RANGE")
+        async with self._lock:
+            self._ensure_open()
 
-        reader = BufferReader(await self._connection.request(MSG_KV_SCAN, writer.build()))
-        status = reader.read_u8()
-        if status != 0:
-            raise kv_error(f"SCAN failed with status {status}", status)
-        if reader.is_eof():
-            return KvScanResult(items=[])
-        count = reader.read_u32_be()
-        items: list[KvPair] = []
-        for _ in range(count):
-            key = reader.read_bytes(reader.read_u32_be())
-            value = reader.read_bytes(reader.read_u32_be())
-            items.append(KvPair(key=key, value=value))
-        has_more = not reader.is_eof() and reader.read_u8() == 1
-        return KvScanResult(items=items, has_more=has_more)
+            async def operation() -> KvScanPage:
+                writer = self._prefix()
+                for value in (start_key, end_key):
+                    writer.write_u8(0 if value is None else 1)
+                    if value is not None:
+                        writer.write_u32_be(len(value))
+                        writer.write_bytes(value)
+                writer.write_u8(0 if limit is None else 1)
+                if limit is not None:
+                    writer.write_u32_be(limit)
+                writer.write_u8(1 if reverse else 0)
+                reader = BufferReader(await self._connection.request(MSG_KV_SCAN, writer.build()))
+                self._status(reader, "SCAN")
+                count = 0 if reader.is_eof() else reader.read_u32_be()
+                entries = tuple(
+                    KvPair(
+                        reader.read_bytes(reader.read_u32_be()),
+                        reader.read_bytes(reader.read_u32_be()),
+                    )
+                    for _ in range(count)
+                )
+                return KvScanPage(entries, not reader.is_eof() and reader.read_u8() == 1)
+
+            return await self._connection.run_with_retry(operation, replay_safe=True)
+
+    async def scan(self, **options) -> AsyncIterator[KvPair]:
+        page = await self.scan_page(**options)
+        if page.has_more and options.get("limit") is None:
+            raise KvError("Unbounded scan was truncated", "SCAN_TRUNCATED")
+        for entry in page.entries:
+            yield entry
 
     async def commit(self) -> None:
-        await self._finalize(MSG_KV_COMMIT, "COMMIT")
+        await self._finish(MSG_KV_COMMIT, "COMMIT")
 
     async def rollback(self) -> None:
-        await self._finalize(MSG_KV_ROLLBACK, "ROLLBACK")
-
-    async def _write(self, message_type: int, key: bytes, value: bytes, operation: str) -> None:
-        self._ensure_open(operation)
-        writer = BufferWriter()
-        writer.write_u64_be(self._tx_id)
-        writer.write_route(self._route)
-        writer.write_u32_be(len(key))
-        writer.write_bytes(key)
-        writer.write_u32_be(len(value))
-        writer.write_bytes(value)
-        await self._expect_status(message_type, writer.build(), operation)
-
-    async def _finalize(self, message_type: int, operation: str) -> None:
-        self._ensure_open(operation)
-        writer = BufferWriter()
-        writer.write_u64_be(self._tx_id)
-        writer.write_route(self._route)
-        await self._expect_status(message_type, writer.build(), operation)
-        self._closed = True
-        self._closed_reason = "committed" if operation == "COMMIT" else "rolled back"
-        self._clear_disconnect_listener()
-
-    def _ensure_open(self, operation: str) -> None:
-        if not self._closed:
-            return
-
-        reason = self._closed_reason or "closed"
-        raise ErrKvOperationNotAllowed(f"{operation} not allowed: transaction already {reason}")
-
-    def _invalidate(self) -> None:
         if self._closed:
             return
-        self._closed = True
-        self._closed_reason = "disconnected"
-        self._clear_disconnect_listener()
+        try:
+            await self._finish(MSG_KV_ROLLBACK, "ROLLBACK")
+        except Exception:
+            self._closed = True
 
-    def _clear_disconnect_listener(self) -> None:
-        unregister = getattr(self, "_disconnect_unregister", None)
-        if unregister is None:
-            return
-        self._disconnect_unregister = None
-        unregister()
+    async def _write(self, message_type: int, operation: str, key: bytes, value: bytes) -> None:
+        async with self._lock:
+            self._ensure_open()
+            writer = self._prefix()
+            for item in (key, value):
+                writer.write_u32_be(len(item))
+                writer.write_bytes(item)
+            self._status(
+                BufferReader(await self._connection.request(message_type, writer.build())),
+                operation,
+            )
 
-    async def _expect_status(self, message_type: int, payload: bytes, operation: str) -> None:
-        reader = BufferReader(await self._connection.request(message_type, payload))
+    async def _finish(self, message_type: int, operation: str) -> None:
+        async with self._lock:
+            self._ensure_open()
+            self._closed = True
+            self._disconnect()
+            reader = BufferReader(
+                await self._connection.request(message_type, self._prefix().build())
+            )
+            self._status(reader, operation)
+
+    def _prefix(self) -> BufferWriter:
+        writer = BufferWriter()
+        writer.write_u64_be(self._tx_id)
+        writer.write_route(self._route)
+        return writer
+
+    @staticmethod
+    def _status(reader: BufferReader, operation: str) -> None:
         status = reader.read_u8()
         if status != 0:
-            raise kv_error(f"{operation} failed with status {status}", status)
+            message = reader.read_string() if reader.remaining_bytes() >= 4 else None
+            raise domain_error(KvError, operation, status, message)
 
 
 class KvClient(DomainClient):
-    """KV domain entry point for creating transactions."""
+    def __init__(self, connection) -> None:
+        super().__init__(connection)
+        capacity = connection.config.limits.subscription_buffer_size
+        self._subscriptions = SubscriptionRegistry[KvNotification](
+            capacity, self._subscribe_wire, self._unsubscribe_wire
+        )
+        connection.register_notification_handler(MSG_KV_NOTIFY, self._notify)
+        connection.on_reconnect(
+            lambda: self._subscriptions.restore(
+                domain="kv",
+                on_error=lambda registration, error: connection.report_restore_failure(
+                    "kv", registration, error
+                ),
+            ),
+            domain="kv",
+            registration="mutations",
+        )
 
     async def begin(
         self,
         route: str,
         *,
-        mode: KVMode = "read_write",
-        durability: KVDurability,
+        durability: KvDurability | str = KvDurability.BUFFERED,
+        mode: KvMode | str = KvMode.READ_WRITE,
     ) -> KvTransaction:
-        _assert_kv_route(route)
+        if not is_exact_route_shape(route, "kv", 3):
+            raise KvError(f"Invalid KV route: {route}", "INVALID_ROUTE")
         writer = BufferWriter()
         writer.write_route(route)
-        writer.write_u8(1 if mode == "read_write" else 0)
-        writer.write_u8(1 if durability == "sync" else 0)
+        writer.write_u8(1 if KvMode(mode) is KvMode.READ_WRITE else 0)
+        writer.write_u8(1 if KvDurability(durability) is KvDurability.SYNC else 0)
         reader = BufferReader(await self.request_frame(MSG_KV_BEGIN, writer.build()))
-        status = reader.read_u8()
-        if status != 0:
-            raise kv_error(f"BEGIN failed with status {status}", status)
-        tx_id = reader.read_u64_be() if not reader.is_eof() else None
-        if tx_id is None:
-            raise KvError("BEGIN response missing transaction id", "MISSING_TX_ID")
-        return KvTransaction(self.connection, route, tx_id)
+        KvTransaction._status(reader, "BEGIN")
+        if reader.remaining_bytes() < 8:
+            raise KvError("BEGIN response missing transaction id", "INVALID_RESPONSE")
+        return KvTransaction(self.connection, route, reader.read_u64_be())
 
+    async def subscribe(self, pattern: str) -> AsyncSubscription[KvNotification]:
+        if not is_selector_route_shape(pattern, "kv", 3, True):
+            raise KvError(f"Invalid KV pattern: {pattern}", "INVALID_ROUTE")
+        return await self._subscriptions.subscribe(pattern)
 
-def _assert_kv_route(route: str) -> None:
-    if not is_exact_route_shape(route, "kv", 3):
-        raise KvError(
-            f"Invalid kv route: {route} (expected kv://{{realm}}/{{area}}/{{resource}}, no empty segments or wildcards)",
-            "INVALID_ROUTE",
+    async def _subscribe_wire(self, pattern: str) -> int:
+        writer = BufferWriter()
+        writer.write_route(pattern)
+        reader = BufferReader(await self.request_frame(MSG_KV_SUBSCRIBE, writer.build()))
+        KvTransaction._status(reader, "SUBSCRIBE")
+        if reader.remaining_bytes() != 8:
+            raise KvError("SUBSCRIBE response missing id", "INVALID_RESPONSE")
+        return reader.read_u64_be()
+
+    async def _unsubscribe_wire(self, pattern: str) -> None:
+        writer = BufferWriter()
+        writer.write_route(pattern)
+        KvTransaction._status(
+            BufferReader(await self.request_frame(MSG_KV_UNSUBSCRIBE, writer.build())),
+            "UNSUBSCRIBE",
         )
+
+    def _notify(self, payload: bytes) -> None:
+        reader = BufferReader(payload)
+        sub_id = reader.read_u64_be()
+        notification = KvNotification(reader.read_route(), reader.read_u64_be())
+        if not reader.is_eof():
+            return
+        self._subscriptions.publish(sub_id, notification)
+
+
+# Descriptive compatibility-free public spelling.
+KVDurability = KvDurability
+KVMode = KvMode
+KvScanResult = KvScanPage

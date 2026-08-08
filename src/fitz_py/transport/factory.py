@@ -11,14 +11,22 @@ def create_transport(
     *,
     timeout_ms: int,
     max_frame_size: int,
+    websocket_headers: dict[str, str] | None = None,
 ) -> Transport:
     resolved = transport
-    if resolved == "auto":
-        resolved = "ws" if url.startswith("ws://") or url.startswith("wss://") else "tcp"
+    if resolved is TransportType.AUTO:
+        resolved = (
+            TransportType.WEBSOCKET if url.startswith(("ws://", "wss://")) else TransportType.TCP
+        )
 
-    if resolved == "ws":
+    if resolved is TransportType.WEBSOCKET:
         from fitz_py.transport.websocket import WebSocketTransport
 
-        return WebSocketTransport(url, timeout_ms=timeout_ms, max_frame_size=max_frame_size)
+        return WebSocketTransport(
+            url,
+            timeout_ms=timeout_ms,
+            max_frame_size=max_frame_size,
+            headers=websocket_headers,
+        )
 
     return TcpTransport(url, timeout_ms=timeout_ms, max_frame_size=max_frame_size)

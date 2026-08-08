@@ -1,14 +1,13 @@
-"""Notice domain publish/subscribe client and notification models."""
+"""Fire-and-forget notices and bounded async subscriptions."""
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
+from fitz_py._runtime import AsyncSubscription
 from fitz_py.domains._routes import is_exact_route_shape, is_selector_route_shape
 from fitz_py.domains.base import DomainClient
-from fitz_py.errors import NoticeError, notice_error
+from fitz_py.errors import NoticeError, domain_error
 from fitz_py.protocol.buffer import BufferReader, BufferWriter
 from fitz_py.protocol.messages import (
     MSG_NOTICE_NOTIFY,
@@ -16,171 +15,107 @@ from fitz_py.protocol.messages import (
     MSG_NOTICE_SUBSCRIBE,
     MSG_NOTICE_UNSUBSCRIBE,
 )
+from fitz_py.protocol.response import parse_response
 
-NoticeHandler = Callable[["NoticeMessage"], None | Awaitable[None]]
 
-
-@dataclass(slots=True)
-class NoticeMessage:
-    """Notice payload delivered to a subscriber callback."""
-
+@dataclass(frozen=True, slots=True)
+class Notice:
     route: str
     body: bytes
 
 
 @dataclass(slots=True)
-class _NoticeSubscriptionState:
-    """Internal handler registry for a single subscribed notice pattern."""
-
+class _Wire:
     sub_id: int
-    handlers: dict[int, NoticeHandler] = field(default_factory=dict)
-
-
-class NoticeSubscription:
-    """Handle for an active notice pattern subscription."""
-
-    def __init__(
-        self,
-        sub_id: int,
-        pattern: str,
-        handler: NoticeHandler,
-        unsubscribe: Callable[[str, int], Awaitable[None]],
-        handler_id: int,
-    ) -> None:
-        self._sub_id = sub_id
-        self.pattern = pattern
-        self.handler = handler
-        self._unsubscribe = unsubscribe
-        self._handler_id = handler_id
-
-    async def unsubscribe(self) -> None:
-        await self._unsubscribe(self.pattern, self._handler_id)
+    consumers: set[AsyncSubscription[Notice]] = field(default_factory=set)
 
 
 class NoticeClient(DomainClient):
-    """Notice domain operations for publish and pattern subscriptions."""
-
     def __init__(self, connection) -> None:
         super().__init__(connection)
-        self._subscriptions_by_pattern: dict[str, _NoticeSubscriptionState] = {}
-        self._patterns_by_sub_id: dict[int, str] = {}
-        self._initialized = False
-        self._next_handler_id = 1
-        self.connection.on_reconnect(self._restore_subscriptions)
+        self._by_pattern: dict[str, _Wire] = {}
+        self._pattern_by_id: dict[int, str] = {}
+        connection.register_notification_handler(MSG_NOTICE_NOTIFY, self._notify)
+        connection.on_reconnect(self._restore, domain="notice", registration="subscriptions")
 
     async def publish(self, route: str, body: bytes) -> None:
-        _assert_notice_route(route)
+        if not is_exact_route_shape(route, "notice", 3):
+            raise NoticeError(f"Invalid notice route: {route}", "INVALID_ROUTE")
         writer = BufferWriter()
         writer.write_route(route)
         writer.write_u32_be(len(body))
         writer.write_bytes(body)
-        cancel_optional = self.connection.get_multiplexer().expect_optional_response(
-            MSG_NOTICE_PUBLISH
+        await self.connection.send(MSG_NOTICE_PUBLISH, writer.build())
+
+    async def subscribe(self, pattern: str) -> AsyncSubscription[Notice]:
+        if not is_selector_route_shape(pattern, "notice", 3, allow_realm_wildcard=True):
+            raise NoticeError(f"Invalid notice pattern: {pattern}", "INVALID_ROUTE")
+        state = self._by_pattern.get(pattern)
+        if state is None:
+            state = _Wire(await self._subscribe_wire(pattern))
+            self._by_pattern[pattern] = state
+            self._pattern_by_id[state.sub_id] = pattern
+        subscription: AsyncSubscription[Notice]
+
+        async def close() -> None:
+            current = self._by_pattern.get(pattern)
+            if current is None:
+                return
+            current.consumers.discard(subscription)
+            if current.consumers:
+                return
+            writer = BufferWriter()
+            writer.write_u64_be(current.sub_id)
+            response = parse_response(
+                await self.request_frame(MSG_NOTICE_UNSUBSCRIBE, writer.build())
+            )
+            if not response.success:
+                raise domain_error(
+                    NoticeError, "UNSUBSCRIBE", response.error_code or 0, response.error
+                )
+            self._by_pattern.pop(pattern, None)
+            self._pattern_by_id.pop(current.sub_id, None)
+
+        subscription = AsyncSubscription(
+            pattern, self.connection.config.limits.subscription_buffer_size, close
         )
-        try:
-            await self.connection.send_fire_and_forget(MSG_NOTICE_PUBLISH, writer.build())
-        except Exception:
-            cancel_optional()
-            raise
-
-    async def subscribe(self, pattern: str, handler: NoticeHandler) -> NoticeSubscription:
-        _assert_notice_pattern(pattern)
-        self._init_notify_handler()
-        existing = self._subscriptions_by_pattern.get(pattern)
-        if existing is None:
-            sub_id = await self._subscribe_wire(pattern)
-            existing = _NoticeSubscriptionState(sub_id=sub_id)
-            self._subscriptions_by_pattern[pattern] = existing
-            self._patterns_by_sub_id[sub_id] = pattern
-
-        handler_id = self._next_handler_id
-        self._next_handler_id += 1
-        existing.handlers[handler_id] = handler
-        return NoticeSubscription(existing.sub_id, pattern, handler, self._unsubscribe, handler_id)
+        state.consumers.add(subscription)
+        return subscription
 
     async def _subscribe_wire(self, pattern: str) -> int:
         writer = BufferWriter()
         writer.write_route(pattern)
-        reader = BufferReader(await self.request_frame(MSG_NOTICE_SUBSCRIBE, writer.build()))
-        status = reader.read_u8()
-        if status != 0:
-            raise notice_error(f"SUBSCRIBE failed with status {status}", status)
-        has_sub_id = reader.read_u8() if not reader.is_eof() else 0
-        if has_sub_id != 1 or reader.remaining_bytes() < 8:
-            raise NoticeError("SUBSCRIBE response missing subscription id", "MISSING_SUB_ID")
+        response = parse_response(await self.request_frame(MSG_NOTICE_SUBSCRIBE, writer.build()))
+        if not response.success:
+            raise domain_error(NoticeError, "SUBSCRIBE", response.error_code or 0, response.error)
+        reader = BufferReader(response.data)
+        if reader.read_u8() != 1:
+            raise NoticeError("SUBSCRIBE response omitted its id", "INVALID_RESPONSE")
         return reader.read_u64_be()
 
-    async def _unsubscribe(self, pattern: str, handler_id: int) -> None:
-        subscription = self._subscriptions_by_pattern.get(pattern)
-        if subscription is None:
+    def _notify(self, payload: bytes) -> None:
+        reader = BufferReader(payload)
+        sub_id = reader.read_u64_be()
+        notice = Notice(reader.read_route(), reader.read_bytes(reader.read_u32_be()))
+        if not reader.is_eof():
+            raise NoticeError("NOTICE_NOTIFY has trailing bytes", "INVALID_RESPONSE")
+        pattern = self._pattern_by_id.get(sub_id)
+        state = self._by_pattern.get(pattern) if pattern is not None else None
+        if state is None:
             return
+        dead = {consumer for consumer in state.consumers if not consumer.push(notice)}
+        state.consumers.difference_update(dead)
 
-        subscription.handlers.pop(handler_id, None)
-        if subscription.handlers:
-            return
-
-        self._subscriptions_by_pattern.pop(pattern, None)
-        self._patterns_by_sub_id.pop(subscription.sub_id, None)
-        writer = BufferWriter()
-        writer.write_u64_be(subscription.sub_id)
-        await self.request_frame(MSG_NOTICE_UNSUBSCRIBE, writer.build())
-
-    def _init_notify_handler(self) -> None:
-        if self._initialized:
-            return
-        self._initialized = True
-
-        def handler(payload: bytes) -> None:
+    async def _restore(self) -> None:
+        for pattern, state in list(self._by_pattern.items()):
+            old_id = state.sub_id
             try:
-                reader = BufferReader(payload)
-                sub_id = reader.read_u64_be()
-                route = reader.read_route()
-                body = reader.read_bytes(reader.read_u32_be())
-                pattern = self._patterns_by_sub_id.get(sub_id)
-                if pattern is None:
-                    return
-                subscription = self._subscriptions_by_pattern.get(pattern)
-                if subscription is None:
-                    return
-                notification = NoticeMessage(route=route, body=body)
-                for callback in subscription.handlers.values():
-                    result = callback(notification)
-                    if asyncio.iscoroutine(result):
-                        asyncio.create_task(result)
-            except Exception:
-                return
-
-        self.connection.register_notification_handler(MSG_NOTICE_NOTIFY, handler)
-
-    async def _restore_subscriptions(self) -> None:
-        if not self._subscriptions_by_pattern:
-            return
-        snapshot = [
-            (pattern, dict(state.handlers))
-            for pattern, state in self._subscriptions_by_pattern.items()
-        ]
-        self._subscriptions_by_pattern.clear()
-        self._patterns_by_sub_id.clear()
-        for pattern, handlers in snapshot:
-            sub_id = await self._subscribe_wire(pattern)
-            self._subscriptions_by_pattern[pattern] = _NoticeSubscriptionState(
-                sub_id=sub_id,
-                handlers=handlers,
-            )
-            self._patterns_by_sub_id[sub_id] = pattern
-
-
-def _assert_notice_route(route: str) -> None:
-    if not is_exact_route_shape(route, "notice", 3):
-        raise NoticeError(
-            f"Invalid notice route: {route} (expected notice://{{realm}}/{{area}}/{{resource}}, no empty segments or wildcards)",
-            "INVALID_ROUTE",
-        )
-
-
-def _assert_notice_pattern(pattern: str) -> None:
-    if not is_selector_route_shape(pattern, "notice", 3, allow_realm_wildcard=True):
-        raise NoticeError(
-            f"Invalid notice pattern: {pattern} (expected notice://{{realm}}/{{area}}/{{resource}}, notice://{{realm}}/{{area}}/*, or notice://{{realm}}/**)",
-            "INVALID_ROUTE",
-        )
+                state.sub_id = await self._subscribe_wire(pattern)
+            except BaseException as exc:
+                self._by_pattern.pop(pattern, None)
+                for consumer in state.consumers:
+                    consumer.fail(exc)
+                self.connection.report_restore_failure("notice", pattern, exc)
+                continue
+            self._pattern_by_id.pop(old_id, None)
+            self._pattern_by_id[state.sub_id] = pattern

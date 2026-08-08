@@ -6,23 +6,34 @@ from fitz_py.errors import CodecError
 
 
 class BufferWriter:
-    def __init__(self) -> None:
-        self._parts: list[bytes] = []
+    def __init__(self, capacity: int = 128) -> None:
+        self._buffer = bytearray(capacity)
+        self._offset = 0
+
+    def _reserve(self, size: int) -> int:
+        start = self._offset
+        end = start + size
+        if end > len(self._buffer):
+            self._buffer.extend(b"\0" * max(end - len(self._buffer), len(self._buffer)))
+        self._offset = end
+        return start
 
     def write_u8(self, value: int) -> None:
-        self._parts.append(struct.pack(">B", value))
+        struct.pack_into(">B", self._buffer, self._reserve(1), value)
 
     def write_u16_be(self, value: int) -> None:
-        self._parts.append(struct.pack(">H", value))
+        struct.pack_into(">H", self._buffer, self._reserve(2), value)
 
     def write_u32_be(self, value: int) -> None:
-        self._parts.append(struct.pack(">I", value))
+        struct.pack_into(">I", self._buffer, self._reserve(4), value)
 
     def write_u64_be(self, value: int) -> None:
-        self._parts.append(struct.pack(">Q", value))
+        struct.pack_into(">Q", self._buffer, self._reserve(8), value)
 
     def write_bytes(self, value: bytes | bytearray | memoryview) -> None:
-        self._parts.append(bytes(value))
+        view = memoryview(value)
+        start = self._reserve(len(view))
+        self._buffer[start : start + len(view)] = view
 
     def write_string(self, value: str) -> None:
         encoded = value.encode("utf-8")
@@ -40,12 +51,12 @@ class BufferWriter:
         self.write_u64_be(value)
 
     def build(self) -> bytes:
-        return b"".join(self._parts)
+        return bytes(memoryview(self._buffer)[: self._offset])
 
 
 class BufferReader:
     def __init__(self, data: bytes | bytearray | memoryview) -> None:
-        self._buffer = memoryview(bytes(data))
+        self._buffer = memoryview(data)
         self._offset = 0
 
     def _read(self, size: int) -> memoryview:
@@ -77,8 +88,11 @@ class BufferReader:
         return self.read_string()
 
     def read_optional_u64(self) -> int | None:
-        if self.read_u8() == 0:
+        flag = self.read_u8()
+        if flag == 0:
             return None
+        if flag != 1:
+            raise CodecError(f"Invalid optional u64 flag: {flag}")
         return self.read_u64_be()
 
     def remaining(self) -> bytes:

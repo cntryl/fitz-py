@@ -1,4 +1,4 @@
-"""In-flight request correlation and notification dispatch for framed messages."""
+"""Cancellation-safe FIFO response correlation and push-frame dispatch."""
 
 from __future__ import annotations
 
@@ -7,35 +7,30 @@ from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
-from fitz_py.errors import ConnectionError, TimeoutError
-from fitz_py.types import ConnectionState
+from fitz_py.errors import FitzConnectionError, FitzTimeoutError
 
 NotificationHandler = Callable[[bytes], None]
+PushClassifier = Callable[[bytes], bool]
 
 
 @dataclass(slots=True)
 class PendingRequest:
-    """Tracks a pending request future and its timeout handle."""
-
-    future: asyncio.Future[bytes]
-    timeout_handle: asyncio.TimerHandle
+    future: asyncio.Future[bytes] | None
+    sent: bool = False
 
 
 class Multiplexer:
-    """Routes response frames to awaiters and notification frames to handlers."""
-
     def __init__(self) -> None:
         self._pending: dict[int, deque[PendingRequest]] = defaultdict(deque)
         self._notification_handlers: dict[int, NotificationHandler] = {}
-        self._optional_responses: dict[int, int] = {}
-        self._state = ConnectionState.DISCONNECTED
+        self._push_classifiers: dict[int, PushClassifier] = {}
+        self._connected = False
 
     def set_connected(self) -> None:
-        self._state = ConnectionState.AUTHENTICATED
+        self._connected = True
 
     def set_disconnected(self) -> None:
-        self._state = ConnectionState.DISCONNECTED
-        self._optional_responses.clear()
+        self._connected = False
         self.cancel_all()
 
     def register_notification_handler(
@@ -46,96 +41,88 @@ class Multiplexer:
     def unregister_notification_handler(self, message_type: int) -> None:
         self._notification_handlers.pop(message_type, None)
 
-    def expect_optional_response(self, message_type: int) -> Callable[[], None]:
-        self._optional_responses[message_type] = self._optional_responses.get(message_type, 0) + 1
-
-        def cancel() -> None:
-            current = self._optional_responses.get(message_type, 0)
-            if current <= 1:
-                self._optional_responses.pop(message_type, None)
-            else:
-                self._optional_responses[message_type] = current - 1
-
-        return cancel
+    def register_push_classifier(self, message_type: int, classifier: PushClassifier) -> None:
+        self._push_classifiers[message_type] = classifier
 
     async def request(
         self,
         message_type: int,
         frame_data: bytes,
         send: Callable[[bytes], Awaitable[None]],
-        timeout_ms: int,
+        timeout: float,
     ) -> bytes:
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future[bytes] = loop.create_future()
-
-        def on_timeout() -> None:
-            self._remove_pending_future(message_type, future)
-            if not future.done():
-                future.set_exception(
-                    TimeoutError(
-                        f"Request timeout for message type {message_type} after {timeout_ms}ms"
-                    )
-                )
-
-        timeout_handle = loop.call_later(timeout_ms / 1000, on_timeout)
-        self._pending[message_type].append(
-            PendingRequest(future=future, timeout_handle=timeout_handle)
-        )
-
+        future = asyncio.get_running_loop().create_future()
+        pending = PendingRequest(future)
+        self._pending[message_type].append(pending)
         try:
             await send(frame_data)
-            return await future
+            pending.sent = True
+            async with asyncio.timeout(timeout):
+                return await future
+        except TimeoutError as exc:
+            self._abandon(message_type, pending)
+            raise FitzTimeoutError(
+                f"Request timeout for message type {message_type} after {timeout:g}s"
+            ) from exc
+        except asyncio.CancelledError:
+            self._abandon(message_type, pending)
+            raise
         except BaseException:
-            timeout_handle.cancel()
-            self._remove_pending_future(message_type, future)
+            if pending.sent:
+                self._abandon(message_type, pending)
+            else:
+                self._remove(message_type, pending)
             raise
 
-    def _remove_pending_future(self, message_type: int, future: asyncio.Future[bytes]) -> None:
+    def _abandon(self, message_type: int, pending: PendingRequest) -> None:
+        if pending.sent:
+            pending.future = None  # tombstone consumes a possible late reply
+        else:
+            self._remove(message_type, pending)
+
+    def _remove(self, message_type: int, pending: PendingRequest) -> None:
         queue = self._pending.get(message_type)
         if queue is None:
             return
-
-        filtered = deque(item for item in queue if item.future is not future)
-        if filtered:
-            self._pending[message_type] = filtered
+        try:
+            queue.remove(pending)
+        except ValueError:
             return
-
-        self._pending.pop(message_type, None)
+        if not queue:
+            self._pending.pop(message_type, None)
 
     def dispatch(self, message_type: int, payload: bytes) -> None:
+        classifier = self._push_classifiers.get(message_type)
+        if classifier is not None:
+            try:
+                if classifier(payload):
+                    self._dispatch_push(message_type, payload)
+                    return
+            except Exception:
+                return
+
         queue = self._pending.get(message_type)
         if queue:
             pending = queue.popleft()
             if not queue:
                 self._pending.pop(message_type, None)
-            pending.timeout_handle.cancel()
-            if not pending.future.done():
+            if pending.future is not None and not pending.future.done():
                 pending.future.set_result(payload)
             return
+        self._dispatch_push(message_type, payload)
 
+    def _dispatch_push(self, message_type: int, payload: bytes) -> None:
         handler = self._notification_handlers.get(message_type)
         if handler is not None:
             try:
                 handler(payload)
             except Exception:
                 return
-            return
-
-        optional_count = self._optional_responses.get(message_type, 0)
-        if optional_count > 0:
-            if optional_count == 1:
-                self._optional_responses.pop(message_type, None)
-            else:
-                self._optional_responses[message_type] = optional_count - 1
-            return
-
-        if self._state is not ConnectionState.AUTHENTICATED:
-            return
 
     def cancel_all(self) -> None:
+        error = FitzConnectionError("Connection closed or reset")
         for queue in self._pending.values():
             for pending in queue:
-                pending.timeout_handle.cancel()
-                if not pending.future.done():
-                    pending.future.set_exception(ConnectionError("Connection closed or reset"))
+                if pending.future is not None and not pending.future.done():
+                    pending.future.set_exception(error)
         self._pending.clear()

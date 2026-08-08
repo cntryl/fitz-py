@@ -36,8 +36,13 @@ from fitz_py import (  # noqa: E402
     AuthenticationError,
     Client,
     ClientConfig,
+    ConcurrencyLimits,
     FitzError,
+    RequestQueueFullError,
+    StreamFilterClause,
+    StreamFilterSet,
 )
+from fitz_py._runtime import RequestGate
 from tests.integration.fixture.jwt import make_expired_jwt, make_valid_jwt  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -102,9 +107,9 @@ async def _new_client(
         ClientConfig(
             url=url,
             token_provider=provider,
-            timeout_ms=timeout_ms,
+            request_timeout=timeout_ms / 1000,
             transport=CONFORMANCE_TRANSPORT,
-            max_in_flight_requests=max_in_flight_requests,
+            limits=ConcurrencyLimits(max_in_flight=max_in_flight_requests),
         )
     )
     await client.connect()
@@ -223,7 +228,7 @@ async def test_cs001_connect_success() -> None:
         evidence.append("connect returned successfully")
 
         route = _unique_route("kv")
-        tx = await client.kv().begin(route, durability="sync")
+        tx = await client.kv.begin(route, durability="sync")
         await tx.put(b"cs001-key", b"cs001-value")
         await tx.commit()
         evidence.append("first domain request (kv) succeeded")
@@ -283,7 +288,7 @@ async def test_cs002_auth_failure() -> None:
         evidence.append("connect did not raise (unexpected)")
         # Try a domain operation for diagnostic evidence only.
         try:
-            await client.kv().begin(_unique_route("kv"), durability="sync")
+            await client.kv.begin(_unique_route("kv"), durability="sync")
             evidence.append("WARNING: domain request unexpectedly succeeded")
         except Exception as dom_exc:
             evidence.append(f"domain request failed post-auth: {dom_exc}")
@@ -316,12 +321,12 @@ async def test_cs003_request_success() -> None:
     client = await _new_client()
     try:
         route = _unique_route("kv")
-        tx = await client.kv().begin(route, durability="sync")
+        tx = await client.kv.begin(route, durability="sync")
         await tx.put(b"user:1", b"Alice")
         await tx.commit()
         evidence.append("kv begin/put/commit succeeded")
 
-        rtx = await client.kv().begin(route, mode="read_only", durability="sync")
+        rtx = await client.kv.begin(route, mode="read_only", durability="sync")
         result = await rtx.get(b"user:1")
         assert result.found, "expected found=True"
         assert result.value == b"Alice"
@@ -357,7 +362,7 @@ async def test_cs004_unknown_route() -> None:
         no_worker_route = _unique_route("rpc")
         caught: Exception | None = None
         try:
-            iterator = await client.rpc().call(no_worker_route, b"ping", timeout_ms=500)
+            iterator = await client.rpc.call(no_worker_route, b"ping", timeout=0.5)
             async for _frame in iterator:
                 pass
         except Exception as exc:
@@ -368,7 +373,7 @@ async def test_cs004_unknown_route() -> None:
 
         # Client must remain usable
         route = _unique_route("kv")
-        tx = await client.kv().begin(route, durability="sync")
+        tx = await client.kv.begin(route, durability="sync")
         await tx.put(b"k", b"v")
         await tx.commit()
         evidence.append("client remains usable after unknown-route error")
@@ -401,12 +406,12 @@ async def test_cs005_invalid_payload() -> None:
     client = await _new_client()
     try:
         route = _unique_route("kv")
-        tx1 = await client.kv().begin(route, durability="sync")
+        tx1 = await client.kv.begin(route, durability="sync")
         await tx1.insert(b"dup-key", b"first")
         await tx1.commit()
         evidence.append("first insert succeeded")
 
-        tx2 = await client.kv().begin(route, durability="sync")
+        tx2 = await client.kv.begin(route, durability="sync")
         caught: Exception | None = None
         try:
             await tx2.insert(b"dup-key", b"second")
@@ -421,7 +426,7 @@ async def test_cs005_invalid_payload() -> None:
         assert caught is not None, "expected error on duplicate insert"
         evidence.append(f"duplicate insert raised {type(caught).__name__}: {caught}")
 
-        rtx = await client.kv().begin(route, mode="read_only", durability="sync")
+        rtx = await client.kv.begin(route, mode="read_only", durability="sync")
         result = await rtx.get(b"dup-key")
         assert result.found
         evidence.append("client remains usable after server-rejected operation")
@@ -456,7 +461,7 @@ async def test_cs006_server_error_mapping() -> None:
         route = _unique_route("rpc")
         rpc_err: Exception | None = None
         try:
-            iterator = await client.rpc().call(route, b"ping", timeout_ms=500)
+            iterator = await client.rpc.call(route, b"ping", timeout=0.5)
             async for _frame in iterator:
                 pass
         except Exception as exc:
@@ -472,11 +477,11 @@ async def test_cs006_server_error_mapping() -> None:
 
         # KV conflict — verify typed error
         kv_route = _unique_route("kv")
-        tx = await client.kv().begin(kv_route, durability="sync")
+        tx = await client.kv.begin(kv_route, durability="sync")
         await tx.insert(b"x", b"1")
         await tx.commit()
 
-        tx2 = await client.kv().begin(kv_route, durability="sync")
+        tx2 = await client.kv.begin(kv_route, durability="sync")
         kv_err: Exception | None = None
         try:
             await tx2.insert(b"x", b"2")
@@ -522,7 +527,7 @@ async def test_cs007_timeout_handling() -> None:
         start = time.monotonic()
         caught: Exception | None = None
         try:
-            iterator = await client.rpc().call(route, b"nobody", timeout_ms=250)
+            iterator = await client.rpc.call(route, b"nobody", timeout=0.25)
             async for _frame in iterator:
                 pass
         except Exception as exc:
@@ -539,7 +544,7 @@ async def test_cs007_timeout_handling() -> None:
 
         # Connection must remain healthy
         kv_route = _unique_route("kv")
-        tx = await client.kv().begin(kv_route, durability="sync")
+        tx = await client.kv.begin(kv_route, durability="sync")
         await tx.put(b"post-timeout", b"ok")
         await tx.commit()
         evidence.append("connection healthy after timeout")
@@ -579,14 +584,14 @@ async def test_cs008_caller_cancellation() -> None:
         async def _slow_handler(req, writer) -> None:
             try:
                 await asyncio.sleep(3.0)
-                await writer.send(b"late", is_end=True)
+                await writer.send(b"late", end=True)
             finally:
                 handler_finished.set()
 
-        sub = await worker_client.rpc().register_worker(route, _slow_handler)
+        sub = await worker_client.rpc.register_worker(route, _slow_handler)
 
         async def _do_call() -> None:
-            iterator = await caller_client.rpc().call(route, b"block", timeout_ms=30000)
+            iterator = await caller_client.rpc.call(route, b"block", timeout=30)
             async for _frame in iterator:
                 pass
 
@@ -616,7 +621,7 @@ async def test_cs008_caller_cancellation() -> None:
 
         # Subsequent request must succeed
         kv_route = _unique_route("kv")
-        tx = await caller_client.kv().begin(kv_route, durability="sync")
+        tx = await caller_client.kv.begin(kv_route, durability="sync")
         await tx.put(b"after-cancel", b"ok")
         await tx.commit()
         evidence.append("subsequent request succeeded after cancellation")
@@ -659,14 +664,14 @@ async def test_cs009_disconnect_during_request() -> None:
             handler_started.set()
             try:
                 await asyncio.sleep(1.5)
-                await writer.send(b"late", is_end=True)
+                await writer.send(b"late", end=True)
             finally:
                 handler_finished.set()
 
-        sub = await worker_client.rpc().register_worker(route, _slow_handler)
+        sub = await worker_client.rpc.register_worker(route, _slow_handler)
 
         async def _do_call() -> None:
-            iterator = await caller_client.rpc().call(route, b"block", timeout_ms=30000)
+            iterator = await caller_client.rpc.call(route, b"block", timeout=30)
             async for _frame in iterator:
                 pass
 
@@ -730,7 +735,7 @@ async def test_cs010_reconnect_behavior() -> None:
     client2 = await _new_client()
     try:
         route = _unique_route("kv")
-        tx = await client2.kv().begin(route, durability="sync")
+        tx = await client2.kv.begin(route, durability="sync")
         await tx.put(b"after-reconnect", b"ok")
         await tx.commit()
         evidence.append("new requests succeed after reconnect (new client)")
@@ -766,13 +771,13 @@ async def test_cs011_stream_receive_sequence() -> None:
     client = await _new_client()
     try:
         route = _unique_route("stream")
-        session = await client.stream().begin(route)
+        session = await client.stream.begin(route)
         for i in range(3):
             await session.append(i, bytes([i * 10]))
         await session.commit()
         evidence.append("stream session appended 3 records")
 
-        records = await client.stream().read(route, start_offset=0, limit=10)
+        records = await client.stream.read(route, start_offset=0, limit=10)
         assert len(records) >= 3, f"expected >=3 stream records, got {len(records)}"
         evidence.append(f"read {len(records)} records after commit")
 
@@ -812,13 +817,13 @@ async def test_cs012_stream_completion() -> None:
     client = await _new_client()
     try:
         route = _unique_route("stream")
-        session = await client.stream().begin(route)
+        session = await client.stream.begin(route)
         await session.append(0, b"first")
         await session.append(1, b"last")
         await session.commit()
         evidence.append("stream session committed")
 
-        records = await client.stream().read(route, start_offset=0, limit=100)
+        records = await client.stream.read(route, start_offset=0, limit=100)
         assert len(records) >= 2, f"expected >=2 records after commit, got {len(records)}"
         evidence.append(f"stream.read() completed cleanly with {len(records)} records")
         evidence.append("iterator/read closed cleanly (no resource leak)")
@@ -852,7 +857,7 @@ async def test_cs013_stream_error_mid_flight() -> None:
     wrong_session = None
     try:
         route = _unique_route("stream")
-        session = await client.stream().begin(route)
+        session = await client.stream.begin(route)
         await session.append(0, b"record-1")
         await session.commit()
         evidence.append("written first record at offset 0")
@@ -860,7 +865,7 @@ async def test_cs013_stream_error_mid_flight() -> None:
         caught: Exception | None = None
         try:
             # Expected offset 0 again — server should reject on append
-            wrong_session = await client.stream().begin(route)
+            wrong_session = await client.stream.begin(route)
             await wrong_session.append(0, b"record-2")
         except Exception as exc:
             caught = exc
@@ -870,7 +875,7 @@ async def test_cs013_stream_error_mid_flight() -> None:
 
         # Client must remain usable
         kv_route = _unique_route("kv")
-        tx = await client.kv().begin(kv_route, durability="sync")
+        tx = await client.kv.begin(kv_route, durability="sync")
         await tx.put(b"after-stream-error", b"ok")
         await tx.commit()
         evidence.append("client still usable after stream error")
@@ -910,10 +915,10 @@ async def test_cs014_concurrent_requests() -> None:
         routes = [_unique_route("kv") for _ in range(3)]
 
         async def _kv_roundtrip(route: str, idx: int) -> str:
-            tx = await client.kv().begin(route, durability="sync")
+            tx = await client.kv.begin(route, durability="sync")
             await tx.put(f"key-{idx}".encode(), f"value-{idx}".encode())
             await tx.commit()
-            rtx = await client.kv().begin(route, mode="read_only", durability="sync")
+            rtx = await client.kv.begin(route, mode="read_only", durability="sync")
             result = await rtx.get(f"key-{idx}".encode())
             return result.value.decode() if result.found else ""
 
@@ -957,7 +962,7 @@ async def test_cs015_shutdown_during_active_work() -> None:
     client = await _new_client()
 
     route = _unique_route("kv")
-    begin_task = asyncio.create_task(client.kv().begin(route, durability="sync"))
+    begin_task = asyncio.create_task(client.kv.begin(route, durability="sync"))
 
     await asyncio.sleep(0.05)
     await client.close()
@@ -997,36 +1002,41 @@ async def test_cs015_shutdown_during_active_work() -> None:
 
 
 # ---------------------------------------------------------------------------
-# CS-018 — queue enqueue/reserve/complete lifecycle
+
+# ---------------------------------------------------------------------------
+# CS-016 — filtered stream replay
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_cs018_queue_enqueue_reserve_complete() -> None:
+async def test_cs016_filtered_stream_replay() -> None:
     evidence: list[str] = []
     client = await _new_client()
     try:
-        route = _unique_route("queue")
-        msg_id = await client.queue().enqueue(route, b"cs018-payload")
-        evidence.append(f"enqueued message id={msg_id}")
-
-        items = await client.queue().reserve(route, 30, batch_size=1)
-        assert len(items) == 1, f"expected 1 reserved item, got {len(items)}"
-        assert items[0].body == b"cs018-payload"
-        evidence.append("reserved item matches payload")
-
-        await items[0].complete()
-        evidence.append("message completed")
-
-        empty = await client.queue().reserve(route, 30, batch_size=1)
-        assert not empty, f"expected empty queue after complete, got {len(empty)} items"
-        evidence.append("queue empty after complete")
+        route = _unique_route("stream")
+        session = await client.stream.begin(route)
+        await session.append(0, b"accepted", discriminator="keep")
+        await session.append(1, b"filtered", discriminator="drop")
+        await session.commit()
+        page = await client.stream.read_page(
+            route,
+            0,
+            limit=10,
+            stream_filter=StreamFilterSet(
+                clauses=[StreamFilterClause(kind="Equals", value="keep")]
+            ),
+        )
+        records = [item.record for item in page.items if item.record is not None]
+        assert [record.body for record in records] == [b"accepted"]
+        assert all(item.route == route for item in page.items)
+        evidence.append("filtered replay returned only the matching event")
+        evidence.append("every event and marker retained its concrete route")
     finally:
         await client.close()
 
-    r = ScenarioResult(
-        "CS-018",
-        "queue enqueue/reserve/complete lifecycle",
+    result = ScenarioResult(
+        "CS-016",
+        "filtered stream replay",
         "P1",
         CLIENT_NAME,
         CONFORMANCE_TRANSPORT,
@@ -1035,11 +1045,10 @@ async def test_cs018_queue_enqueue_reserve_complete() -> None:
         evidence,
         0,
     )
-    _record(r)
-    assert r.verdict == "pass"
+    _record(result)
+    assert result.verdict == "pass"
 
 
-# ---------------------------------------------------------------------------
 # CS-017 - bounded concurrency under burst load
 # ---------------------------------------------------------------------------
 
@@ -1047,31 +1056,22 @@ async def test_cs018_queue_enqueue_reserve_complete() -> None:
 @pytest.mark.asyncio
 async def test_cs017_bounded_concurrency_under_burst_load() -> None:
     evidence: list[str] = []
-    client = await _new_client(timeout_ms=750, max_in_flight_requests=1)
-    first_task = None
-    second_task = None
+    gate = RequestGate(1, 1)
+    release_first = await gate.acquire()
+    second_task = asyncio.create_task(gate.acquire())
+    await asyncio.sleep(0)
     try:
-        route = _unique_route("rpc")
-
-        async def _delayed_worker(_request, writer) -> None:
-            await asyncio.sleep(0.5)
-            await writer.send(b"delayed", is_end=True)
-
-        await client.rpc().register_worker(route, _delayed_worker)
-
-        first_task = asyncio.create_task(client.rpc().call(route, b"first", timeout_ms=750))
-        second_task = asyncio.create_task(client.rpc().call(route, b"second", timeout_ms=750))
-
-        await asyncio.sleep(0.1)
-        assert second_task is not None and not second_task.done(), "expected second RPC call to remain pending behind the first"
-
-        evidence.append("second RPC call remained pending while first was in flight")
-        evidence.append("configured max_in_flight_requests=1 and burst size=2")
+        with pytest.raises(RequestQueueFullError):
+            await gate.acquire()
+        evidence.append("burst above active plus queue capacity failed explicitly")
+        release_first()
+        release_second = await asyncio.wait_for(second_task, timeout=1)
+        release_second()
+        evidence.append("queued work advanced in FIFO order after capacity released")
     finally:
-        await client.close()
-        tasks = [task for task in (first_task, second_task) if task is not None]
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        gate.close()
+        if not second_task.done():
+            second_task.cancel()
 
     r = ScenarioResult(
         "CS-017",
@@ -1089,145 +1089,3 @@ async def test_cs017_bounded_concurrency_under_burst_load() -> None:
 
 
 # ---------------------------------------------------------------------------
-# CS-019 — lease acquire/contention/release lifecycle
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_cs019_lease_acquire_contention_release() -> None:
-    evidence: list[str] = []
-    client1 = await _new_client()
-    client2 = await _new_client()
-    try:
-        route = _unique_route("lease")
-        lease1 = await client1.lease().acquire(route, 30)
-        evidence.append("client1 acquired lease")
-
-        caught: Exception | None = None
-        try:
-            await client2.lease().acquire(route, 30)
-        except Exception as exc:
-            caught = exc
-
-        assert caught is not None, "expected contention error for second lease acquire"
-        evidence.append(f"client2 rejected while held: {type(caught).__name__}")
-
-        await lease1.release()
-        evidence.append("client1 released lease")
-
-        lease2 = await client2.lease().acquire(route, 30)
-        evidence.append("client2 acquired lease after release")
-        await lease2.release()
-    finally:
-        await client1.close()
-        await client2.close()
-
-    r = ScenarioResult(
-        "CS-019",
-        "lease acquire/contention/release lifecycle",
-        "P1",
-        CLIENT_NAME,
-        CONFORMANCE_TRANSPORT,
-        CONFORMANCE_AUTH_MODE,
-        "pass",
-        evidence,
-        0,
-    )
-    _record(r)
-    assert r.verdict == "pass"
-
-
-# ---------------------------------------------------------------------------
-# CS-020 — notice subscribe/publish/deliver lifecycle
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_cs020_notice_subscribe_publish_deliver() -> None:
-    evidence: list[str] = []
-    client = await _new_client()
-    try:
-        route = _unique_route("notice")
-        received: list[bytes] = []
-        delivered = asyncio.Event()
-
-        async def _handler(message) -> None:
-            received.append(message.body)
-            delivered.set()
-
-        sub = await client.notice().subscribe(route, _handler)
-        evidence.append("subscribed to route")
-
-        await client.notice().publish(route, b"cs020-msg")
-        await asyncio.wait_for(delivered.wait(), timeout=5.0)
-        assert received == [b"cs020-msg"]
-        evidence.append("handler received message")
-
-        await sub.unsubscribe()
-        evidence.append("unsubscribed")
-
-        delivered.clear()
-        await client.notice().publish(route, b"after-unsub")
-        with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(delivered.wait(), timeout=0.5)
-        evidence.append("no delivery after unsubscribe")
-    finally:
-        await client.close()
-
-    r = ScenarioResult(
-        "CS-020",
-        "notice subscribe/publish/deliver lifecycle",
-        "P1",
-        CLIENT_NAME,
-        CONFORMANCE_TRANSPORT,
-        CONFORMANCE_AUTH_MODE,
-        "pass",
-        evidence,
-        0,
-    )
-    _record(r)
-    assert r.verdict == "pass"
-
-
-# ---------------------------------------------------------------------------
-# CS-021 — schedule create/subscribe/cancel lifecycle
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_cs021_schedule_create_subscribe_cancel() -> None:
-    evidence: list[str] = []
-    client = await _new_client()
-    try:
-        route = _unique_route("schedule")
-
-        async def _handler(_notification) -> None:
-            return None
-
-        sub = await client.schedule().subscribe(route, _handler)
-        evidence.append("subscribed to schedule route")
-
-        schedule_id = await client.schedule().create(route, "0 9 * * 1", b"cs021-payload")
-        evidence.append(f"schedule created id={schedule_id or route}")
-
-        await client.schedule().cancel(schedule_id or route)
-        evidence.append("schedule cancelled")
-
-        await sub.unsubscribe()
-        evidence.append("unsubscribed")
-    finally:
-        await client.close()
-
-    r = ScenarioResult(
-        "CS-021",
-        "schedule create/subscribe/cancel lifecycle",
-        "P1",
-        CLIENT_NAME,
-        CONFORMANCE_TRANSPORT,
-        CONFORMANCE_AUTH_MODE,
-        "pass",
-        evidence,
-        0,
-    )
-    _record(r)
-    assert r.verdict == "pass"

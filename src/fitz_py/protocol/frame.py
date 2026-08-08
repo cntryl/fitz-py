@@ -15,7 +15,7 @@ class Frame:
 class FrameCodec:
     @staticmethod
     def encode_message_type(message_type: int, writer: BufferWriter) -> None:
-        if message_type < 0:
+        if not 0 <= message_type <= 0xFFFF:
             raise CodecError(f"Invalid message type: {message_type}")
         if message_type <= 0xFE:
             writer.write_u8(message_type)
@@ -32,6 +32,8 @@ class FrameCodec:
 
     @classmethod
     def encode_frame(cls, message_type: int, payload: bytes) -> bytes:
+        if len(payload) > 0xFFFF:
+            raise CodecError("TLV payload exceeds 65535 bytes")
         writer = BufferWriter()
         cls.encode_message_type(message_type, writer)
         writer.write_u16_be(len(payload))
@@ -47,7 +49,10 @@ class FrameCodec:
             raise CodecError(
                 f"Frame incomplete: expected {payload_length} bytes, got {reader.remaining_bytes()}"
             )
-        return Frame(message_type=message_type, payload=reader.read_bytes(payload_length))
+        payload = reader.read_bytes(payload_length)
+        if not reader.is_eof():
+            raise CodecError("Frame contains trailing bytes")
+        return Frame(message_type=message_type, payload=payload)
 
 
 class FrameParser:
