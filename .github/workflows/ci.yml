@@ -65,6 +65,7 @@ jobs:
       FITZ_BROKER_AUTH_WS_ADDR: ws://localhost:4090/ws
       FITZ_BROKER_JWT_HMAC_SECRET: test-secret-key
       FITZ_BROKER_JWT_AUDIENCE: fitz
+      FITZ_BROKER_JWT_TENANT: dev
       CONFORMANCE_TRANSPORT: ${{ matrix.transport }}
       CONFORMANCE_AUTH_MODE: ${{ matrix.auth-mode }}
       CONFORMANCE_OUTPUT: artifacts/conformance-${{ matrix.transport }}-${{ matrix.auth-mode }}.json

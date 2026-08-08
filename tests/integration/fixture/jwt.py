@@ -32,13 +32,14 @@ def _encode(payload: dict[str, object], secret: str) -> str:
 def make_valid_jwt(subject: str = "fitz-py-tests") -> str:
     secret = os.getenv("FITZ_BROKER_JWT_HMAC_SECRET", "test-secret-key")
     audience = os.getenv("FITZ_BROKER_JWT_AUDIENCE", "fitz")
+    tenant = os.getenv("FITZ_BROKER_JWT_TENANT", "dev")
     now = int(time.time())
     return _encode(
         {
             "iss": "",
             "sub": subject,
             "aud": audience,
-            "tid": "fitz-py-tests",
+            "tid": tenant,
             "iat": now,
             "nbf": now,
             "exp": now + 300,
@@ -51,13 +52,14 @@ def make_valid_jwt(subject: str = "fitz-py-tests") -> str:
 def make_expired_jwt(subject: str = "fitz-py-tests") -> str:
     secret = os.getenv("FITZ_BROKER_JWT_HMAC_SECRET", "test-secret-key")
     audience = os.getenv("FITZ_BROKER_JWT_AUDIENCE", "fitz")
+    tenant = os.getenv("FITZ_BROKER_JWT_TENANT", "dev")
     now = int(time.time())
     return _encode(
         {
             "iss": "",
             "sub": subject,
             "aud": audience,
-            "tid": "fitz-py-tests",
+            "tid": tenant,
             "iat": now - 600,
             "nbf": now - 600,
             "exp": now - 300,
