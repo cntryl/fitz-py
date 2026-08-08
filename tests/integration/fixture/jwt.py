@@ -37,13 +37,13 @@ def make_valid_jwt(subject: str = "fitz-py-tests") -> str:
     return _encode(
         {
             "iss": "",
-            "sub": subject,
+            "sub": tenant,
             "aud": audience,
             "tid": tenant,
             "iat": now,
             "nbf": now,
             "exp": now + 300,
-            "fitz": {"permissions": DEFAULT_PERMISSIONS},
+            "permissions": DEFAULT_PERMISSIONS,
         },
         secret,
     )
@@ -57,13 +57,13 @@ def make_expired_jwt(subject: str = "fitz-py-tests") -> str:
     return _encode(
         {
             "iss": "",
-            "sub": subject,
+            "sub": tenant,
             "aud": audience,
             "tid": tenant,
             "iat": now - 600,
             "nbf": now - 600,
             "exp": now - 300,
-            "fitz": {"permissions": DEFAULT_PERMISSIONS},
+            "permissions": DEFAULT_PERMISSIONS,
         },
         secret,
     )
