@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from types import MappingProxyType
 from typing import Any
 
@@ -80,14 +80,25 @@ class LeaseLostError(FitzError):
         super().__init__(message, "LEASE_LOST")
 
 
-class LeaseLifecycleError(FitzError):
-    def __init__(self, causes: list[BaseException]) -> None:
-        super().__init__(
+class LeaseLifecycleError(ExceptionGroup, FitzError):
+    def __new__(cls, causes: list[Exception]) -> LeaseLifecycleError:
+        return super().__new__(
+            cls,
             "Multiple failures occurred while managing a lease",
-            "LEASE_LIFECYCLE_MULTIPLE_FAILURES",
-            context={"causes": tuple(causes)},
+            causes,
         )
+
+    def __init__(self, causes: list[Exception]) -> None:
+        self.code = "LEASE_LIFECYCLE_MULTIPLE_FAILURES"
+        self.domain_code = None
+        self.context = MappingProxyType({"causes": tuple(causes)})
         self.causes = tuple(causes)
+
+    def derive(self, exceptions: Sequence[BaseException]) -> LeaseLifecycleError:
+        derived = [error for error in exceptions if isinstance(error, Exception)]
+        if len(derived) != len(exceptions):
+            raise TypeError("Lease lifecycle groups contain Exception instances only")
+        return LeaseLifecycleError(derived)
 
 
 class DomainError(FitzError):
@@ -98,7 +109,7 @@ class DomainError(FitzError):
         self.reason = reason
 
 
-class KvError(DomainError):
+class KVError(DomainError):
     prefix = "KV"
 
 
@@ -110,7 +121,7 @@ class NoticeError(DomainError):
     prefix = "NOTICE"
 
 
-class RpcError(DomainError):
+class RPCError(DomainError):
     prefix = "RPC"
 
 
@@ -127,13 +138,12 @@ class ScheduleError(DomainError):
 
 
 _RETRYABLE = {
-    ("KV", 3),
     ("KV", 1004),
     ("KV", 1009),
-    ("QUEUE", 4),
     ("QUEUE", 4005),
-    ("LEASE", 1),
     ("LEASE", 5001),
+    ("LEASE", 5006),
+    ("LEASE", 5007),
     ("RPC", 6001),
     ("RPC", 6002),
     ("RPC", 6003),
@@ -141,7 +151,7 @@ _RETRYABLE = {
 }
 
 
-def is_retryable(error: object) -> bool:
+def is_retryable(error: BaseException) -> bool:
     if isinstance(error, (FitzTransportError, FitzTimeoutError, RequestQueueFullError)):
         return True
     if not isinstance(error, DomainError) or error.domain_code is None:
@@ -156,22 +166,16 @@ def domain_error(
     return error_type(f"{operation} failed: {reason}", operation, status)
 
 
-# Transitional internal aliases. They are deliberately not exported publicly.
-ConnectionError = FitzConnectionError
-TransportError = FitzTransportError
-TimeoutError = FitzTimeoutError
-
-
-def kv_error(message: str, domain_code: int | None = None) -> KvError:
-    return KvError(message, "ERROR", domain_code)
+def kv_error(message: str, domain_code: int | None = None) -> KVError:
+    return KVError(message, "ERROR", domain_code)
 
 
 def queue_error(message: str, domain_code: int | None = None) -> QueueError:
     return QueueError(message, "ERROR", domain_code)
 
 
-def rpc_error(message: str, domain_code: int | None = None) -> RpcError:
-    return RpcError(message, "ERROR", domain_code)
+def rpc_error(message: str, domain_code: int | None = None) -> RPCError:
+    return RPCError(message, "ERROR", domain_code)
 
 
 def lease_error(message: str, domain_code: int | None = None) -> LeaseError:

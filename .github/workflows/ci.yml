@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
@@ -22,34 +22,43 @@ jobs:
       - run: python -m pip install -e ".[dev]"
       - run: python -m ruff format --check .
       - run: python -m ruff check .
-      - run: python -m pyright src
-      - run: python -m pytest tests/unit --cov=fitz_py --cov-report=term-missing
+      - run: python -m pyright
+      - run: python -m pytest tests/unit --cov=fitz_py --cov-branch --cov-report=term-missing --cov-fail-under=70
 
   package:
     needs: fast
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
           cache: pip
-      - run: python -m pip install --upgrade pip build
+      - run: python -m pip install --upgrade pip build pyperf
       - run: python -m build
       - name: Smoke test wheel
         run: |
           python -m venv artifacts/smoke
           artifacts/smoke/bin/python -m pip install dist/*.whl
           artifacts/smoke/bin/python - <<'PY'
-          from fitz_py import Client, ClientConfig
-          client = Client(ClientConfig(url="tcp://localhost:4191"))
+          from fitz_py import Client
+          client = Client("tcp://localhost:4191")
           assert client.kv is client.kv
           assert client.queue is client.queue
           PY
+      - name: Benchmark smoke
+        run: |
+          python -m pip install dist/*.whl
+          python -m benchmarks.hotpath --fast -o artifacts/benchmarks-${{ matrix.python-version }}.json
       - uses: actions/upload-artifact@v4
         with:
-          name: fitz-py-dist
-          path: dist/*
+          name: fitz-py-dist-${{ matrix.python-version }}
+          path: |
+            dist/*
+            artifacts/benchmarks-*.json
 
   broker:
     needs: fast

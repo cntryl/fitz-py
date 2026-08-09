@@ -1,7 +1,7 @@
 name: fitz-py
 
 x-broker-common: &broker-common
-  image: ghcr.io/cntryl/fitz:latest
+  image: ghcr.io/cntryl/fitz@sha256:5e59eb6607360dc9e48daf3351e0c1aa5165e0abf4fdc4dee2c8610e66719a66
   restart: unless-stopped
   stop_grace_period: 15s
   healthcheck:

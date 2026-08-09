@@ -8,7 +8,7 @@ from typing import Literal
 
 import pytest
 
-from fitz_py import Client, ClientConfig
+from fitz_py import Client
 from tests.integration.fixture.jwt import make_valid_jwt
 
 AuthMode = Literal["anonymous", "valid_jwt"]
@@ -39,16 +39,14 @@ class IntegrationFixture:
     client: Client
 
     @classmethod
-    async def connect_or_fail(cls, transport: str, auth_mode: AuthMode) -> "IntegrationFixture":
+    async def connect_or_fail(cls, transport: str, auth_mode: AuthMode) -> IntegrationFixture:
         token_provider = None
         if auth_mode == "valid_jwt":
             token_provider = make_valid_jwt
         client = Client(
-            ClientConfig(
-                url=_broker_url(transport, auth_mode),
-                token_provider=token_provider,
-                transport=transport,
-            )
+            _broker_url(transport, auth_mode),
+            token_provider=token_provider,
+            transport=transport,
         )
         try:
             await client.connect()
@@ -56,5 +54,5 @@ class IntegrationFixture:
             pytest.skip(f"Broker not reachable for integration test: {exc}")
         return cls(transport=transport, auth_mode=auth_mode, client=client)
 
-    async def close(self) -> None:
-        await self.client.close()
+    async def aclose(self) -> None:
+        await self.client.aclose()

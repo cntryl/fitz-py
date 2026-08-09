@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from enum import Enum, IntEnum
+from enum import StrEnum
+from typing import cast
 
-from fitz_py._runtime import AsyncSubscription
+from fitz_py._runtime import LazyAsyncIterator
+from fitz_py.connection import Connection
 from fitz_py.domains._routes import is_exact_route_shape, is_selector_route_shape
 from fitz_py.domains._subscriptions import SubscriptionRegistry
 from fitz_py.domains.base import DomainClient
@@ -25,6 +27,19 @@ from fitz_py.protocol.messages import (
     MSG_STREAM_UNSUBSCRIBE,
 )
 from fitz_py.protocol.response import parse_response
+from fitz_py.types import BytesLike
+
+
+def _empty_strings() -> list[str]:
+    return []
+
+
+def _empty_clauses() -> list[StreamFilterClause]:
+    return []
+
+
+def _empty_read_items() -> list[StreamReadItem]:
+    return []
 
 
 @dataclass(slots=True)
@@ -61,17 +76,17 @@ class StreamFilterClause:
 
     kind: str
     value: str = ""
-    values: list[str] = field(default_factory=list)
+    values: list[str] = field(default_factory=_empty_strings)
 
 
 @dataclass(slots=True)
 class StreamFilterSet:
     """Collection of filter clauses applied to stream reads."""
 
-    clauses: list[StreamFilterClause] = field(default_factory=list)
+    clauses: list[StreamFilterClause] = field(default_factory=_empty_clauses)
 
 
-class StreamFilteredReason(str, Enum):
+class StreamFilteredReason(StrEnum):
     """Reason a read item was filtered instead of returned as an event."""
 
     SERVER_FILTER = "server_filter"
@@ -79,7 +94,7 @@ class StreamFilteredReason(str, Enum):
     PROJECTION = "projection"
 
 
-class StreamReadItemKind(str, Enum):
+class StreamReadItemKind(StrEnum):
     """Discriminator for stream read page item variants."""
 
     EVENT = "event"
@@ -117,15 +132,15 @@ class StreamReadItem:
 class StreamReadPage:
     """Paged stream read payload containing items and next-cursor state."""
 
-    items: list[StreamReadItem] = field(default_factory=list)
+    items: list[StreamReadItem] = field(default_factory=_empty_read_items)
     cursor: StreamReadCursor = field(default_factory=StreamReadCursor)
 
 
-class StreamCommitMode(IntEnum):
+class StreamCommitMode(StrEnum):
     """Durability mode used when committing a stream session."""
 
-    BUFFERED = 0
-    SYNC = 1
+    BUFFERED = "buffered"
+    SYNC = "sync"
 
 
 @dataclass(slots=True)
@@ -146,7 +161,7 @@ class StreamCommitNotification:
 class StreamSession:
     """Mutable append session returned by stream begin operations."""
 
-    def __init__(self, connection, session_id: int) -> None:
+    def __init__(self, connection: Connection, session_id: int) -> None:
         self._connection = connection
         self._session_id = session_id
         self._closed = False
@@ -157,33 +172,35 @@ class StreamSession:
             on_disconnect(self._invalidate) if callable(on_disconnect) else None
         )
 
-    async def __aenter__(self) -> "StreamSession":
+    async def __aenter__(self) -> StreamSession:
         return self
 
-    async def __aexit__(self, exc_type, exc, tb) -> None:
+    async def __aexit__(self, *_args: object) -> None:
         if not self._closed:
             await self.rollback()
 
     async def append(
         self,
         expected_offset: int,
-        body: bytes,
-        metadata: bytes | None = None,
+        body: BytesLike,
+        metadata: BytesLike | None = None,
         discriminator: str | None = None,
     ) -> int | None:
         self._ensure_open("APPEND")
+        body = bytes(body)
+        metadata = None if metadata is None else bytes(metadata)
         writer = BufferWriter()
         writer.write_u64_be(self._session_id)
         writer.write_u64_be(expected_offset)
         writer.write_u32_be(len(body))
         writer.write_bytes(body)
-        if metadata:
+        if metadata is not None:
             writer.write_u8(1)
             writer.write_u32_be(len(metadata))
             writer.write_bytes(metadata)
         else:
             writer.write_u8(0)
-        if discriminator:
+        if discriminator is not None:
             writer.write_u8(1)
             writer.write_string(discriminator)
         else:
@@ -196,16 +213,17 @@ class StreamSession:
         if not response.data:
             return None
         reader = BufferReader(response.data)
-        length = reader.read_u32_be()
-        if length != 8 or reader.remaining_bytes() != 8:
-            raise StreamError("APPEND response has invalid payload length", "INVALID_RESPONSE")
-        return reader.read_u64_be()
+        data = reader.read_bytes(reader.read_u32_be())
+        if not reader.is_eof():
+            raise StreamError("APPEND response has trailing bytes", "INVALID_RESPONSE")
+        return int.from_bytes(data, "big") if len(data) == 8 else None
 
-    async def commit(self, mode: int | StreamCommitMode = StreamCommitMode.BUFFERED) -> None:
+    async def commit(self, mode: StreamCommitMode | str = StreamCommitMode.BUFFERED) -> None:
         self._ensure_open("COMMIT")
+        resolved_mode = StreamCommitMode(mode)
         writer = BufferWriter()
         writer.write_u64_be(self._session_id)
-        writer.write_u8(int(mode))
+        writer.write_u8(1 if resolved_mode is StreamCommitMode.SYNC else 0)
         await self._expect_status(MSG_STREAM_COMMIT, writer.build(), "COMMIT")
         self._closed = True
         self._closed_reason = "committed"
@@ -221,9 +239,16 @@ class StreamSession:
         self._clear_disconnect_listener()
 
     async def _expect_status(self, message_type: int, payload: bytes, operation: str) -> None:
-        response = parse_response(await self._connection.request(message_type, payload))
+        response = parse_response(await self._connection.request(message_type, payload), plain=True)
         if not response.success:
-            raise domain_error(StreamError, operation, response.error_code or 0, response.error)
+            raise StreamError(f"{operation} failed: {response.error}", operation)
+        if message_type == MSG_STREAM_COMMIT:
+            reader = BufferReader(response.data)
+            reader.read_bytes(reader.read_u32_be())
+            if not reader.is_eof():
+                raise StreamError(f"{operation} response has trailing bytes", "INVALID_RESPONSE")
+        elif response.data:
+            raise StreamError(f"{operation} response has trailing bytes", "INVALID_RESPONSE")
 
     def _ensure_open(self, operation: str) -> None:
         if not self._closed and self._generation == self._connection.generation:
@@ -250,7 +275,7 @@ class StreamSession:
 class StreamClient(DomainClient):
     """Stream domain operations for write sessions, reads, and notifications."""
 
-    def __init__(self, connection) -> None:
+    def __init__(self, connection: Connection) -> None:
         super().__init__(connection)
         self._subscriptions = SubscriptionRegistry[StreamCommitNotification](
             connection.config.limits.subscription_buffer_size,
@@ -268,12 +293,16 @@ class StreamClient(DomainClient):
             domain="stream",
             registration="commits",
         )
+        on_close = getattr(connection, "on_close", None)
+        if callable(on_close):
+            on_close(self._subscriptions.terminate)
 
-    async def begin(self, route: str, ingest_metadata: bytes | None = None) -> StreamSession:
+    async def begin(self, route: str, ingest_metadata: BytesLike | None = None) -> StreamSession:
         _assert_stream_route(route)
+        ingest_metadata = None if ingest_metadata is None else bytes(ingest_metadata)
         writer = BufferWriter()
         writer.write_route(route)
-        if ingest_metadata:
+        if ingest_metadata is not None:
             writer.write_u8(1)
             writer.write_u32_be(len(ingest_metadata))
             writer.write_bytes(ingest_metadata)
@@ -285,9 +314,13 @@ class StreamClient(DomainClient):
         if not response.success:
             raise StreamError(f"BEGIN failed: {response.error}", "BEGIN")
         reader = BufferReader(response.data)
-        if reader.remaining_bytes() < 8:
+        if reader.remaining_bytes() < 12:
             raise StreamError("BEGIN response missing session id", "MISSING_SESSION_ID")
-        return StreamSession(self.connection, reader.read_u64_be())
+        session_id = reader.read_u64_be()
+        reader.read_bytes(reader.read_u32_be())
+        if not reader.is_eof():
+            raise StreamError("BEGIN response has trailing bytes", "INVALID_RESPONSE")
+        return StreamSession(self.connection, session_id)
 
     async def read(
         self,
@@ -356,25 +389,32 @@ class StreamClient(DomainClient):
         _assert_stream_route(route)
         writer = BufferWriter()
         writer.write_route(route)
-        response = parse_response(await self.request_frame(MSG_STREAM_LAST, writer.build()))
+        response = parse_response(
+            await self.request_frame(MSG_STREAM_LAST, writer.build()), plain=True
+        )
         if not response.success:
-            raise domain_error(StreamError, "LAST", response.error_code or 0, response.error)
+            raise StreamError(f"LAST failed: {response.error}", "LAST")
         if not response.data:
             return None
         inner = BufferReader(response.data)
-        return _read_stream_record(inner, route, False)
+        record = _read_stream_record(inner, route, False)
+        if not inner.is_eof():
+            raise StreamError("LAST response has trailing bytes", "INVALID_RESPONSE")
+        return record
 
     async def metadata(self, route: str) -> StreamMetadata:
         _assert_stream_route(route)
         writer = BufferWriter()
         writer.write_route(route)
-        response = parse_response(await self.request_frame(MSG_STREAM_GET_METADATA, writer.build()))
+        response = parse_response(
+            await self.request_frame(MSG_STREAM_GET_METADATA, writer.build()), plain=True
+        )
         if not response.success:
-            raise domain_error(StreamError, "METADATA", response.error_code or 0, response.error)
+            raise StreamError(f"METADATA failed: {response.error}", "METADATA")
         if not response.data:
             return StreamMetadata(first_offset=0, last_offset=0, record_count=0)
         inner = BufferReader(response.data)
-        return StreamMetadata(
+        result = StreamMetadata(
             first_offset=_read_optional_u64(inner) or 0,
             last_offset=_read_optional_u64(inner) or 0,
             record_count=inner.read_u64_be(),
@@ -384,59 +424,66 @@ class StreamClient(DomainClient):
             area_watermark=inner.read_u64_be(),
             realm_watermark=inner.read_u64_be(),
         )
+        if not inner.is_eof():
+            raise StreamError("METADATA response has trailing bytes", "INVALID_RESPONSE")
+        return result
 
-    async def subscribe(self, pattern: str) -> AsyncSubscription[StreamCommitNotification]:
+    def subscribe(self, pattern: str) -> LazyAsyncIterator[StreamCommitNotification]:
         _assert_stream_pattern(pattern)
-        return await self._subscriptions.subscribe(pattern)
+        return LazyAsyncIterator(lambda: self._subscriptions.subscribe(pattern))
 
     async def _subscribe_wire(self, pattern: str) -> int:
         writer = BufferWriter()
         writer.write_route(pattern)
-        response = parse_response(await self.request_frame(MSG_STREAM_SUBSCRIBE, writer.build()))
+        response = parse_response(
+            await self.request_frame(MSG_STREAM_SUBSCRIBE, writer.build()), plain=True
+        )
         if not response.success:
-            raise domain_error(StreamError, "SUBSCRIBE", response.error_code or 0, response.error)
+            raise StreamError(f"SUBSCRIBE failed: {response.error}", "SUBSCRIBE")
         reader = BufferReader(response.data)
         has_sub_id = reader.read_u8()
         if has_sub_id != 1 or reader.is_eof():
             raise StreamError("SUBSCRIBE response missing subscription id", "MISSING_SUB_ID")
-        return reader.read_u64_be()
+        sub_id = reader.read_u64_be()
+        if not reader.is_eof():
+            raise StreamError("SUBSCRIBE response has trailing bytes", "INVALID_RESPONSE")
+        return sub_id
 
     async def _unsubscribe_wire(self, pattern: str) -> None:
         writer = BufferWriter()
         writer.write_route(pattern)
-        response = parse_response(await self.request_frame(MSG_STREAM_UNSUBSCRIBE, writer.build()))
+        response = parse_response(
+            await self.request_frame(MSG_STREAM_UNSUBSCRIBE, writer.build()), plain=True
+        )
         if not response.success:
-            raise domain_error(StreamError, "UNSUBSCRIBE", response.error_code or 0, response.error)
+            raise StreamError(f"UNSUBSCRIBE failed: {response.error}", "UNSUBSCRIBE")
+        if response.data:
+            raise StreamError("UNSUBSCRIBE response has trailing bytes", "INVALID_RESPONSE")
 
     def _notify(self, payload: bytes) -> None:
         reader = BufferReader(payload)
         sub_id, route = reader.read_u64_be(), reader.read_route()
         body = reader.read_bytes(reader.read_u32_be())
+        if not reader.is_eof():
+            raise StreamError("STREAM_NOTIFY has trailing bytes", "INVALID_RESPONSE")
         self._subscriptions.publish(sub_id, _decode_stream_commit_notification(route, body))
 
 
-def _read_wrapped_stream_response(reader: BufferReader) -> tuple[int, bytes]:
-    status = reader.read_u8()
-    if status != 0:
-        return status, b""
-    if not reader.is_eof():
-        has_session = reader.read_u8()
-        if has_session == 1 and reader.remaining_bytes() >= 8:
-            reader.read_u64_be()
-    if reader.is_eof():
-        return 0, b""
-    return 0, reader.read_bytes(reader.read_u32_be())
-
-
 def _read_optional_u64(reader: BufferReader) -> int | None:
-    if reader.read_u8() == 0:
+    flag = reader.read_u8()
+    if flag == 0:
         return None
+    if flag != 1:
+        raise StreamError(f"Invalid optional u64 flag: {flag}", "INVALID_RESPONSE")
     return reader.read_u64_be()
 
 
 def _read_optional_bytes(reader: BufferReader) -> bytes | None:
-    if reader.read_u8() == 0:
+    flag = reader.read_u8()
+    if flag == 0:
         return None
+    if flag != 1:
+        raise StreamError(f"Invalid optional bytes flag: {flag}", "INVALID_RESPONSE")
     return reader.read_bytes(reader.read_u32_be())
 
 
@@ -462,9 +509,9 @@ def _read_stream_record(reader: BufferReader, route: str, extended: bool) -> Str
 
 def _read_stream_read_page(data: bytes, selector: str) -> StreamReadPage:
     reader = BufferReader(data)
-    extended = selector in {"stream://**", "stream://*/*/*"}
+    extended = selector == "stream://**" or selector.startswith("stream://*/")
     count = reader.read_u32_be()
-    items = []
+    items: list[StreamReadItem] = []
     for _ in range(count):
         route = reader.read_route()
         _assert_stream_route(route)
@@ -540,15 +587,20 @@ def _flatten_stream_read_items(items: list[StreamReadItem]) -> list[StreamRecord
 def _assert_stream_route(route: str) -> None:
     if not is_exact_route_shape(route, "stream", 3):
         raise StreamError(
-            f"Invalid stream route: {route} (expected stream://{{realm}}/{{area}}/{{resource}}, no empty segments or wildcards)",
+            f"Invalid stream route: {route} "
+            "(expected stream://{realm}/{area}/{resource}, no empty segments or wildcards)",
             "INVALID_ROUTE",
         )
 
 
 def _assert_stream_pattern(pattern: str) -> None:
-    if not is_selector_route_shape(pattern, "stream", 3, allow_realm_wildcard=True):
+    if pattern == "stream://*/**" or not is_selector_route_shape(
+        pattern, "stream", 3, allow_realm_wildcard=True
+    ):
         raise StreamError(
-            f"Invalid stream pattern: {pattern} (expected stream://{{realm}}/{{area}}/{{resource}}, stream://{{realm}}/{{area}}/*, or stream://{{realm}}/**)",
+            f"Invalid stream pattern: {pattern} "
+            "(expected stream://{realm}/{area}/{resource}, stream://{realm}/{area}/*, "
+            "or stream://{realm}/**)",
             "INVALID_ROUTE",
         )
 
@@ -561,26 +613,33 @@ def _decode_stream_commit_notification(route: str, payload: bytes) -> StreamComm
         return notification
 
     try:
-        decoded = json.loads(payload)
-        if not isinstance(decoded, dict):
+        decoded_value = json.loads(payload)
+        if not isinstance(decoded_value, dict):
             return notification
+        decoded = cast(dict[str, object], decoded_value)
 
         event = decoded.get("event", "")
         if not isinstance(event, str):
             return notification
 
         notification.event = event
-        notification.first_resource_offset = int(decoded.get("first_resource_offset", 0))
-        notification.last_resource_offset = int(decoded.get("last_resource_offset", 0))
-        notification.first_area_offset = int(decoded.get("first_area_offset", 0))
-        notification.last_area_offset = int(decoded.get("last_area_offset", 0))
-        notification.first_realm_offset = int(decoded.get("first_realm_offset", 0))
-        notification.last_realm_offset = int(decoded.get("last_realm_offset", 0))
-        notification.batch_size = int(decoded.get("batch_size", 0))
+        notification.first_resource_offset = _json_int(decoded.get("first_resource_offset", 0))
+        notification.last_resource_offset = _json_int(decoded.get("last_resource_offset", 0))
+        notification.first_area_offset = _json_int(decoded.get("first_area_offset", 0))
+        notification.last_area_offset = _json_int(decoded.get("last_area_offset", 0))
+        notification.first_realm_offset = _json_int(decoded.get("first_realm_offset", 0))
+        notification.last_realm_offset = _json_int(decoded.get("last_realm_offset", 0))
+        notification.batch_size = _json_int(decoded.get("batch_size", 0))
     except (TypeError, ValueError, json.JSONDecodeError):
         return StreamCommitNotification(route=route)
 
     return notification
+
+
+def _json_int(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return 0
+    return int(value)
 
 
 def _encode_stream_filter_set(stream_filter: StreamFilterSet | None) -> bytes:

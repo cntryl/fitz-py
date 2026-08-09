@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Protocol, TypeAlias
+from typing import Protocol, TypeAlias
 
 TokenProvider: TypeAlias = Callable[[], str | bytes | Awaitable[str | bytes]]
+BytesLike: TypeAlias = bytes | bytearray | memoryview
+
+
+def _empty_headers() -> dict[str, str]:
+    return {}
 
 
 class TransportType(StrEnum):
@@ -72,20 +78,30 @@ class LifecycleEvent:
 
 
 class FitzTracer(Protocol):
-    def start_span(self, name: str, attributes: Mapping[str, Any]) -> Any: ...
+    def start_span(self, name: str, attributes: Mapping[str, object]) -> object: ...
 
 
 class FitzMeter(Protocol):
-    def counter(self, name: str, value: int, attributes: Mapping[str, Any]) -> None: ...
+    def counter(self, name: str, value: int, attributes: Mapping[str, object]) -> None: ...
 
-    def histogram(self, name: str, value: float, attributes: Mapping[str, Any]) -> None: ...
+    def histogram(self, name: str, value: float, attributes: Mapping[str, object]) -> None: ...
 
-    def gauge(self, name: str, value: int, attributes: Mapping[str, Any]) -> None: ...
+    def gauge(self, name: str, value: int, attributes: Mapping[str, object]) -> None: ...
+
+
+class FitzLogger(Protocol):
+    def debug(self, message: str, *, extra: Mapping[str, object]) -> None: ...
+
+    def info(self, message: str, *, extra: Mapping[str, object]) -> None: ...
+
+    def warning(self, message: str, *, extra: Mapping[str, object]) -> None: ...
+
+    def error(self, message: str, *, extra: Mapping[str, object]) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
 class Observability:
-    logger: Any | None = None
+    logger: FitzLogger | None = None
     tracer: FitzTracer | None = None
     meter: FitzMeter | None = None
     on_lifecycle_event: Callable[[LifecycleEvent], None] | None = None
@@ -98,13 +114,13 @@ class ClientConfig:
     transport: TransportType | str = TransportType.AUTO
     request_timeout: float = 30.0
     auth_settle_timeout: float = 1.0
-    max_frame_size: int = 65_540
+    max_frame_size: int = 1_048_576
     reconnect: ReconnectPolicy = field(default_factory=ReconnectPolicy)
     retry: RetryPolicy = field(default_factory=RetryPolicy)
     heartbeat: HeartbeatPolicy = field(default_factory=HeartbeatPolicy)
     limits: ConcurrencyLimits = field(default_factory=ConcurrencyLimits)
     observability: Observability = field(default_factory=Observability)
-    websocket_headers: Mapping[str, str] = field(default_factory=dict)
+    websocket_headers: Mapping[str, str] = field(default_factory=_empty_headers)
 
     def __post_init__(self) -> None:
         if not self.url:
@@ -117,6 +133,22 @@ class ClientConfig:
             raise ValueError("reconnect.max_attempts must be non-negative or None")
         if self.retry.max_attempts < 1:
             raise ValueError("retry.max_attempts must be at least 1")
+        positive_finite = {
+            "reconnect.backoff": self.reconnect.backoff,
+            "reconnect.max_backoff": self.reconnect.max_backoff,
+            "retry.backoff": self.retry.backoff,
+            "retry.max_backoff": self.retry.max_backoff,
+            "heartbeat.interval": self.heartbeat.interval,
+            "heartbeat.timeout": self.heartbeat.timeout,
+            "limits.async_handler_timeout": self.limits.async_handler_timeout,
+        }
+        for name, value in positive_finite.items():
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be positive and finite")
+        if self.reconnect.max_backoff < self.reconnect.backoff:
+            raise ValueError("reconnect.max_backoff must be at least reconnect.backoff")
+        if self.retry.max_backoff < self.retry.backoff:
+            raise ValueError("retry.max_backoff must be at least retry.backoff")
         if self.limits.max_in_flight < 1:
             raise ValueError("limits.max_in_flight must be at least 1")
         if self.limits.request_queue_size < 0:
@@ -127,7 +159,3 @@ class ClientConfig:
             raise ValueError("limits.async_handler_queue_size must be non-negative")
         if self.limits.subscription_buffer_size < 1:
             raise ValueError("limits.subscription_buffer_size must be at least 1")
-
-
-# Short aliases used in annotations and migration docs.
-ReconnectOptions = ReconnectPolicy

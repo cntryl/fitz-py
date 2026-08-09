@@ -8,12 +8,13 @@ import inspect
 import random
 import time
 from collections.abc import Awaitable, Callable
-from typing import Any, TypeVar
+from typing import TypeVar
 
 from fitz_py._runtime import AsyncDispatcher, RequestGate
 from fitz_py.errors import (
     AuthenticationError,
     FitzConnectionError,
+    FitzTimeoutError,
     FitzTransportError,
     ReconnectRestoreError,
     is_retryable,
@@ -25,8 +26,9 @@ from fitz_py.transport.base import Transport
 from fitz_py.types import ClientConfig, ConnectionState, LifecycleEvent
 
 TransportFactory = Callable[[], Transport]
-ReconnectListener = Callable[[], None | Awaitable[None]]
-DisconnectListener = Callable[[], None | Awaitable[None]]
+ReconnectListener = Callable[[], Awaitable[None] | None]
+DisconnectListener = Callable[[], Awaitable[None] | None]
+CloseListener = Callable[[], Awaitable[None] | None]
 T = TypeVar("T")
 
 
@@ -37,7 +39,7 @@ class Connection:
         self._transport: Transport | None = None
         self._state = ConnectionState.DISCONNECTED
         self._generation = 0
-        self._multiplexer = Multiplexer()
+        self._multiplexer = Multiplexer(self._handler_error)
         self._parser = FrameParser()
         self._receive_task: asyncio.Task[None] | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
@@ -54,6 +56,8 @@ class Connection:
         self._auth_error: asyncio.Future[None] | None = None
         self._reconnect_listeners: dict[tuple[str, str], ReconnectListener] = {}
         self._disconnect_listeners: set[DisconnectListener] = set()
+        self._close_listeners: set[CloseListener] = set()
+        self._close_notified = False
         self._gate = self._new_gate()
         limits = config.limits
         self._dispatcher = AsyncDispatcher(
@@ -79,10 +83,17 @@ class Connection:
         async with self._connect_lock:
             if self.is_connected():
                 return
-            if self._connect_task is None or self._connect_task.done():
+            reconnect_task = self._reconnect_task
+            if reconnect_task is not None and not reconnect_task.done():
+                task = reconnect_task
+            elif self._connect_task is None or self._connect_task.done():
                 self._connect_task = asyncio.create_task(self._open_and_authenticate(False))
-            task = self._connect_task
+                task = self._connect_task
+            else:
+                task = self._connect_task
         await asyncio.shield(task)
+        if not self.is_connected():
+            raise FitzConnectionError("Connection attempt completed without authentication")
 
     async def close(self) -> None:
         if self._close_task is not None:
@@ -99,14 +110,27 @@ class Connection:
         self._gate.close()
         self._multiplexer.set_disconnected()
         await self._notify_disconnect()
+        await self._notify_close()
         current = asyncio.current_task()
-        for task in (self._reconnect_task, self._heartbeat_task, self._receive_task):
-            if task is not None and task is not current:
-                task.cancel()
+        owned_tasks = {
+            task
+            for task in (
+                self._reconnect_task,
+                self._heartbeat_task,
+                self._receive_task,
+                self._loss_task,
+                self._connect_task,
+            )
+            if task is not None and task is not current
+        }
+        for task in owned_tasks:
+            task.cancel()
         transport, self._transport = self._transport, None
         if transport is not None:
             with contextlib.suppress(Exception):
                 await transport.close()
+        if owned_tasks:
+            await asyncio.gather(*owned_tasks, return_exceptions=True)
         await self._dispatcher.close()
 
     async def request(self, message_type: int, payload: bytes) -> bytes:
@@ -123,7 +147,11 @@ class Connection:
         self._ensure_authenticated()
         release = await self._gate.acquire()
         try:
-            await self._send_frame(FrameCodec.encode_frame(message_type, payload))
+            try:
+                await self._send_frame(FrameCodec.encode_frame(message_type, payload))
+            except (FitzTransportError, FitzConnectionError, FitzTimeoutError) as exc:
+                self._schedule_connection_loss(exc)
+                raise
         finally:
             release()
 
@@ -182,6 +210,14 @@ class Connection:
 
         return unregister
 
+    def on_close(self, listener: CloseListener) -> Callable[[], None]:
+        self._close_listeners.add(listener)
+
+        def unregister() -> None:
+            self._close_listeners.discard(listener)
+
+        return unregister
+
     def report_restore_failure(self, domain: str, registration: str, error: BaseException) -> None:
         self._emit(
             "reconnect_restore_failed",
@@ -222,9 +258,13 @@ class Connection:
         raise AssertionError("retry loop exhausted")
 
     async def _open_and_authenticate(self, reconnect: bool) -> None:
-        self._parser = FrameParser()
+        if self._closed:
+            raise FitzConnectionError("Client is closed")
+        parser = FrameParser()
+        self._parser = parser
         self._gate = self._new_gate()
         transport = self._transport_factory()
+        receive_task: asyncio.Task[None] | None = None
         self._transport = transport
         self._set_state(
             ConnectionState.RECONNECTING if reconnect else ConnectionState.CONNECTING,
@@ -236,16 +276,18 @@ class Connection:
             self._set_state(ConnectionState.CONNECTED, "connected")
             self._set_state(ConnectionState.AUTHENTICATING, "authenticating")
             self._auth_error = asyncio.get_running_loop().create_future()
-            self._receive_task = asyncio.create_task(self._receive_loop(transport))
+            receive_task = asyncio.create_task(self._receive_loop(transport, parser))
+            self._receive_task = receive_task
             await self._send_connect()
             try:
                 async with asyncio.timeout(self._config.auth_settle_timeout):
                     await asyncio.shield(self._auth_error)
             except TimeoutError:
                 pass
-            if self._auth_error is not None and self._auth_error.done():
+            if self._auth_error.done():
                 self._auth_error.result()
             self._auth_error = None
+            self._assert_transport_owner(transport, receive_task)
             self._generation += 1
             self._multiplexer.set_connected()
             if reconnect:
@@ -254,15 +296,19 @@ class Connection:
                     await self._restore_registrations()
                 finally:
                     self._restoring = False
+            self._assert_transport_owner(transport, receive_task)
             self._ever_authenticated = True
             self._set_state(ConnectionState.AUTHENTICATED, "authenticated")
-            self._start_heartbeat()
+            await self._start_heartbeat()
         except BaseException as exc:
             self._multiplexer.set_disconnected()
             if self._transport is transport:
                 self._transport = None
             with contextlib.suppress(Exception):
                 await transport.close()
+            if receive_task is not None and receive_task is not asyncio.current_task():
+                receive_task.cancel()
+                await asyncio.gather(receive_task, return_exceptions=True)
             if isinstance(exc, AuthenticationError):
                 self._closed = True
                 self._gate.close()
@@ -289,7 +335,7 @@ class Connection:
             return await self._multiplexer.request(
                 message_type, frame, self._send_frame, self._config.request_timeout
             )
-        except (FitzTransportError, FitzConnectionError) as exc:
+        except (FitzTransportError, FitzConnectionError, FitzTimeoutError) as exc:
             self._schedule_connection_loss(exc)
             raise
 
@@ -301,16 +347,18 @@ class Connection:
             await transport.send(frame)
             self._last_activity = time.monotonic()
 
-    async def _receive_loop(self, transport: Transport) -> None:
+    async def _receive_loop(self, transport: Transport, parser: FrameParser) -> None:
         try:
             while not self._closed and self._transport is transport:
                 data = await transport.receive()
+                if self._closed or self._transport is not transport:
+                    return
                 self._last_activity = time.monotonic()
-                for frame in self._parser.parse_frames(data):
+                for frame in parser.parse_frames(data):
                     self._multiplexer.dispatch(frame.message_type, frame.payload)
         except asyncio.CancelledError:
             return
-        except BaseException as exc:
+        except BaseException as exc:  # noqa: BLE001
             if self._state is ConnectionState.AUTHENTICATING and self._auth_error is not None:
                 if not self._auth_error.done():
                     self._auth_error.set_exception(AuthenticationError(str(exc) or "auth rejected"))
@@ -329,6 +377,10 @@ class Connection:
         self._gate.close()
         self._set_state(ConnectionState.DISCONNECTED, "disconnected", error=cause)
         transport, self._transport = self._transport, None
+        receive_task = self._receive_task
+        if receive_task is not None and receive_task is not asyncio.current_task():
+            receive_task.cancel()
+            await asyncio.gather(receive_task, return_exceptions=True)
         if transport is not None:
             with contextlib.suppress(Exception):
                 await transport.close()
@@ -352,16 +404,19 @@ class Connection:
             await asyncio.sleep(delay * random.uniform(0.8, 1.2))
             try:
                 await self._open_and_authenticate(True)
-                return
+                return  # noqa: TRY300
+            except asyncio.CancelledError:
+                raise
             except AuthenticationError:
                 self._closed = True
                 self._set_state(ConnectionState.CLOSED, "auth_rejected")
                 return
-            except BaseException as exc:
+            except BaseException as exc:  # noqa: BLE001
                 self._emit("reconnect_failed", attempt=attempt, error=exc)
                 delay = min(delay * 2, policy.max_backoff)
         if not self._closed:
             self._set_state(ConnectionState.DISCONNECTED, "reconnect_exhausted")
+            await self._notify_close()
 
     async def _restore_registrations(self) -> None:
         for (domain, registration), listener in list(self._reconnect_listeners.items()):
@@ -369,7 +424,9 @@ class Connection:
                 result = listener()
                 if inspect.isawaitable(result):
                     await result
-            except BaseException as exc:
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:  # noqa: BLE001
                 error = ReconnectRestoreError(domain, registration, exc)
                 self._emit(
                     "reconnect_restore_failed",
@@ -384,14 +441,32 @@ class Connection:
                 result = listener()
                 if inspect.isawaitable(result):
                     await result
-            except BaseException as exc:
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:  # noqa: BLE001
                 self._handler_error(exc)
 
-    def _start_heartbeat(self) -> None:
+    async def _notify_close(self) -> None:
+        if self._close_notified:
+            return
+        self._close_notified = True
+        for listener in list(self._close_listeners):
+            try:
+                result = listener()
+                if inspect.isawaitable(result):
+                    await result
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:  # noqa: BLE001
+                self._handler_error(exc)
+
+    async def _start_heartbeat(self) -> None:
         if not self._config.heartbeat.enabled:
             return
-        if self._heartbeat_task is not None:
-            self._heartbeat_task.cancel()
+        previous = self._heartbeat_task
+        if previous is not None and previous is not asyncio.current_task():
+            previous.cancel()
+            await asyncio.gather(previous, return_exceptions=True)
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
     async def _heartbeat_loop(self) -> None:
@@ -408,7 +483,7 @@ class Connection:
                 self._last_activity = time.monotonic()
         except asyncio.CancelledError:
             return
-        except BaseException as exc:
+        except BaseException as exc:  # noqa: BLE001
             await self._connection_lost(exc)
 
     def _new_gate(self) -> RequestGate:
@@ -432,6 +507,8 @@ class Connection:
         attempt: int | None = None,
         error: BaseException | None = None,
     ) -> None:
+        if self._closed and state is not ConnectionState.CLOSED:
+            return
         self._state = state
         self._emit(event, attempt=attempt, error=error)
 
@@ -456,26 +533,50 @@ class Connection:
         )
         observer = self._config.observability
         if observer.on_lifecycle_event is not None:
-            observer.on_lifecycle_event(payload)
+            with contextlib.suppress(Exception):
+                observer.on_lifecycle_event(payload)
         self._log("info", f"fitz.connection.{event}", lifecycle=payload)
         if observer.meter is not None:
-            observer.meter.counter("fitz.connection.lifecycle", 1, {"event": event})
+            with contextlib.suppress(Exception):
+                observer.meter.counter("fitz.connection.lifecycle", 1, {"event": event})
 
     def _record_latency(self, message_type: int, started: float) -> None:
         elapsed = time.monotonic() - started
         meter = self._config.observability.meter
         if meter is not None:
-            meter.histogram("fitz.request.duration", elapsed, {"message_type": message_type})
+            with contextlib.suppress(Exception):
+                meter.histogram("fitz.request.duration", elapsed, {"message_type": message_type})
         if elapsed > 1:
             self._log("warning", "fitz.request.slow", message_type=message_type, duration=elapsed)
 
     def _handler_error(self, error: BaseException) -> None:
         self._log("error", "fitz.handler.error", error=str(error))
 
-    def _log(self, level: str, event: str, **fields: Any) -> None:
+    def _log(self, level: str, event: str, **fields: object) -> None:
         logger = self._config.observability.logger
         if logger is None:
             return
-        method = getattr(logger, level, None)
-        if callable(method):
-            method(event, extra={"fitz": fields})
+        methods = {
+            "debug": logger.debug,
+            "error": logger.error,
+            "info": logger.info,
+            "warning": logger.warning,
+        }
+        method = methods.get(level)
+        if method is not None:
+            with contextlib.suppress(Exception):
+                method(event, extra={"fitz": fields})
+
+    def _assert_transport_owner(
+        self,
+        transport: Transport,
+        receive_task: asyncio.Task[None],
+    ) -> None:
+        if (
+            self._closed
+            or self._transport is not transport
+            or self._receive_task is not receive_task
+            or receive_task.done()
+            or self._state is ConnectionState.DISCONNECTED
+        ):
+            raise FitzConnectionError("Connection changed while authentication was in progress")

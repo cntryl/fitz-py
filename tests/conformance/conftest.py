@@ -10,7 +10,7 @@ import importlib
 import sys
 
 
-def pytest_sessionfinish(session, exitstatus) -> None:  # noqa: ANN001
+def pytest_sessionfinish(session, exitstatus) -> None:
     # Lazy import — test_conformance is fully initialised by the time this hook fires.
     module = None
     for loaded in sys.modules.values():

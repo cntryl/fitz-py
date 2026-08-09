@@ -20,11 +20,12 @@ class PendingRequest:
 
 
 class Multiplexer:
-    def __init__(self) -> None:
+    def __init__(self, on_error: Callable[[BaseException], None] | None = None) -> None:
         self._pending: dict[int, deque[PendingRequest]] = defaultdict(deque)
         self._notification_handlers: dict[int, NotificationHandler] = {}
         self._push_classifiers: dict[int, PushClassifier] = {}
         self._connected = False
+        self._on_error = on_error
 
     def set_connected(self) -> None:
         self._connected = True
@@ -55,7 +56,18 @@ class Multiplexer:
         pending = PendingRequest(future)
         self._pending[message_type].append(pending)
         try:
-            await send(frame_data)
+            send_future = asyncio.ensure_future(send(frame_data))
+            try:
+                await asyncio.shield(send_future)
+            except asyncio.CancelledError:
+                try:
+                    await asyncio.shield(send_future)
+                except BaseException:  # noqa: BLE001
+                    self._remove(message_type, pending)
+                else:
+                    pending.sent = True
+                    self._abandon(message_type, pending)
+                raise
             pending.sent = True
             async with asyncio.timeout(timeout):
                 return await future
@@ -67,8 +79,9 @@ class Multiplexer:
         except asyncio.CancelledError:
             self._abandon(message_type, pending)
             raise
-        except BaseException:
-            if pending.sent:
+        except BaseException as exc:
+            if pending.sent or isinstance(exc, (FitzConnectionError, FitzTimeoutError)):
+                pending.sent = True
                 self._abandon(message_type, pending)
             else:
                 self._remove(message_type, pending)
@@ -98,8 +111,8 @@ class Multiplexer:
                 if classifier(payload):
                     self._dispatch_push(message_type, payload)
                     return
-            except Exception:
-                return
+            except Exception as exc:  # noqa: BLE001
+                self._report_error(exc)
 
         queue = self._pending.get(message_type)
         if queue:
@@ -116,8 +129,12 @@ class Multiplexer:
         if handler is not None:
             try:
                 handler(payload)
-            except Exception:
-                return
+            except Exception as exc:  # noqa: BLE001
+                self._report_error(exc)
+
+    def _report_error(self, error: BaseException) -> None:
+        if self._on_error is not None:
+            self._on_error(error)
 
     def cancel_all(self) -> None:
         error = FitzConnectionError("Connection closed or reset")

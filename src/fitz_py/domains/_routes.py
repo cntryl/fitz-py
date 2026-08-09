@@ -5,7 +5,7 @@ from __future__ import annotations
 
 def _parts(route: str, scheme: str) -> list[str] | None:
     prefix = f"{scheme}://"
-    if not isinstance(route, str) or not route.startswith(prefix):
+    if not isinstance(route, str) or not route.startswith(prefix):  # pyright: ignore[reportUnnecessaryIsInstance]
         return None
     parts = route[len(prefix) :].split("/")
     if not parts or any(not part for part in parts):
@@ -42,6 +42,4 @@ def is_selector_route_shape(
         return parts[0] != "*" or allow_realm_wildcard
     if len(parts) != segment_count or "**" in parts:
         return False
-    if parts[0] == "*" and not allow_realm_wildcard:
-        return False
-    return True
+    return not (parts[0] == "*" and not allow_realm_wildcard)

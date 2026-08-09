@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from fitz_py._runtime import AsyncSubscription
+from fitz_py._runtime import LazyAsyncIterator
+from fitz_py.connection import Connection
 from fitz_py.domains._routes import is_exact_route_shape, is_selector_route_shape
 from fitz_py.domains._subscriptions import SubscriptionRegistry
 from fitz_py.domains.base import DomainClient
@@ -20,6 +21,7 @@ from fitz_py.protocol.messages import (
     MSG_QUEUE_UNSUBSCRIBE,
 )
 from fitz_py.protocol.response import parse_response
+from fitz_py.types import BytesLike
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,16 +48,16 @@ class QueueItem:
 
     async def extend(self, lease_seconds: int) -> None:
         self._ensure_valid()
-        await self._client._extend(self.route, self._id, self._token, lease_seconds)
+        await self._client._extend(self.route, self._id, self._token, lease_seconds)  # noqa: SLF001
 
     async def complete(self) -> None:
         self._ensure_valid()
-        await self._client._complete(self.route, self._id, self._token)
+        await self._client._complete(self.route, self._id, self._token)  # noqa: SLF001
         self._closed = True
 
 
 class QueueClient(DomainClient):
-    def __init__(self, connection) -> None:
+    def __init__(self, connection: Connection) -> None:
         super().__init__(connection)
         self._subscriptions = SubscriptionRegistry[Availability](
             connection.config.limits.subscription_buffer_size,
@@ -73,16 +75,20 @@ class QueueClient(DomainClient):
             domain="queue",
             registration="availability",
         )
+        on_close = getattr(connection, "on_close", None)
+        if callable(on_close):
+            on_close(self._subscriptions.terminate)
 
-    async def enqueue(self, route: str, body: bytes, *, delay: float | None = None) -> int | None:
+    async def enqueue(self, route: str, body: BytesLike, *, delay: int | None = None) -> int:
         _exact(route)
-        if delay is not None and delay < 0:
-            raise ValueError("delay must be non-negative")
+        body = bytes(body)
+        if delay is not None:
+            _duration(delay, "delay")
         writer = BufferWriter()
         writer.write_route(route)
         writer.write_u32_be(len(body))
         writer.write_bytes(body)
-        seconds = int(delay or 0)
+        seconds = delay or 0
         writer.write_u8(int(seconds > 0))
         if seconds:
             writer.write_u64_be(seconds)
@@ -90,34 +96,32 @@ class QueueClient(DomainClient):
         if not response.success:
             raise domain_error(QueueError, "ENQUEUE", response.error_code or 0, response.error)
         reader = BufferReader(response.data)
-        return reader.read_u64_be() if reader.remaining_bytes() >= 8 else None
+        if reader.remaining_bytes() != 8:
+            raise QueueError("ENQUEUE response must contain one item id", "INVALID_RESPONSE")
+        return reader.read_u64_be()
 
     async def reserve(
         self,
         selector: str,
         *,
-        lease: float,
+        lease: int,
         batch_size: int | None = None,
-        wait: float | None = None,
+        wait: int | None = None,
     ) -> list[QueueItem]:
         _selector(selector)
-        if (
-            lease <= 0
-            or batch_size is not None
-            and batch_size <= 0
-            or wait is not None
-            and wait < 0
-        ):
-            raise ValueError("lease and batch_size must be positive; wait must be non-negative")
+        _duration(lease, "lease", positive=True)
+        if wait is not None:
+            _duration(wait, "wait")
+        if batch_size is not None and not 1 <= batch_size <= 1024:
+            raise ValueError("batch_size must be between 1 and 1024")
         writer = BufferWriter()
         writer.write_route(selector)
-        writer.write_u64_be(int(lease))
-        writer.write_u8(int(batch_size is not None))
-        if batch_size is not None:
-            writer.write_u32_be(batch_size)
+        writer.write_u64_be(lease)
+        writer.write_u8(1)
+        writer.write_u32_be(batch_size or 1)
         writer.write_u8(int(wait is not None and wait > 0))
         if wait is not None and wait > 0:
-            writer.write_u64_be(int(wait))
+            writer.write_u64_be(wait)
         response = parse_response(await self.request_frame(MSG_QUEUE_RESERVE, writer.build()))
         if not response.success:
             raise domain_error(QueueError, "RESERVE", response.error_code or 0, response.error)
@@ -147,9 +151,9 @@ class QueueClient(DomainClient):
             raise QueueError("RESERVE response has trailing bytes", "INVALID_RESPONSE")
         return items
 
-    async def subscribe(self, selector: str) -> AsyncSubscription[Availability]:
+    def subscribe(self, selector: str) -> LazyAsyncIterator[Availability]:
         _selector(selector)
-        return await self._subscriptions.subscribe(selector)
+        return LazyAsyncIterator(lambda: self._subscriptions.subscribe(selector))
 
     async def _complete(self, route: str, item_id: int, token: int) -> None:
         writer = BufferWriter()
@@ -161,20 +165,23 @@ class QueueClient(DomainClient):
         )
         if not response.success:
             raise QueueError(f"COMPLETE failed: {response.error}", "COMPLETE")
+        if response.data:
+            raise QueueError("COMPLETE response has trailing bytes", "INVALID_RESPONSE")
 
-    async def _extend(self, route: str, item_id: int, token: int, lease: float) -> None:
-        if lease <= 0:
-            raise ValueError("lease must be positive")
+    async def _extend(self, route: str, item_id: int, token: int, lease: int) -> None:
+        _duration(lease, "lease", positive=True)
         writer = BufferWriter()
         writer.write_route(route)
         writer.write_u64_be(item_id)
         writer.write_u64_be(token)
-        writer.write_u64_be(int(lease))
+        writer.write_u64_be(lease)
         response = parse_response(
             await self.request_frame(MSG_QUEUE_EXTEND, writer.build()), plain=True
         )
         if not response.success:
             raise QueueError(f"EXTEND failed: {response.error}", "EXTEND")
+        if response.data:
+            raise QueueError("EXTEND response has trailing bytes", "INVALID_RESPONSE")
 
     async def _subscribe_wire(self, selector: str) -> int:
         writer = BufferWriter()
@@ -200,6 +207,8 @@ class QueueClient(DomainClient):
         )
         if not response.success:
             raise QueueError(f"UNSUBSCRIBE failed: {response.error}", "UNSUBSCRIBE")
+        if response.data:
+            raise QueueError("UNSUBSCRIBE response has trailing bytes", "INVALID_RESPONSE")
 
     def _notify(self, payload: bytes) -> None:
         reader = BufferReader(payload)
@@ -221,5 +230,13 @@ def _exact(route: str) -> None:
 
 
 def _selector(route: str) -> None:
-    if not is_selector_route_shape(route, "queue", 3):
+    if not is_selector_route_shape(route, "queue", 3, allow_realm_wildcard=True):
         raise QueueError(f"Invalid queue selector: {route}", "INVALID_ROUTE")
+
+
+def _duration(value: object, name: str, *, positive: bool = False) -> None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an integer number of seconds")
+    if value < (1 if positive else 0):
+        qualifier = "positive" if positive else "non-negative"
+        raise ValueError(f"{name} must be {qualifier}")

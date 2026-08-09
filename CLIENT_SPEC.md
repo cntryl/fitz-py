@@ -4,8 +4,10 @@
 
 The canonical Fitz client specification lives in the server repository:
 
-- `fitz/docs/clients/CLIENT_SPEC.md`
-- `fitz/docs/clients/CLIENT_ACCEPTANCE_CRITERIA.md`
-- `fitz/docs/clients/CLIENT_IMPLEMENTATION_GUIDE.md`
+- `../../fitz/docs/clients/spec/`
+- `../../fitz/docs/clients/cross-language-conformance-suite.yaml`
+- `../../fitz/docs/clients/client-perfection-scoreboard.md`
 
-Use `fitz-go` as the primary implementation reference and `fitz-ts` as a secondary cross-check for reconnect behavior and broker-backed test shape.
+Use `fitz-ts` as the forward implementation reference and cross-check wire-sensitive behavior
+against the current broker source. When prose and the running codec disagree, record the drift and
+follow the current broker contract.

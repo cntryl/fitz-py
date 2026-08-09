@@ -24,7 +24,9 @@ def _b64url(data: bytes) -> str:
 
 def _encode(payload: dict[str, object], secret: str) -> str:
     header = {"alg": "HS256", "typ": "JWT"}
-    signing_input = f"{_b64url(json.dumps(header, separators=(',', ':')).encode())}.{_b64url(json.dumps(payload, separators=(',', ':')).encode())}"
+    encoded_header = _b64url(json.dumps(header, separators=(",", ":")).encode())
+    encoded_payload = _b64url(json.dumps(payload, separators=(",", ":")).encode())
+    signing_input = f"{encoded_header}.{encoded_payload}"
     signature = hmac.new(secret.encode(), signing_input.encode(), hashlib.sha256).digest()
     return f"{signing_input}.{_b64url(signature)}"
 

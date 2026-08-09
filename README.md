@@ -1,6 +1,6 @@
 # fitz-py
 
-`fitz-py` is the typed, asyncio-native Python client for the Fitz broker. Version 0.2 is a
+`fitz-py` is the typed, asyncio-native Python client for the Fitz broker. Version 0.3 is a
 deliberate clean break: clients are configured once, domain clients are cached properties, streamed
 results are async iterators, and network/runtime queues are bounded.
 
@@ -11,23 +11,21 @@ python -m pip install cntryl-fitz
 ## Connect
 
 ```python
-from fitz_py import Client, ClientConfig
+from fitz_py import Client
 
 async with Client(
-    ClientConfig(
-        url="ws://localhost:4190/ws",
-        token_provider=lambda: "",
-    )
+    "ws://localhost:4190/ws",
+    token_provider=lambda: "",
 ) as client:
-    async with await client.kv.begin("kv://example/app/users") as tx:
+    async with client.kv.transaction("kv://example/app/users") as tx:
         await tx.put(b"alice", b"active")
         await tx.commit()
 ```
 
-`Client.close()` is permanent and idempotent. Reconnect is enabled by default after the first
+`Client.aclose()` is permanent and idempotent. Reconnect is enabled by default after the first
 successful authentication; an authentication rejection permanently closes the client. Configure
-timeouts, bounded concurrency, retry, heartbeat, logging, metrics, and lifecycle events with the
-frozen policies on `ClientConfig`.
+timeouts, bounded concurrency, retry, heartbeat, logging, metrics, and lifecycle events with
+keyword arguments and the frozen policy values exported by `fitz_py`.
 
 ## Domains
 
@@ -42,7 +40,7 @@ frozen policies on `ClientConfig`.
 Subscriptions are independently closable async iterators:
 
 ```python
-async with await client.notice.subscribe("notice://example/app/*") as notices:
+async with client.notice.subscribe("notice://example/app/*") as notices:
     async for notice in notices:
         print(notice.route, notice.body)
 ```
@@ -52,13 +50,12 @@ Reserve waits are performed by the broker rather than local polling:
 ```python
 items = await client.queue.reserve("queue://example/work/*", lease=30, wait=10)
 for item in items:
-    try:
-        await process(item.body)
-    except Exception:
-        raise
-    else:
-        await item.complete()
+    await process(item.body)
+    await item.complete()
 ```
+
+If processing raises before `complete()`, the item remains inflight and becomes available for
+redelivery when its lease expires.
 
 Managed leases renew at one third of their TTL and preserve both renewal and release failures:
 
@@ -80,7 +77,7 @@ reply cannot corrupt the next same-type request.
 python -m pip install -e ".[dev]"
 python -m ruff format --check .
 python -m ruff check .
-python -m pyright src
+python -m pyright
 python -m pytest tests/unit
 
 docker compose up -d
@@ -93,5 +90,9 @@ python -m build
 ```
 
 The repository owns its broker Compose stack and a vendored copy of the canonical 17-scenario
-cross-language suite. CI runs Python 3.11-3.13, wheel smoke tests, TCP/WebSocket, and
+cross-language suite. CI runs Python 3.11-3.14, wheel smoke tests, TCP/WebSocket, and
 anonymous/JWT broker legs. Canonical behavior remains owned by the Fitz server documentation.
+
+See [MIGRATION.md](MIGRATION.md) for every 0.3 break and [PERFORMANCE.md](PERFORMANCE.md) for the
+benchmark evidence policy. [AUDIT_REMEDIATION.md](AUDIT_REMEDIATION.md) records the disposition and
+proof for the independent correctness review.

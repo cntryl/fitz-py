@@ -32,11 +32,11 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install dist/*.whl
           python - <<'PY'
-          from fitz_py import Client, ClientConfig
+          from fitz_py import Client
 
-          client = Client(ClientConfig(url="ws://localhost:4190/ws"))
+          client = Client("ws://localhost:4190/ws")
           print(type(client).__name__)
-          print(type(client.kv()).__name__)
+          print(type(client.kv).__name__)
           PY
 
       - name: Publish package to PyPI

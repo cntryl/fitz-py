@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cntryl-fitz"
-version = "0.2.0"
+version = "0.3.0"
 description = "Async-first Python client for Fitz"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -22,12 +22,13 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Software Development :: Libraries",
   "Topic :: System :: Distributed Computing",
 ]
 keywords = ["fitz", "distributed-systems", "asyncio", "websocket", "tcp", "rpc"]
 dependencies = [
-  "websockets>=12,<16",
+  "websockets>=13,<16",
 ]
 
 [project.urls]
@@ -38,6 +39,7 @@ Issues = "https://github.com/cntryl/fitz-py/issues"
 [project.optional-dependencies]
 dev = [
   "build>=1,<2",
+  "hypothesis>=6.130,<7",
   "ruff>=0.13,<1",
   "pytest>=8,<9",
   "pytest-asyncio>=0.24,<2",
@@ -48,6 +50,20 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/fitz_py"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src",
+  "/tests",
+  "/benchmarks",
+  "/README.md",
+  "/LICENSE",
+  "/MIGRATION.md",
+  "/PERFORMANCE.md",
+  "/AUDIT_REMEDIATION.md",
+  "/pyproject.toml",
+]
+exclude = ["/.hypothesis", "/artifacts", "/dist"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -67,19 +83,40 @@ verify = "ruff format --check . && ruff check . && pytest tests/unit && pytest t
 [tool.ruff]
 target-version = "py311"
 line-length = 100
+extend-exclude = ["artifacts", "dist"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "B"]
-ignore = ["E501"]
+select = ["ALL"]
+ignore = [
+  "ASYNC109", # Timeout is an intentional part of these async APIs.
+  "C901",     # State-machine complexity is covered by branch tests.
+  "COM812",   # Conflicts with Ruff's formatter.
+  "CPY",      # The repository license applies without per-file banners.
+  "D",        # Public API documentation is maintained in the reference docs.
+  "EM",
+  "FBT",
+  "PLR",
+  "PLC0415",  # Optional transports are imported lazily.
+  "PYI034",
+  "S311",     # Jitter is non-cryptographic.
+  "TC",
+  "TRY003",   # Domain exceptions intentionally carry operation-specific messages at raise sites.
+]
+
+[tool.ruff.lint.per-file-ignores]
+"benchmarks/**" = ["T201"]
+"tests/**" = ["ANN", "ARG", "INP", "PT", "RUF006", "S", "SIM105", "SLF", "T201"]
+"tests/conformance/test_conformance.py" = ["BLE"] # Scenarios record unexpected failures.
+"tests/integration/fixture/fixture.py" = ["BLE"] # Any connection failure makes the broker unavailable.
 
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
 
 [tool.pyright]
-include = ["src", "tests/unit"]
+include = ["src"]
 pythonVersion = "3.11"
-typeCheckingMode = "standard"
+typeCheckingMode = "strict"
 reportPrivateUsage = false
 reportUnsupportedDunderAll = false
 reportMissingImports = false

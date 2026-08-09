@@ -1,9 +1,7 @@
 """
 Fitz conformance harness — Python / fitz-py
 
-Covers 21 scenarios executed by this harness:
-    CS-001..CS-015 track fitz/docs/clients/cross-language-conformance-suite.yaml
-    CS-018..CS-021 are fitz-py local lifecycle checks
+Covers the canonical 17 scenarios, CS-001 through CS-017.
 
 Configuration via environment variables:
   CONFORMANCE_TRANSPORT   "ws" (default) | "tcp"
@@ -25,25 +23,26 @@ import json
 import os
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
 import pytest
 import pytest_asyncio  # noqa: F401 — required for asyncio_mode
 
-from fitz_py import (  # noqa: E402
+from fitz_py import (
     AuthenticationError,
     Client,
-    ClientConfig,
     ConcurrencyLimits,
-    FitzError,
+    FitzConnectionError,
+    FitzTimeoutError,
+    KVError,
     RequestQueueFullError,
+    RPCError,
     StreamFilterClause,
     StreamFilterSet,
 )
-from fitz_py._runtime import RequestGate
-from tests.integration.fixture.jwt import make_expired_jwt, make_valid_jwt  # noqa: E402
+from tests.integration.fixture.jwt import make_expired_jwt, make_valid_jwt
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -99,18 +98,20 @@ async def _new_client(
     override_url: str | None = None,
     timeout_ms: int = 30000,
     max_in_flight_requests: int = 256,
+    request_queue_size: int = 1024,
 ) -> Client:
     mode = auth_mode or CONFORMANCE_AUTH_MODE
     url = override_url or _broker_url(mode)
     provider = token_provider if token_provider is not None else _token_provider()
     client = Client(
-        ClientConfig(
-            url=url,
-            token_provider=provider,
-            request_timeout=timeout_ms / 1000,
-            transport=CONFORMANCE_TRANSPORT,
-            limits=ConcurrencyLimits(max_in_flight=max_in_flight_requests),
-        )
+        url,
+        token_provider=provider,
+        request_timeout=timeout_ms / 1000,
+        transport=CONFORMANCE_TRANSPORT,
+        limits=ConcurrencyLimits(
+            max_in_flight=max_in_flight_requests,
+            request_queue_size=request_queue_size,
+        ),
     )
     await client.connect()
     return client
@@ -146,6 +147,9 @@ def _record(r: ScenarioResult) -> None:
 
 
 def _write_results() -> None:
+    required_ids = {f"CS-{number:03d}" for number in range(1, 18)}
+    recorded_ids = {result.scenario_id for result in _results}
+    missing_ids = sorted(required_ids - recorded_ids)
     p0 = [r for r in _results if r.priority == "P0"]
     p1 = [r for r in _results if r.priority == "P1"]
 
@@ -158,18 +162,19 @@ def _write_results() -> None:
     p1_rate = rate(p1)
     any_p0_fail = any(r.verdict != "pass" for r in p0)
     any_p1_warn = any(r.verdict in ("fail", "partial") for r in p1)
-    overall = "fail" if any_p0_fail else ("partial" if any_p1_warn else "pass")
+    overall = "fail" if missing_ids or any_p0_fail else ("partial" if any_p1_warn else "pass")
 
     aggregate = {
         "suite": "fitz-cross-language-client-conformance",
         "version": "1.0",
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": datetime.now(UTC).isoformat(),
         "client": CLIENT_NAME,
         "transport": CONFORMANCE_TRANSPORT,
         "auth_mode": CONFORMANCE_AUTH_MODE,
         "p0_pass_rate": p0_rate,
         "p1_pass_rate": p1_rate,
         "overall_status": overall,
+        "missing_scenarios": missing_ids,
         "scenarios": [dataclasses.asdict(r) for r in _results],
     }
 
@@ -235,7 +240,7 @@ async def test_cs001_connect_success() -> None:
 
         verdict: Verdict = "pass"
     finally:
-        await client.close()
+        await client.aclose()
 
     r = ScenarioResult(
         "CS-001",
@@ -265,11 +270,9 @@ async def test_cs002_auth_failure() -> None:
     url = _broker_url_for_mode("invalid_jwt")
     # Use an expired token as the "invalid" token
     client = Client(
-        ClientConfig(
-            url=url,
-            token_provider=make_expired_jwt,
-            transport=CONFORMANCE_TRANSPORT,
-        )
+        url,
+        token_provider=make_expired_jwt,
+        transport=CONFORMANCE_TRANSPORT,
     )
 
     connect_exc: Exception | None = None
@@ -293,7 +296,7 @@ async def test_cs002_auth_failure() -> None:
         except Exception as dom_exc:
             evidence.append(f"domain request failed post-auth: {dom_exc}")
         finally:
-            await client.close()
+            await client.aclose()
 
     r = ScenarioResult(
         "CS-002",
@@ -328,11 +331,10 @@ async def test_cs003_request_success() -> None:
 
         rtx = await client.kv.begin(route, mode="read_only", durability="sync")
         result = await rtx.get(b"user:1")
-        assert result.found, "expected found=True"
-        assert result.value == b"Alice"
-        evidence.append(f'read-after-commit returned "{result.value.decode()}" (correct)')
+        assert result == b"Alice"
+        evidence.append(f'read-after-commit returned "{result.decode()}" (correct)')
     finally:
-        await client.close()
+        await client.aclose()
 
     r = ScenarioResult(
         "CS-003",
@@ -362,7 +364,7 @@ async def test_cs004_unknown_route() -> None:
         no_worker_route = _unique_route("rpc")
         caught: Exception | None = None
         try:
-            iterator = await client.rpc.call(no_worker_route, b"ping", timeout=0.5)
+            iterator = await client.rpc.open_call(no_worker_route, b"ping", timeout=0.5)
             async for _frame in iterator:
                 pass
         except Exception as exc:
@@ -378,7 +380,7 @@ async def test_cs004_unknown_route() -> None:
         await tx.commit()
         evidence.append("client remains usable after unknown-route error")
     finally:
-        await client.close()
+        await client.aclose()
 
     r = ScenarioResult(
         "CS-004",
@@ -428,10 +430,10 @@ async def test_cs005_invalid_payload() -> None:
 
         rtx = await client.kv.begin(route, mode="read_only", durability="sync")
         result = await rtx.get(b"dup-key")
-        assert result.found
+        assert result is not None
         evidence.append("client remains usable after server-rejected operation")
     finally:
-        await client.close()
+        await client.aclose()
 
     r = ScenarioResult(
         "CS-005",
@@ -461,19 +463,16 @@ async def test_cs006_server_error_mapping() -> None:
         route = _unique_route("rpc")
         rpc_err: Exception | None = None
         try:
-            iterator = await client.rpc.call(route, b"ping", timeout=0.5)
+            iterator = await client.rpc.open_call(route, b"ping", timeout=0.5)
             async for _frame in iterator:
                 pass
         except Exception as exc:
             rpc_err = exc
 
-        if rpc_err:
-            evidence.append(f"rpc error type: {type(rpc_err).__name__}")
-            evidence.append(f"rpc error: {rpc_err}")
-            if isinstance(rpc_err, FitzError):
-                evidence.append("error is a typed FitzError subclass (correct)")
-                if hasattr(rpc_err, "code"):
-                    evidence.append(f"error.code = {rpc_err.code}")
+        assert isinstance(rpc_err, RPCError), type(rpc_err).__name__
+        assert rpc_err.domain_code is not None
+        evidence.append(f"rpc error type: {type(rpc_err).__name__}")
+        evidence.append(f"error.code = {rpc_err.code}")
 
         # KV conflict — verify typed error
         kv_route = _unique_route("kv")
@@ -493,10 +492,12 @@ async def test_cs006_server_error_mapping() -> None:
             except Exception:
                 pass
 
-        if kv_err:
-            evidence.append(f"kv conflict error type: {type(kv_err).__name__}")
+        assert isinstance(kv_err, KVError), type(kv_err).__name__
+        assert kv_err.domain_code is not None
+        evidence.append(f"kv conflict error type: {type(kv_err).__name__}")
+        evidence.append(f"kv error code: {kv_err.domain_code}")
     finally:
-        await client.close()
+        await client.aclose()
 
     r = ScenarioResult(
         "CS-006",
@@ -524,10 +525,20 @@ async def test_cs007_timeout_handling() -> None:
     client = await _new_client()
     try:
         route = _unique_route("rpc")
+        handler_started = asyncio.Event()
+        never_finish = asyncio.Event()
+
+        async def blocked_handler(request, response) -> None:
+            del request, response
+            handler_started.set()
+            await never_finish.wait()
+
+        worker = await client.rpc.register_worker(route, blocked_handler)
         start = time.monotonic()
         caught: Exception | None = None
         try:
-            iterator = await client.rpc.call(route, b"nobody", timeout=0.25)
+            iterator = await client.rpc.open_call(route, b"nobody", timeout=0.25)
+            await asyncio.wait_for(handler_started.wait(), 1)
             async for _frame in iterator:
                 pass
         except Exception as exc:
@@ -537,10 +548,8 @@ async def test_cs007_timeout_handling() -> None:
         assert caught is not None, "expected timeout error"
         evidence.append(f"rpc timed out after ~{elapsed_ms}ms: {type(caught).__name__}")
 
-        if isinstance(caught, asyncio.CancelledError):
-            evidence.append("WARNING: raised CancelledError, expected FitzTimeoutError or RpcError")
-        else:
-            evidence.append("error is not CancelledError (correct)")
+        assert isinstance(caught, FitzTimeoutError), type(caught).__name__
+        evidence.append("error is FitzTimeoutError (correct)")
 
         # Connection must remain healthy
         kv_route = _unique_route("kv")
@@ -548,8 +557,9 @@ async def test_cs007_timeout_handling() -> None:
         await tx.put(b"post-timeout", b"ok")
         await tx.commit()
         evidence.append("connection healthy after timeout")
+        await worker.aclose()
     finally:
-        await client.close()
+        await client.aclose()
 
     r = ScenarioResult(
         "CS-007",
@@ -591,7 +601,7 @@ async def test_cs008_caller_cancellation() -> None:
         sub = await worker_client.rpc.register_worker(route, _slow_handler)
 
         async def _do_call() -> None:
-            iterator = await caller_client.rpc.call(route, b"block", timeout=30)
+            iterator = await caller_client.rpc.open_call(route, b"block", timeout=30)
             async for _frame in iterator:
                 pass
 
@@ -616,7 +626,7 @@ async def test_cs008_caller_cancellation() -> None:
         try:
             await asyncio.wait_for(handler_finished.wait(), timeout=1.0)
             evidence.append("worker handler finished after caller cancellation")
-        except asyncio.TimeoutError:
+        except TimeoutError:
             evidence.append("worker handler still draining after cancellation")
 
         # Subsequent request must succeed
@@ -626,8 +636,8 @@ async def test_cs008_caller_cancellation() -> None:
         await tx.commit()
         evidence.append("subsequent request succeeded after cancellation")
     finally:
-        await worker_client.close()
-        await caller_client.close()
+        await worker_client.aclose()
+        await caller_client.aclose()
 
     r = ScenarioResult(
         "CS-008",
@@ -671,13 +681,13 @@ async def test_cs009_disconnect_during_request() -> None:
         sub = await worker_client.rpc.register_worker(route, _slow_handler)
 
         async def _do_call() -> None:
-            iterator = await caller_client.rpc.call(route, b"block", timeout=30)
+            iterator = await caller_client.rpc.open_call(route, b"block", timeout=30)
             async for _frame in iterator:
                 pass
 
         task = asyncio.create_task(_do_call())
         await asyncio.wait_for(handler_started.wait(), timeout=2.0)
-        await caller_client.close()
+        await caller_client.aclose()
 
         caught: BaseException | None = None
         try:
@@ -692,13 +702,13 @@ async def test_cs009_disconnect_during_request() -> None:
         try:
             await asyncio.wait_for(handler_finished.wait(), timeout=2.0)
             evidence.append("worker handler finished after disconnect")
-        except asyncio.TimeoutError:
+        except TimeoutError:
             evidence.append("worker handler still draining after disconnect")
     finally:
-        await worker_client.close()
+        await worker_client.aclose()
         # Caller may already be closed
         try:
-            await caller_client.close()
+            await caller_client.aclose()
         except Exception:
             pass
 
@@ -727,23 +737,25 @@ async def test_cs010_reconnect_behavior() -> None:
     evidence: list[str] = []
 
     client = await _new_client()
-    evidence.append("first client connected with default settings")
-    await client.close()
-    evidence.append("first client closed")
-
-    # Create a new client and confirm requests succeed
-    client2 = await _new_client()
+    generation = client._connection.generation
+    transport = client._connection._transport
+    assert transport is not None
+    evidence.append(f"client connected at generation {generation}")
     try:
+        await transport.close()
+        async with asyncio.timeout(10):
+            while (  # noqa: ASYNC110 -- reconnect state is external to this test task
+                client._connection.generation == generation or not client.is_connected
+            ):
+                await asyncio.sleep(0.01)
+        evidence.append(f"same client reconnected at generation {client._connection.generation}")
         route = _unique_route("kv")
-        tx = await client2.kv.begin(route, durability="sync")
+        tx = await client.kv.begin(route, durability="sync")
         await tx.put(b"after-reconnect", b"ok")
         await tx.commit()
-        evidence.append("new requests succeed after reconnect (new client)")
-        evidence.append(
-            "NOTE: full auto-reconnect loop requires network-level disruption not provided here"
-        )
+        evidence.append("new requests succeed on the reconnected client")
     finally:
-        await client2.close()
+        await client.aclose()
 
     r = ScenarioResult(
         "CS-010",
@@ -789,7 +801,7 @@ async def test_cs011_stream_receive_sequence() -> None:
         if records:
             evidence.append(f"first offset: {records[0].offset}, last: {records[-1].offset}")
     finally:
-        await client.close()
+        await client.aclose()
 
     r = ScenarioResult(
         "CS-011",
@@ -815,6 +827,7 @@ async def test_cs011_stream_receive_sequence() -> None:
 async def test_cs012_stream_completion() -> None:
     evidence: list[str] = []
     client = await _new_client()
+    baseline = set(asyncio.all_tasks())
     try:
         route = _unique_route("stream")
         session = await client.stream.begin(route)
@@ -826,9 +839,16 @@ async def test_cs012_stream_completion() -> None:
         records = await client.stream.read(route, start_offset=0, limit=100)
         assert len(records) >= 2, f"expected >=2 records after commit, got {len(records)}"
         evidence.append(f"stream.read() completed cleanly with {len(records)} records")
-        evidence.append("iterator/read closed cleanly (no resource leak)")
+        await asyncio.sleep(0)
+        leaked = {
+            task
+            for task in asyncio.all_tasks() - baseline
+            if task is not asyncio.current_task() and not task.done()
+        }
+        assert not leaked, [task.get_coro().__qualname__ for task in leaked]
+        evidence.append("no additional live asyncio tasks after read completion")
     finally:
-        await client.close()
+        await client.aclose()
 
     r = ScenarioResult(
         "CS-012",
@@ -885,7 +905,7 @@ async def test_cs013_stream_error_mid_flight() -> None:
                 await wrong_session.rollback()
             except Exception:
                 pass
-        await client.close()
+        await client.aclose()
 
     r = ScenarioResult(
         "CS-013",
@@ -920,7 +940,7 @@ async def test_cs014_concurrent_requests() -> None:
             await tx.commit()
             rtx = await client.kv.begin(route, mode="read_only", durability="sync")
             result = await rtx.get(f"key-{idx}".encode())
-            return result.value.decode() if result.found else ""
+            return result.decode() if result is not None else ""
 
         results_list = await asyncio.gather(
             *[_kv_roundtrip(route, i) for i, route in enumerate(routes)]
@@ -933,7 +953,7 @@ async def test_cs014_concurrent_requests() -> None:
         evidence.append("3 concurrent kv transactions completed correctly")
         evidence.append("all responses correlated to correct request contexts")
     finally:
-        await client.close()
+        await client.aclose()
 
     r = ScenarioResult(
         "CS-014",
@@ -961,30 +981,29 @@ async def test_cs015_shutdown_during_active_work() -> None:
 
     client = await _new_client()
 
-    route = _unique_route("kv")
-    begin_task = asyncio.create_task(client.kv.begin(route, durability="sync"))
+    route = _unique_route("rpc")
+    handler_started = asyncio.Event()
+    never_finish = asyncio.Event()
 
-    await asyncio.sleep(0.05)
-    await client.close()
+    async def blocked_handler(request, response) -> None:
+        del request, response
+        handler_started.set()
+        await never_finish.wait()
+
+    await client.rpc.register_worker(route, blocked_handler)
+    call = await client.rpc.open_call(route, b"wait", timeout=5)
+    active_task = asyncio.create_task(anext(call))
+    await asyncio.wait_for(handler_started.wait(), 1)
+    await client.aclose()
     evidence.append("close during active work did not raise")
 
-    caught: Exception | None = None
-    try:
-        await begin_task
-    except Exception as exc:
-        caught = exc
-
-    if caught:
-        evidence.append(f"in-flight begin raised: {type(caught).__name__} (expected)")
-    else:
-        evidence.append("in-flight begin completed before close (race — acceptable)")
+    with pytest.raises(FitzConnectionError):
+        await asyncio.wait_for(active_task, 1)
+    evidence.append("in-flight work failed promptly with FitzConnectionError")
 
     # Double close must not raise
-    try:
-        await client.close()
-        evidence.append("double close is safe")
-    except Exception as exc:
-        evidence.append(f"double close raised {type(exc).__name__} (should be idempotent)")
+    await client.aclose()
+    evidence.append("double close is safe")
 
     r = ScenarioResult(
         "CS-015",
@@ -1032,7 +1051,7 @@ async def test_cs016_filtered_stream_replay() -> None:
         evidence.append("filtered replay returned only the matching event")
         evidence.append("every event and marker retained its concrete route")
     finally:
-        await client.close()
+        await client.aclose()
 
     result = ScenarioResult(
         "CS-016",
@@ -1056,22 +1075,27 @@ async def test_cs016_filtered_stream_replay() -> None:
 @pytest.mark.asyncio
 async def test_cs017_bounded_concurrency_under_burst_load() -> None:
     evidence: list[str] = []
-    gate = RequestGate(1, 1)
-    release_first = await gate.acquire()
-    second_task = asyncio.create_task(gate.acquire())
-    await asyncio.sleep(0)
+    client = await _new_client(max_in_flight_requests=1, request_queue_size=1)
     try:
-        with pytest.raises(RequestQueueFullError):
-            await gate.acquire()
-        evidence.append("burst above active plus queue capacity failed explicitly")
-        release_first()
-        release_second = await asyncio.wait_for(second_task, timeout=1)
-        release_second()
-        evidence.append("queued work advanced in FIFO order after capacity released")
+        tasks = [
+            asyncio.create_task(client.kv.begin(_unique_route("kv"), durability="sync"))
+            for _ in range(32)
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        saturated = [result for result in results if isinstance(result, RequestQueueFullError)]
+        unexpected = [
+            result
+            for result in results
+            if isinstance(result, BaseException) and not isinstance(result, RequestQueueFullError)
+        ]
+        assert saturated, "live client burst never exercised its configured queue bound"
+        assert not unexpected, [type(error).__name__ for error in unexpected]
+        for transaction in results:
+            if not isinstance(transaction, BaseException):
+                await transaction.rollback()
+        evidence.append(f"{len(saturated)} live client requests failed explicitly at capacity")
     finally:
-        gate.close()
-        if not second_task.done():
-            second_task.cancel()
+        await client.aclose()
 
     r = ScenarioResult(
         "CS-017",
