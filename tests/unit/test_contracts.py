@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from pathlib import Path
 
 import pytest
 
@@ -12,7 +14,7 @@ from fitz_py.domains.notice import NoticeClient
 from fitz_py.domains.queue import QueueClient
 from fitz_py.domains.rpc import RPCClient
 from fitz_py.domains.schedule import DeliveryMode, ScheduleClient
-from fitz_py.domains.stream import StreamClient, StreamSession
+from fitz_py.domains.stream import StreamClient, StreamSession, _assert_stream_pattern
 from fitz_py.errors import (
     FitzConnectionError,
     FitzTimeoutError,
@@ -369,6 +371,17 @@ async def test_stream_global_filters_decode_extended_cursor(selector: str) -> No
     assert result.cursor.last_global_offset == 12
     assert result.cursor.cursor_fingerprint == 13
     assert result.cursor.captured_watermark == 14
+
+
+def test_stream_selectors_match_canonical_conformance_fixture() -> None:
+    fixture_path = Path(__file__).parents[2] / "docs/clients/spec/stream-read-conformance.json"
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+
+    for entry in fixture["selectors"]:
+        _assert_stream_pattern(entry["selector"])
+    for selector in fixture["invalidSelectors"]:
+        with pytest.raises(StreamError):
+            _assert_stream_pattern(selector)
 
 
 @pytest.mark.asyncio
