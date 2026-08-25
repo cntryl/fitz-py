@@ -71,6 +71,10 @@ queue, stale-handle, and domain failures have stable string codes and structured
 cancellation is preserved. Requests cancelled after transmission leave a FIFO tombstone so a late
 reply cannot corrupt the next same-type request.
 
+Schedule backend unavailability and broker saturation use the distinct coded
+error `ERR_SCHEDULE_BACKEND_ERROR` (`7010`). It is retryable subject to the
+operation's replay safety; it is never reported as a cron or parse error.
+
 ## Verification
 
 ```bash
