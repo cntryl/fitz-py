@@ -46,6 +46,7 @@ from fitz_py.domains import (
     Worker,
 )
 from fitz_py.errors import (
+    ERR_SCHEDULE_BACKEND_ERROR,
     AuthenticationError,
     CodecError,
     DomainError,
@@ -87,6 +88,7 @@ from fitz_py.types import (
 )
 
 __all__ = (
+    "ERR_SCHEDULE_BACKEND_ERROR",
     "AsyncSubscription",
     "AuthenticationError",
     "Availability",

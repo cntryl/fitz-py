@@ -173,11 +173,19 @@ class LeaseClient(DomainClient):
         resolved_owner_id = self._owner_id if owner_id is None else owner_id
         if not resolved_owner_id:
             raise ValueError("owner_id must not be empty")
-        queued = asyncio.get_running_loop().create_future()
+        queued: asyncio.Future[bytes] | None = None
+        if wait > 0:
+            queued = asyncio.get_running_loop().create_future()
+            # A disconnect can fail this internal future while the primary
+            # ACQUIRE request is still pending. Observe that failure from the
+            # moment it can be published; awaiting the same future later still
+            # preserves the public acquisition error.
+            queued.add_done_callback(_observe_acquire_future)
         await self._acquire_lock.acquire()
         release_lock = True
         try:
-            self._queued.append(queued)
+            if queued is not None:
+                self._queued.append(queued)
             writer = BufferWriter()
             writer.write_route(route)
             writer.write_route(resolved_owner_id)
@@ -186,19 +194,21 @@ class LeaseClient(DomainClient):
             payload = await self.request_frame(MSG_LEASE_ACQUIRE, writer.build())
             response_type, token = self._decode_acquire(payload)
             if response_type not in {2, 3}:
-                self._queued.remove(queued)
+                if queued is not None:
+                    self._queued.remove(queued)
             else:
-                response_type, token = self._decode_acquire(await asyncio.shield(queued))
+                queued_response = _require_queued_acquire_future(queued)
+                response_type, token = self._decode_acquire(await asyncio.shield(queued_response))
                 _validate_final_acquire(response_type)
         except asyncio.CancelledError:
-            if queued in self._queued:
+            if queued is not None and queued in self._queued:
                 task = asyncio.create_task(self._drain_cancelled_acquire(queued))
                 self._cancelled_acquires.add(task)
                 task.add_done_callback(self._cancelled_acquire_completed)
                 release_lock = False
             raise
         except BaseException:
-            if queued in self._queued:
+            if queued is not None and queued in self._queued:
                 with contextlib.suppress(ValueError):
                     self._queued.remove(queued)
             raise
@@ -354,6 +364,19 @@ def _route(route: str) -> None:
 def _validate_final_acquire(response_type: int) -> None:
     if response_type not in {0, 1}:
         raise LeaseError("ACQUIRE returned a second queued response", "INVALID_RESPONSE")
+
+
+def _observe_acquire_future(future: asyncio.Future[bytes]) -> None:
+    if not future.cancelled():
+        future.exception()
+
+
+def _require_queued_acquire_future(
+    future: asyncio.Future[bytes] | None,
+) -> asyncio.Future[bytes]:
+    if future is None:
+        raise LeaseError("ACQUIRE queued without a positive wait", "INVALID_RESPONSE")
+    return future
 
 
 def _duration(value: object, name: str, *, positive: bool = False) -> None:

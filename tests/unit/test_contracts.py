@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from fitz_py.domains.rpc import RPCClient
 from fitz_py.domains.schedule import DeliveryMode, ScheduleClient
 from fitz_py.domains.stream import StreamClient, StreamSession, _assert_stream_pattern
 from fitz_py.errors import (
+    ERR_SCHEDULE_BACKEND_ERROR,
     FitzConnectionError,
     FitzTimeoutError,
     FitzTransportError,
@@ -27,6 +29,7 @@ from fitz_py.errors import (
     ScheduleError,
     StreamError,
     SubscriptionBackpressureError,
+    is_retryable,
 )
 from fitz_py.multiplexer import Multiplexer
 from fitz_py.protocol.buffer import BufferReader, BufferWriter
@@ -72,6 +75,13 @@ from fitz_py.transport.websocket import WebSocketTransport
 from fitz_py.types import ClientConfig, ConcurrencyLimits
 
 
+def test_schedule_backend_error_code_is_distinct_and_retryable() -> None:
+    error = ScheduleError("backend busy", "BACKEND_ERROR", ERR_SCHEDULE_BACKEND_ERROR)
+
+    assert ERR_SCHEDULE_BACKEND_ERROR == 7010
+    assert is_retryable(error)
+
+
 class FakeConnection:
     def __init__(self, responses: dict[int, bytes] | None = None) -> None:
         self.config = ClientConfig(url="tcp://localhost:1")
@@ -109,6 +119,18 @@ class FakeConnection:
     async def run_with_retry(self, operation, *, replay_safe):
         assert replay_safe
         return await operation()
+
+
+class PendingLeaseConnection(FakeConnection):
+    def __init__(self) -> None:
+        super().__init__()
+        self.release_request = asyncio.Event()
+
+    async def request(self, message_type: int, payload: bytes) -> bytes:
+        self.sent.append((message_type, payload))
+        self.request_started.set()
+        await self.release_request.wait()
+        raise FitzConnectionError("transport disconnected")
 
 
 def test_clean_break_public_surface() -> None:
@@ -415,6 +437,19 @@ async def test_kv_error_response_decodes_domain_code_and_message() -> None:
 
 
 @pytest.mark.asyncio
+async def test_schedule_backend_error_response_preserves_distinct_code() -> None:
+    connection = FakeConnection(
+        {MSG_SCHEDULE_LIST: _coded_error(ERR_SCHEDULE_BACKEND_ERROR, "backend busy")}
+    )
+
+    with pytest.raises(ScheduleError, match="backend busy") as raised:
+        await ScheduleClient(connection).list_schedules()
+
+    assert raised.value.domain_code == 7010
+    assert is_retryable(raised.value)
+
+
+@pytest.mark.asyncio
 async def test_domain_success_decoders_reject_malformed_flags_and_lengths() -> None:
     transaction = KVTransaction(FakeConnection({MSG_KV_GET: b"\0\2"}), "kv://r/a/items", 7)
     with pytest.raises(KVError, match="found flag"):
@@ -576,6 +611,36 @@ async def test_queued_lease_wait_is_unblocked_by_disconnect() -> None:
 
     with pytest.raises(FitzConnectionError, match="interrupted"):
         await pending
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wait", [0, 30])
+async def test_disconnect_during_primary_acquire_has_no_unretrieved_internal_future(
+    wait: int,
+) -> None:
+    connection = PendingLeaseConnection()
+    client = LeaseClient(connection)
+    loop = asyncio.get_running_loop()
+    contexts: list[dict[str, object]] = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: contexts.append(context))
+
+    try:
+        pending = asyncio.create_task(client.acquire("lease://r/a/first", ttl=30, wait=wait))
+        await asyncio.wait_for(connection.request_started.wait(), 1)
+
+        client._disconnect()
+        connection.release_request.set()
+
+        with pytest.raises(FitzConnectionError, match="transport disconnected"):
+            await pending
+        del pending
+        gc.collect()
+        await asyncio.sleep(0)
+        assert contexts == []
+        assert not client._queued
+    finally:
+        loop.set_exception_handler(previous_handler)
 
 
 @pytest.mark.asyncio

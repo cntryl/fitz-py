@@ -137,6 +137,9 @@ class ScheduleError(DomainError):
     prefix = "SCHEDULE"
 
 
+ERR_SCHEDULE_BACKEND_ERROR = 7010
+
+
 _RETRYABLE = {
     ("KV", 1004),
     ("KV", 1009),
@@ -148,6 +151,7 @@ _RETRYABLE = {
     ("RPC", 6002),
     ("RPC", 6003),
     ("RPC", 6004),
+    ("SCHEDULE", ERR_SCHEDULE_BACKEND_ERROR),
 }
 
 
