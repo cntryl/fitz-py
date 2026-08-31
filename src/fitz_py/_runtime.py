@@ -248,10 +248,12 @@ class AsyncSubscription(AsyncIterator[T], Generic[T]):
         registration: str,
         capacity: int,
         close_wire: Callable[[], Awaitable[None]],
+        on_push: Callable[[T], None] | None = None,
     ) -> None:
         self.registration = registration
         self._queue: asyncio.Queue[T | BaseException | object] = asyncio.Queue(capacity)
         self._close_wire = close_wire
+        self._on_push = on_push
         self._closed = False
         self._wire_closed = False
         self._close_lock = asyncio.Lock()
@@ -279,6 +281,8 @@ class AsyncSubscription(AsyncIterator[T], Generic[T]):
     def push(self, item: T) -> bool:
         if self._closed:
             return False
+        if self._on_push is not None:
+            self._on_push(item)
         try:
             self._queue.put_nowait(item)
             return True  # noqa: TRY300
