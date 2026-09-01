@@ -38,7 +38,12 @@ class SubscriptionRegistry(Generic[T]):
         self._cleanup_tasks: set[asyncio.Task[None]] = set()
         self._pending_notifications: deque[tuple[int, T]] = deque(maxlen=capacity)
 
-    async def subscribe(self, registration: str) -> AsyncSubscription[T]:
+    async def subscribe(
+        self,
+        registration: str,
+        *,
+        on_push: Callable[[T], None] | None = None,
+    ) -> AsyncSubscription[T]:
         async with self._lock:
             state = self._by_registration.get(registration)
             if state is None:
@@ -87,7 +92,7 @@ class SubscriptionRegistry(Generic[T]):
                         self._by_registration.pop(registration, None)
                         self._by_id.pop(current.sub_id, None)
 
-        subscription = AsyncSubscription[T](registration, self._capacity, close)
+        subscription = AsyncSubscription[T](registration, self._capacity, close, on_push)
         state.consumers.add(subscription)
         self._flush_pending(state)
         return subscription

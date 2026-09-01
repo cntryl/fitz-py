@@ -9,7 +9,16 @@ from fitz_py.domains.kv import (
     KVScanPage,
     KVTransaction,
 )
-from fitz_py.domains.lease import Lease, LeaseClient, LeaseInfo, ManagedLease
+from fitz_py.domains.lease import (
+    Lease,
+    LeaseClient,
+    LeaseInfo,
+    LeaseInventoryObserver,
+    LeaseListCursor,
+    LeaseListItem,
+    LeaseListPage,
+    ManagedLease,
+)
 from fitz_py.domains.notice import Notice, NoticeClient
 from fitz_py.domains.queue import Availability, QueueClient, QueueItem
 from fitz_py.domains.rpc import (
@@ -58,6 +67,10 @@ __all__ = [
     "Lease",
     "LeaseClient",
     "LeaseInfo",
+    "LeaseInventoryObserver",
+    "LeaseListCursor",
+    "LeaseListItem",
+    "LeaseListPage",
     "ManagedLease",
     "Notice",
     "NoticeClient",
