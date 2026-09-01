@@ -481,6 +481,14 @@ class LeaseInventoryObserver:
                 # implementations that terminate by raising directly too.
                 if self._subscription_ready.is_set():
                     self._note_subscription_failure(error)
+            else:
+                # SubscriptionRegistry.terminate() finishes consumers
+                # cleanly when the client is permanently closed. There is no
+                # usable connection to recover through in that case, so stop
+                # instead of retrying SUBSCRIBE forever and logging noise.
+                self._subscription_ready.clear()
+                self._ready.clear()
+                return
 
             if self._closed:
                 return

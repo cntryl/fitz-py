@@ -444,6 +444,30 @@ async def test_observer_recovers_subscription_after_backpressure_and_transient_r
 
 
 @pytest.mark.asyncio
+async def test_observer_stops_recovery_after_clean_subscription_termination() -> None:
+    """A permanent client close finishes subscriptions cleanly; the observer
+    must invalidate readiness without retrying SUBSCRIBE forever.
+    """
+    connection = ObserverConnection()
+    connection.queue(MSG_LEASE_SUBSCRIBE, _subscribe_response(1))
+    connection.queue(MSG_LEASE_LIST, _list_response(items=[]))
+    _allow_unsubscribe(connection)
+
+    client = LeaseClient(connection)
+    observer = await client.observe("lease://acme/renderers/*", reconcile_interval=1000.0)
+    try:
+        await _wait_until(lambda: observer.ready)
+
+        client._subscriptions.terminate()
+
+        await _wait_until(lambda: not observer.ready)
+        await asyncio.sleep(0)
+        assert connection.sent.count(MSG_LEASE_SUBSCRIBE) == 1
+    finally:
+        await observer.close()
+
+
+@pytest.mark.asyncio
 async def test_observer_changes_queue_is_bounded_when_never_drained() -> None:
     """`changes()` is optional - a caller reading only `view` must never
     leak memory, so the internal queue backing `changes()` is bounded and
