@@ -178,7 +178,11 @@ class LeaseInventoryObserver:
     acquisition time, or renewal count, so it cannot safely rebuild an
     observed item. A jittered periodic reconciliation
     (``reconcile_interval`` seconds, default 60s, ±20% jitter by default) is
-    a backstop against a missed or dropped notification.
+    a backstop against a missed or dropped notification. For a known
+    workload, use ``clamp(shortest expected lease TTL / 2, 5s, 60s)``. This
+    targets two backstop passes during the shortest lease
+    lifetime without polling faster than one bounded full LIST every five
+    seconds per observer.
 
     Reconnect: Lease subscriptions and state do not survive a broker-side
     disconnect, so a reconnect clears readiness and re-runs the full
