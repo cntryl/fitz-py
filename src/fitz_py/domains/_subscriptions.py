@@ -43,6 +43,7 @@ class SubscriptionRegistry(Generic[T]):
         registration: str,
         *,
         on_push: Callable[[T], None] | None = None,
+        on_failure: Callable[[BaseException], None] | None = None,
     ) -> AsyncSubscription[T]:
         async with self._lock:
             state = self._by_registration.get(registration)
@@ -92,7 +93,13 @@ class SubscriptionRegistry(Generic[T]):
                         self._by_registration.pop(registration, None)
                         self._by_id.pop(current.sub_id, None)
 
-        subscription = AsyncSubscription[T](registration, self._capacity, close, on_push)
+        subscription = AsyncSubscription[T](
+            registration,
+            self._capacity,
+            close,
+            on_push,
+            on_failure,
+        )
         state.consumers.add(subscription)
         self._flush_pending(state)
         return subscription
