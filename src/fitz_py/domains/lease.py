@@ -184,13 +184,35 @@ class LeaseInventoryObserver:
     disconnect, so a reconnect clears readiness and re-runs the full
     bootstrap from scratch.
 
+    Convergence backoff: if a bootstrap ``LIST`` pass keeps racing fresh
+    notifications (e.g. continuous churn on a hot selector), each retry
+    waits a bounded, jittered exponential backoff (50ms-2s, using the same
+    ``sleep``/``random_func`` as periodic reconciliation) before the next
+    full-relist attempt, rather than hammering the broker back-to-back.
+
+    Degraded state: if a background task (the notification consumer, the
+    bootstrap loop, or the periodic reconciler) ever fails permanently, the
+    failure is logged via the connection's observability hooks
+    (``Connection.report_restore_failure``, the same convention Notice/RPC
+    use for background-task failures) and recorded on ``error``/``degraded``
+    for callers to detect - the observer does not silently degrade to
+    poll-only with no visible signal.
+
     ``view`` returns the current snapshot, ``ready`` reports whether the
     first bootstrap has completed, ``changes()`` is an async-iterator change
     stream (``str`` for a single route, ``None`` when the whole view was
     replaced by a relist), and ``close()`` / ``async with`` stop the
     observer's background task and unsubscribe. ``changes()`` shares one
-    internal queue, so only one concurrent consumer is supported.
+    internal queue, so only one concurrent consumer is supported. That queue
+    is bounded (``changes_maxsize``, default 256): once full, the oldest
+    pending entry is dropped to make room for the newest one, since ``view``
+    is always the authoritative current state and a caller that only polls
+    ``view`` (never draining ``changes()``) must not leak memory for the
+    observer's lifetime.
     """
+
+    _BOOTSTRAP_BACKOFF_BASE = 0.05
+    _BOOTSTRAP_BACKOFF_MAX = 2.0
 
     def __init__(
         self,
@@ -201,6 +223,7 @@ class LeaseInventoryObserver:
         jitter: float = 0.2,
         sleep: Callable[[float], Awaitable[None]] | None = None,
         random_func: Callable[[], float] = random.random,
+        changes_maxsize: int = 256,
     ) -> None:
         self._client = client
         self._pattern = pattern
@@ -217,10 +240,13 @@ class LeaseInventoryObserver:
         self._lock = asyncio.Lock()
         self._invalidate = asyncio.Event()
         self._invalidate.set()
-        self._changes: asyncio.Queue[object] = asyncio.Queue()
+        self._changes: asyncio.Queue[object] = asyncio.Queue(maxsize=max(1, changes_maxsize))
         self._subscription: LazyAsyncIterator[str] | None = None
+        self._subscription_ready = asyncio.Event()
+        self._subscription_generation = 0
         self._unregister_reconnect: Callable[[], None] | None = None
         self._tasks: set[asyncio.Task[None]] = set()
+        self._error: BaseException | None = None
 
     @property
     def ready(self) -> bool:
@@ -229,6 +255,21 @@ class LeaseInventoryObserver:
     @property
     def view(self) -> dict[str, LeaseListItem]:
         return dict(self._view)
+
+    @property
+    def error(self) -> BaseException | None:
+        """The first fatal error from a background task, if any (see `degraded`)."""
+        return self._error
+
+    @property
+    def degraded(self) -> bool:
+        """Whether a background task has permanently failed.
+
+        When true, this observer has stopped reacting to notifications
+        and/or reconciling and will not recover on its own; `error` holds
+        the cause. Close and re-`observe()` to recover.
+        """
+        return self._error is not None
 
     async def wait_ready(self) -> None:
         await self._ready.wait()
@@ -260,18 +301,21 @@ class LeaseInventoryObserver:
             await asyncio.gather(*tasks, return_exceptions=True)
         if self._subscription is not None:
             await self._subscription.aclose()
-        self._changes.put_nowait(_CHANGE_CLOSED)
+        self._enqueue_change(_CHANGE_CLOSED)
 
     async def _start(self) -> None:
         subscription = self._client._subscribe_observer(  # noqa: SLF001
             self._pattern,
             self._note_notification,
+            self._note_subscription_failure,
         )
         self._subscription = subscription
         # Step 1: establish the subscription and wait for its ack before any
         # LIST traffic - the subsequent bootstrap task relies on the wire
         # subscription (and thus buffering) already being live.
         await subscription.__aenter__()
+        self._subscription_generation += 1
+        self._subscription_ready.set()
         self._unregister_reconnect = self._client.connection.on_reconnect(
             self._handle_reconnect,
             domain="lease",
@@ -288,8 +332,17 @@ class LeaseInventoryObserver:
 
     def _task_done(self, task: asyncio.Task[None]) -> None:
         self._tasks.discard(task)
-        if not task.cancelled():
-            task.exception()
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        # A background task (consume/bootstrap/reconcile) failed permanently
+        # - surface it rather than letting the observer silently degrade to
+        # poll-only with no visible signal (issue #219 §5 follow-up).
+        if self._error is None:
+            self._error = exc
+        self._client.connection.report_restore_failure("lease", f"observer:{id(self)}", exc)
 
     def _note_notification(self, _route: str) -> None:
         """Record invalidation synchronously before queue-based dispatch."""
@@ -298,20 +351,60 @@ class LeaseInventoryObserver:
             self._ready.clear()
             self._invalidate.set()
 
+    def _note_subscription_failure(self, error: BaseException) -> None:
+        """Synchronously invalidate a view whose wire subscription failed."""
+        self._subscription_generation += 1
+        self._subscription_ready.clear()
+        self._ready.clear()
+        self._mode = "buffering"
+        self._buffer.clear()
+        self._invalidate.set()
+        self._client.connection.report_restore_failure(
+            "lease",
+            f"observer:{id(self)}",
+            error,
+        )
+
     async def _handle_reconnect(self) -> None:
         self._ready.clear()
         async with self._lock:
             self._mode = "buffering"
             self._buffer.clear()
+            # A LIST already in flight must not install a view assembled
+            # across a broker generation boundary, even when no notification
+            # happens to arrive during that pass.
+            self._subscription_generation += 1
         self._invalidate.set()
 
     async def _bootstrap_loop(self) -> None:
+        attempt = 0
         while True:
             await self._invalidate.wait()
             if self._closed:
                 return
             self._invalidate.clear()
-            await self._bootstrap()
+            await self._subscription_ready.wait()
+            # A replacement subscription sets `_invalidate` while this loop
+            # may already be waiting on `_subscription_ready`. The LIST below
+            # covers every change before it starts, so consume that coalesced
+            # wake-up now instead of immediately issuing a redundant second
+            # LIST after the recovery pass.
+            self._invalidate.clear()
+            try:
+                await self._bootstrap()
+                attempt = 0
+            except asyncio.CancelledError:
+                raise
+            except BaseException as error:  # noqa: BLE001 - retry transient LIST failures
+                self._ready.clear()
+                self._client.connection.report_restore_failure(
+                    "lease",
+                    f"observer:{id(self)}",
+                    error,
+                )
+                attempt += 1
+                await self._sleep(self._bootstrap_backoff(attempt))
+                self._invalidate.set()
 
     async def _bootstrap(self) -> None:
         # Steps 2-3: buffer notifications while a full LIST scan builds the
@@ -319,33 +412,105 @@ class LeaseInventoryObserver:
         async with self._lock:
             self._mode = "buffering"
             self._buffer.clear()
+        attempt = 0
         while True:
+            await self._subscription_ready.wait()
+            subscription_generation = self._subscription_generation
             start_generation = self._notification_generation
             view = await self._full_list()
             async with self._lock:
-                if self._buffer or self._notification_generation != start_generation:
+                raced = (
+                    bool(self._buffer)
+                    or self._notification_generation != start_generation
+                    or not self._subscription_ready.is_set()
+                    or self._subscription_generation != subscription_generation
+                )
+                if raced:
                     # An invalidation raced this complete pass. Stay in
                     # buffering mode and repeat; never expose this pass as a
                     # ready view in between.
                     self._buffer.clear()
-                    continue
-                self._view = view
-                self._mode = "steady"
-                self._buffer.clear()
-                self._ready.set()
+                else:
+                    self._view = view
+                    self._mode = "steady"
+                    self._buffer.clear()
+                    self._ready.set()
+            if raced:
+                # Under continuous churn on a hot selector, retrying with no
+                # delay would hammer the broker with back-to-back full LISTs
+                # and never converge. Back off (bounded, jittered) between
+                # attempts instead.
+                attempt += 1
+                await self._sleep(self._bootstrap_backoff(attempt))
+                continue
             self._emit(None)
             return
 
+    def _bootstrap_backoff(self, attempt: int) -> float:
+        cap = min(
+            self._BOOTSTRAP_BACKOFF_MAX,
+            self._BOOTSTRAP_BACKOFF_BASE * (2 ** min(attempt, 10)),
+        )
+        # Equal jitter keeps every retry at or above the documented 50ms
+        # floor while still spreading a fleet across the upper half of the
+        # current exponential window.
+        return max(self._BOOTSTRAP_BACKOFF_BASE, cap * (0.5 + (self._random() * 0.5)))
+
     async def _consume(self) -> None:
-        assert self._subscription is not None  # noqa: S101
-        async for route in self._subscription:
-            async with self._lock:
-                buffering = self._mode == "buffering"
-                if buffering:
-                    self._buffer.append(route)
-            if not buffering:
-                self._ready.clear()
+        attempt = 0
+        while not self._closed:
+            assert self._subscription is not None  # noqa: S101
+            try:
+                async for route in self._subscription:
+                    async with self._lock:
+                        buffering = self._mode == "buffering"
+                        if buffering:
+                            self._buffer.append(route)
+                    if not buffering:
+                        self._ready.clear()
+                        self._invalidate.set()
+            except asyncio.CancelledError:
+                raise
+            except BaseException as error:  # noqa: BLE001 - subscription failures are recoverable
+                # `AsyncSubscription.fail` already invalidated synchronously
+                # through `_note_subscription_failure`; report failures from
+                # implementations that terminate by raising directly too.
+                if self._subscription_ready.is_set():
+                    self._note_subscription_failure(error)
+
+            if self._closed:
+                return
+
+            old_subscription = self._subscription
+            with contextlib.suppress(Exception):
+                await old_subscription.aclose()
+
+            while not self._closed:
+                try:
+                    replacement = self._client._subscribe_observer(  # noqa: SLF001
+                        self._pattern,
+                        self._note_notification,
+                        self._note_subscription_failure,
+                    )
+                    await replacement.__aenter__()
+                except asyncio.CancelledError:
+                    raise
+                except BaseException as error:  # noqa: BLE001 - retry transient wire failures
+                    self._client.connection.report_restore_failure(
+                        "lease",
+                        f"observer:{id(self)}",
+                        error,
+                    )
+                    attempt += 1
+                    await self._sleep(self._bootstrap_backoff(attempt))
+                    continue
+
+                self._subscription = replacement
+                self._subscription_generation += 1
+                self._subscription_ready.set()
                 self._invalidate.set()
+                attempt = 0
+                break
 
     async def _full_list(self) -> dict[str, LeaseListItem]:
         view: dict[str, LeaseListItem] = {}
@@ -366,7 +531,20 @@ class LeaseInventoryObserver:
             self._invalidate.set()
 
     def _emit(self, route: str | None) -> None:
-        self._changes.put_nowait(route)
+        self._enqueue_change(route)
+
+    def _enqueue_change(self, item: object) -> None:
+        # Bounded, drop-oldest: `view` is always the authoritative current
+        # state, so a caller that never drains `changes()` must not leak
+        # memory for the observer's lifetime (issue #219 §5 follow-up).
+        while True:
+            try:
+                self._changes.put_nowait(item)
+            except asyncio.QueueFull:
+                with contextlib.suppress(asyncio.QueueEmpty):
+                    self._changes.get_nowait()
+            else:
+                return
 
 
 class LeaseClient(DomainClient):
@@ -513,8 +691,15 @@ class LeaseClient(DomainClient):
         self,
         route: str,
         on_push: Callable[[str], None],
+        on_failure: Callable[[BaseException], None],
     ) -> LazyAsyncIterator[str]:
-        return LazyAsyncIterator(lambda: self._subscriptions.subscribe(route, on_push=on_push))
+        return LazyAsyncIterator(
+            lambda: self._subscriptions.subscribe(
+                route,
+                on_push=on_push,
+                on_failure=on_failure,
+            )
+        )
 
     async def list_page(
         self,
@@ -566,6 +751,7 @@ class LeaseClient(DomainClient):
         jitter: float = 0.2,
         sleep: Callable[[float], Awaitable[None]] | None = None,
         random_func: Callable[[], float] = random.random,
+        changes_maxsize: int = 256,
     ) -> LeaseInventoryObserver:
         """Return a started `LeaseInventoryObserver` for `pattern`.
 
@@ -573,6 +759,10 @@ class LeaseClient(DomainClient):
         LIST reconciliation, periodic reconciliation, and reconnect recovery
         described on `LeaseInventoryObserver`, so callers never have to
         hand-roll it (docs/clients/client-requirements.md REQ-API-004C).
+
+        `changes_maxsize` bounds the internal queue backing `changes()`; once
+        full, the oldest pending entry is dropped to make room for the
+        newest (see `LeaseInventoryObserver`'s docstring).
         """
         _pattern(pattern)
         if reconcile_interval <= 0:
@@ -586,6 +776,7 @@ class LeaseClient(DomainClient):
             jitter=jitter,
             sleep=sleep,
             random_func=random_func,
+            changes_maxsize=changes_maxsize,
         )
         await observer._start()  # noqa: SLF001
         return observer

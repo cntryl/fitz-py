@@ -249,11 +249,13 @@ class AsyncSubscription(AsyncIterator[T], Generic[T]):
         capacity: int,
         close_wire: Callable[[], Awaitable[None]],
         on_push: Callable[[T], None] | None = None,
+        on_failure: Callable[[BaseException], None] | None = None,
     ) -> None:
         self.registration = registration
         self._queue: asyncio.Queue[T | BaseException | object] = asyncio.Queue(capacity)
         self._close_wire = close_wire
         self._on_push = on_push
+        self._on_failure = on_failure
         self._closed = False
         self._wire_closed = False
         self._close_lock = asyncio.Lock()
@@ -293,6 +295,8 @@ class AsyncSubscription(AsyncIterator[T], Generic[T]):
     def fail(self, error: BaseException) -> None:
         if self._closed:
             return
+        if self._on_failure is not None:
+            self._on_failure(error)
         self._closed = True
         while not self._queue.empty():
             with contextlib.suppress(asyncio.QueueEmpty):
