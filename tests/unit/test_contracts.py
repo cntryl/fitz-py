@@ -909,3 +909,30 @@ def test_invalid_queue_route_fails_before_io() -> None:
     connection = FakeConnection()
     with pytest.raises(QueueError):
         asyncio.run(QueueClient(connection).enqueue("queue://bad", b"x"))
+
+
+@pytest.mark.parametrize("operation", ["append", "commit"])
+@pytest.mark.parametrize(
+    ("code", "message"),
+    [(2001, "unrelated wording"), (2002, "concurrency conflict"), (2012, "backend unavailable")],
+)
+async def test_stream_session_preserves_versioned_error_code(
+    operation: str, code: int, message: str
+) -> None:
+    writer = BufferWriter()
+    writer.write_u8(2)
+    writer.write_u32_be(code)
+    writer.write_string(message)
+    connection = FakeConnection(
+        {MSG_STREAM_APPEND: writer.build(), MSG_STREAM_COMMIT: writer.build()}
+    )
+    session = StreamSession(connection, 7)
+
+    with pytest.raises(StreamError) as raised:
+        if operation == "append":
+            await session.append(0, b"event")
+        else:
+            await session.commit()
+
+    assert raised.value.domain_code == code
+    assert message in str(raised.value)

@@ -26,7 +26,7 @@ from fitz_py.protocol.messages import (
     MSG_STREAM_SUBSCRIBE,
     MSG_STREAM_UNSUBSCRIBE,
 )
-from fitz_py.protocol.response import parse_response
+from fitz_py.protocol.response import parse_stream_response as parse_response
 from fitz_py.types import BytesLike
 
 
@@ -209,7 +209,7 @@ class StreamSession:
             await self._connection.request(MSG_STREAM_APPEND, writer.build()), plain=True
         )
         if not response.success:
-            raise StreamError(f"APPEND failed: {response.error}", "APPEND")
+            raise StreamError(f"APPEND failed: {response.error}", "APPEND", response.error_code)
         if not response.data:
             return None
         reader = BufferReader(response.data)
@@ -241,7 +241,9 @@ class StreamSession:
     async def _expect_status(self, message_type: int, payload: bytes, operation: str) -> None:
         response = parse_response(await self._connection.request(message_type, payload), plain=True)
         if not response.success:
-            raise StreamError(f"{operation} failed: {response.error}", operation)
+            raise StreamError(
+                f"{operation} failed: {response.error}", operation, response.error_code
+            )
         if message_type == MSG_STREAM_COMMIT:
             reader = BufferReader(response.data)
             reader.read_bytes(reader.read_u32_be())
@@ -312,7 +314,7 @@ class StreamClient(DomainClient):
             await self.request_frame(MSG_STREAM_BEGIN, writer.build()), plain=True
         )
         if not response.success:
-            raise StreamError(f"BEGIN failed: {response.error}", "BEGIN")
+            raise StreamError(f"BEGIN failed: {response.error}", "BEGIN", response.error_code)
         reader = BufferReader(response.data)
         if reader.remaining_bytes() < 12:
             raise StreamError("BEGIN response missing session id", "MISSING_SESSION_ID")
@@ -393,7 +395,7 @@ class StreamClient(DomainClient):
             await self.request_frame(MSG_STREAM_LAST, writer.build()), plain=True
         )
         if not response.success:
-            raise StreamError(f"LAST failed: {response.error}", "LAST")
+            raise StreamError(f"LAST failed: {response.error}", "LAST", response.error_code)
         if not response.data:
             return None
         inner = BufferReader(response.data)
@@ -410,7 +412,7 @@ class StreamClient(DomainClient):
             await self.request_frame(MSG_STREAM_GET_METADATA, writer.build()), plain=True
         )
         if not response.success:
-            raise StreamError(f"METADATA failed: {response.error}", "METADATA")
+            raise StreamError(f"METADATA failed: {response.error}", "METADATA", response.error_code)
         if not response.data:
             return StreamMetadata(first_offset=0, last_offset=0, record_count=0)
         inner = BufferReader(response.data)
@@ -439,7 +441,9 @@ class StreamClient(DomainClient):
             await self.request_frame(MSG_STREAM_SUBSCRIBE, writer.build()), plain=True
         )
         if not response.success:
-            raise StreamError(f"SUBSCRIBE failed: {response.error}", "SUBSCRIBE")
+            raise StreamError(
+                f"SUBSCRIBE failed: {response.error}", "SUBSCRIBE", response.error_code
+            )
         reader = BufferReader(response.data)
         has_sub_id = reader.read_u8()
         if has_sub_id != 1 or reader.is_eof():
@@ -456,7 +460,9 @@ class StreamClient(DomainClient):
             await self.request_frame(MSG_STREAM_UNSUBSCRIBE, writer.build()), plain=True
         )
         if not response.success:
-            raise StreamError(f"UNSUBSCRIBE failed: {response.error}", "UNSUBSCRIBE")
+            raise StreamError(
+                f"UNSUBSCRIBE failed: {response.error}", "UNSUBSCRIBE", response.error_code
+            )
         if response.data:
             raise StreamError("UNSUBSCRIBE response has trailing bytes", "INVALID_RESPONSE")
 
