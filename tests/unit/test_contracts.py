@@ -254,6 +254,63 @@ async def test_multiplexer_disconnect_fails_waiters() -> None:
         await task
 
 
+@pytest.mark.asyncio
+async def test_multiplexer_correlates_out_of_order_same_type_responses() -> None:
+    mux = Multiplexer()
+    mux.set_connected()
+    mux.set_capabilities(1, 1)
+    sent: list[bytes] = []
+
+    async def send(frame: bytes) -> None:
+        sent.append(frame)
+
+    first = asyncio.create_task(mux.request(202, b"first", send, 1))
+    second = asyncio.create_task(mux.request(202, b"second", send, 1))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert sent[0].startswith(b"\x02\x00\x08" + (1).to_bytes(8, "big"))
+    assert sent[1].startswith(b"\x02\x00\x08" + (2).to_bytes(8, "big"))
+    mux.dispatch_correlated(2, 202, b"second-response")
+    mux.dispatch_correlated(1, 202, b"first-response")
+
+    assert await first == b"first-response"
+    assert await second == b"second-response"
+
+
+@pytest.mark.asyncio
+async def test_multiplexer_serializes_legacy_same_type_requests() -> None:
+    mux = Multiplexer()
+    mux.set_connected()
+    sent: list[bytes] = []
+
+    async def send(frame: bytes) -> None:
+        sent.append(frame)
+
+    first = asyncio.create_task(mux.request(202, b"first", send, 1))
+    second = asyncio.create_task(mux.request(202, b"second", send, 1))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert sent == [b"first"]
+    mux.dispatch(202, b"first-response")
+    assert await first == b"first-response"
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert sent == [b"first", b"second"]
+    mux.dispatch(202, b"second-response")
+    assert await second == b"second-response"
+
+
+def test_unknown_correlation_falls_through_to_push_handler() -> None:
+    mux = Multiplexer()
+    received: list[bytes] = []
+    mux.register_notification_handler(400, received.append)
+
+    mux.dispatch_correlated(99, 400, b"later-grant")
+
+    assert received == [b"later-grant"]
+
+
 def test_multiplexer_reports_push_decoder_failures() -> None:
     failures: list[BaseException] = []
     mux = Multiplexer(failures.append)
