@@ -1020,6 +1020,25 @@ async def test_cs015_shutdown_during_active_work() -> None:
     assert r.verdict == "pass"
 
 
+@pytest.mark.asyncio
+async def test_cs019_same_type_requests_are_correlated_out_of_order() -> None:
+    client = await _new_client(timeout_ms=10000)
+    assert client.correlation_enabled
+    assert (client.protocol_version, client.capabilities) == (1, 1)
+    parked_route = _unique_route("queue")
+    ready_route = _unique_route("queue")
+    await client.queue.enqueue(ready_route, b"second")
+
+    parked = asyncio.create_task(client.queue.reserve(parked_route, lease=30, wait=5))
+    await asyncio.sleep(0.1)
+    second = await asyncio.wait_for(client.queue.reserve(ready_route, lease=30, wait=0), timeout=2)
+    assert second[0].body == b"second"
+    await client.queue.enqueue(parked_route, b"first")
+    first = await asyncio.wait_for(parked, timeout=5)
+    assert first[0].body == b"first"
+    await client.aclose()
+
+
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------

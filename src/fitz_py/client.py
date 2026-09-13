@@ -138,6 +138,18 @@ class Client:
         return self._connection.is_connected()
 
     @property
+    def protocol_version(self) -> int:
+        return self._connection.protocol_version
+
+    @property
+    def capabilities(self) -> int:
+        return self._connection.capabilities
+
+    @property
+    def correlation_enabled(self) -> bool:
+        return self._connection.correlation_enabled
+
+    @property
     def url(self) -> str:
         return self.config.url
 

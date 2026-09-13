@@ -21,7 +21,7 @@ from fitz_py.errors import (
 )
 from fitz_py.multiplexer import Multiplexer
 from fitz_py.protocol.frame import FrameCodec, FrameParser
-from fitz_py.protocol.messages import MSG_CONNECT
+from fitz_py.protocol.messages import MSG_CONNECT, MSG_CORRELATED, MSG_SERVER_HELLO
 from fitz_py.transport.base import Transport
 from fitz_py.types import ClientConfig, ConnectionState, LifecycleEvent
 
@@ -74,6 +74,18 @@ class Connection:
     @property
     def config(self) -> ClientConfig:
         return self._config
+
+    @property
+    def protocol_version(self) -> int:
+        return self._multiplexer.protocol_version
+
+    @property
+    def capabilities(self) -> int:
+        return self._multiplexer.capabilities
+
+    @property
+    def correlation_enabled(self) -> bool:
+        return self._multiplexer.correlation_enabled
 
     async def connect(self) -> None:
         if self._closed:
@@ -354,8 +366,7 @@ class Connection:
                 if self._closed or self._transport is not transport:
                     return
                 self._last_activity = time.monotonic()
-                for frame in parser.parse_frames(data):
-                    self._multiplexer.dispatch(frame.message_type, frame.payload)
+                self._dispatch_transport_frame(data, parser)
         except asyncio.CancelledError:
             return
         except BaseException as exc:  # noqa: BLE001
@@ -365,6 +376,35 @@ class Connection:
                 return
             if not self._closed and self._transport is transport:
                 await self._connection_lost(exc)
+
+    def _dispatch_transport_frame(self, data: bytes, parser: FrameParser) -> None:
+        pending_correlation: int | None = None
+        for frame in parser.parse_frames(data):
+            if frame.message_type == MSG_SERVER_HELLO:
+                if pending_correlation is not None:
+                    raise FitzConnectionError("CORRELATED record cannot label SERVER_HELLO")
+                if len(frame.payload) >= 6:
+                    self._multiplexer.set_capabilities(
+                        int.from_bytes(frame.payload[:2], "big"),
+                        int.from_bytes(frame.payload[2:6], "big"),
+                    )
+                continue
+            if frame.message_type == MSG_CORRELATED:
+                if len(frame.payload) != 8 or pending_correlation is not None:
+                    raise FitzConnectionError("Malformed CORRELATED record")
+                pending_correlation = int.from_bytes(frame.payload, "big")
+                if pending_correlation == 0:
+                    raise FitzConnectionError("Zero CORRELATED identifier")
+                continue
+            if pending_correlation is None:
+                self._multiplexer.dispatch(frame.message_type, frame.payload)
+            else:
+                self._multiplexer.dispatch_correlated(
+                    pending_correlation, frame.message_type, frame.payload
+                )
+                pending_correlation = None
+        if pending_correlation is not None:
+            raise FitzConnectionError("CORRELATED record did not label a response")
 
     async def _connection_lost(self, cause: BaseException) -> None:
         if self._state in {
