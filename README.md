@@ -75,6 +75,16 @@ Schedule backend unavailability and broker saturation use the distinct coded
 error `ERR_SCHEDULE_BACKEND_ERROR` (`7010`). It is retryable subject to the
 operation's replay safety; it is never reported as a cron or parse error.
 
+## Schedule broker extensions
+
+The canonical `schedule.create()` and offset-based `schedule.list_schedules()` remain the
+portable operations. Brokers that expose Schedule 706 and 707 also support
+`schedule.create_batch(entries)` and `schedule.list_v2(cursor=..., limit=...)`.
+`create_batch` accepts `ScheduleEntry` values, including each entry's delivery mode.
+`list_v2` returns a `ScheduleCursorPage` with `entries`, `has_more`, and an opaque
+`continuation` to pass as the next cursor. These methods use the broker extension wire
+formats and report coded broker errors as `ScheduleError` domain codes.
+
 ## Verification
 
 ```bash

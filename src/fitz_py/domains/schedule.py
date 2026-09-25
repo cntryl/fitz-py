@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -15,12 +16,14 @@ from fitz_py.protocol.buffer import BufferReader, BufferWriter
 from fitz_py.protocol.messages import (
     MSG_SCHEDULE_CANCEL,
     MSG_SCHEDULE_CREATE,
+    MSG_SCHEDULE_CREATE_BATCH,
     MSG_SCHEDULE_LIST,
+    MSG_SCHEDULE_LIST_V2,
     MSG_SCHEDULE_NOTIFY,
     MSG_SCHEDULE_SUBSCRIBE,
     MSG_SCHEDULE_UNSUBSCRIBE,
 )
-from fitz_py.protocol.response import parse_response
+from fitz_py.protocol.response import Response, parse_response
 from fitz_py.types import BytesLike
 
 
@@ -45,6 +48,13 @@ class ScheduleEntry:
 class SchedulePage:
     entries: tuple[ScheduleEntry, ...]
     total_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class ScheduleCursorPage:
+    entries: tuple[ScheduleEntry, ...]
+    has_more: bool
+    continuation: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +125,79 @@ class ScheduleClient(DomainClient):
             raise ScheduleError(f"CANCEL failed: {response.error}", "CANCEL")
         if response.data:
             raise ScheduleError("CANCEL response has trailing bytes", "INVALID_RESPONSE")
+
+    async def create_batch(self, entries: Sequence[ScheduleEntry]) -> None:
+        writer = BufferWriter()
+        writer.write_u32_be(len(entries))
+        for entry in entries:
+            _route(entry.route)
+            if not entry.cron:
+                raise ValueError("cron must not be empty")
+            mode = DeliveryMode(entry.delivery_mode)
+            writer.write_route(entry.route)
+            writer.write_string(entry.cron)
+            writer.write_u8(0 if mode is DeliveryMode.BROADCAST else 1)
+            writer.write_u32_be(len(entry.payload))
+            writer.write_bytes(entry.payload)
+        response = _parse_extension_response(
+            await self.request_frame(MSG_SCHEDULE_CREATE_BATCH, writer.build())
+        )
+        if not response.success:
+            raise domain_error(
+                ScheduleError, "CREATE_BATCH", response.error_code or 0, response.error
+            )
+        if response.data:
+            raise ScheduleError("CREATE_BATCH response has trailing bytes", "INVALID_RESPONSE")
+
+    async def list_v2(
+        self, *, cursor: str | None = None, limit: int | None = None
+    ) -> ScheduleCursorPage:
+        if limit is not None and not 0 <= limit <= 1000:
+            raise ValueError("limit must be between 0 and 1000")
+        writer = BufferWriter()
+        writer.write_u8(0 if cursor is None else 1)
+        if cursor is not None:
+            writer.write_string(cursor)
+        writer.write_optional_u64(limit)
+        response = _parse_extension_response(
+            await self.request_frame(MSG_SCHEDULE_LIST_V2, writer.build())
+        )
+        if not response.success:
+            raise domain_error(ScheduleError, "LIST_V2", response.error_code or 0, response.error)
+        reader = BufferReader(response.data)
+        if reader.read_u8() != 1:
+            raise ScheduleError("LIST_V2 response has an invalid version", "INVALID_RESPONSE")
+        has_more_byte = reader.read_u8()
+        if has_more_byte not in {0, 1}:
+            raise ScheduleError("LIST_V2 response has an invalid has_more flag", "INVALID_RESPONSE")
+        marker = reader.read_u8()
+        if marker not in {0, 1}:
+            raise ScheduleError("LIST_V2 response has an invalid cursor flag", "INVALID_RESPONSE")
+        continuation = reader.read_string() if marker else None
+        entries: list[ScheduleEntry] = []
+        while True:
+            marker = reader.read_u8()
+            if marker == 0:
+                break
+            if marker != 1:
+                raise ScheduleError(
+                    "LIST_V2 response has an invalid entry marker", "INVALID_RESPONSE"
+                )
+            route, cron = reader.read_string(), reader.read_string()
+            mode_byte = reader.read_u8()
+            if mode_byte not in {0, 1}:
+                raise ScheduleError("Invalid delivery mode", "INVALID_RESPONSE")
+            entries.append(
+                ScheduleEntry(
+                    route,
+                    cron,
+                    DeliveryMode.BROADCAST if mode_byte == 0 else DeliveryMode.SINGLE,
+                    reader.read_bytes(reader.read_u32_be()),
+                )
+            )
+        if not reader.is_eof():
+            raise ScheduleError("LIST_V2 response has trailing bytes", "INVALID_RESPONSE")
+        return ScheduleCursorPage(tuple(entries), bool(has_more_byte), continuation)
 
     async def list_schedules(
         self, *, offset: int | None = None, limit: int | None = None
@@ -195,6 +278,13 @@ class ScheduleClient(DomainClient):
         if not reader.is_eof():
             raise ScheduleError("SCHEDULE_NOTIFY has trailing bytes", "INVALID_RESPONSE")
         self._subscriptions.publish(sub_id, notification)
+
+
+def _parse_extension_response(payload: bytes) -> Response:
+    if len(payload) >= 5 and payload[0] == 1:
+        plain_length = int.from_bytes(payload[1:5], "big")
+        return parse_response(payload, plain=len(payload) == 5 + plain_length)
+    return parse_response(payload, plain=True)
 
 
 def _route(route: str) -> None:
