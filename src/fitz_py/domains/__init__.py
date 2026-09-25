@@ -33,6 +33,7 @@ from fitz_py.domains.rpc import (
 from fitz_py.domains.schedule import (
     DeliveryMode,
     ScheduleClient,
+    ScheduleCursorPage,
     ScheduleEntry,
     ScheduleNotification,
     SchedulePage,
@@ -82,6 +83,7 @@ __all__ = [
     "ResponseFrame",
     "ResponseWriter",
     "ScheduleClient",
+    "ScheduleCursorPage",
     "ScheduleEntry",
     "ScheduleNotification",
     "SchedulePage",

@@ -14,7 +14,7 @@ from fitz_py.domains.lease import LeaseClient
 from fitz_py.domains.notice import NoticeClient
 from fitz_py.domains.queue import QueueClient
 from fitz_py.domains.rpc import RPCClient
-from fitz_py.domains.schedule import DeliveryMode, ScheduleClient
+from fitz_py.domains.schedule import DeliveryMode, ScheduleClient, ScheduleEntry
 from fitz_py.domains.stream import StreamClient, StreamSession, _assert_stream_pattern
 from fitz_py.errors import (
     ERR_SCHEDULE_BACKEND_ERROR,
@@ -23,6 +23,7 @@ from fitz_py.errors import (
     FitzTransportError,
     KVError,
     LeaseError,
+    NoticeError,
     QueueError,
     RequestQueueFullError,
     RPCError,
@@ -55,7 +56,9 @@ from fitz_py.protocol.messages import (
     MSG_RPC_SUBSCRIBE_WORKER,
     MSG_SCHEDULE_CANCEL,
     MSG_SCHEDULE_CREATE,
+    MSG_SCHEDULE_CREATE_BATCH,
     MSG_SCHEDULE_LIST,
+    MSG_SCHEDULE_LIST_V2,
     MSG_SCHEDULE_NOTIFY,
     MSG_SCHEDULE_SUBSCRIBE,
     MSG_SCHEDULE_UNSUBSCRIBE,
@@ -80,6 +83,96 @@ def test_schedule_backend_error_code_is_distinct_and_retryable() -> None:
 
     assert ERR_SCHEDULE_BACKEND_ERROR == 7010
     assert is_retryable(error)
+
+
+@pytest.mark.parametrize(
+    ("error_type", "code", "expected"),
+    [
+        (KVError, 1014, True),
+        (StreamError, 2014, True),
+        (NoticeError, 3006, True),
+        (LeaseError, 5007, True),
+        (KVError, 1009, False),
+        (LeaseError, 5006, False),
+        (KVError, 1011, False),
+    ],
+)
+def test_retryability_matches_server_domain_codes(error_type, code, expected) -> None:
+    assert is_retryable(error_type("server error", "SERVER", code)) is expected
+
+
+async def test_schedule_create_batch_encodes_each_definition() -> None:
+    connection = FakeConnection({706: b"\x00"})
+    entries = (
+        ScheduleEntry("schedule://r/a/jobs/one", "* * * * *", DeliveryMode.BROADCAST, b"one"),
+        ScheduleEntry("schedule://r/a/jobs/two", "0 * * * *", DeliveryMode.SINGLE, b"two"),
+    )
+
+    await ScheduleClient(connection).create_batch(entries)
+
+    message_type, payload = connection.sent[0]
+    assert message_type == MSG_SCHEDULE_CREATE_BATCH
+    reader = BufferReader(payload)
+    assert reader.read_u32_be() == 2
+    for entry in entries:
+        assert reader.read_route() == entry.route
+        assert reader.read_string() == entry.cron
+        assert reader.read_u8() == (0 if entry.delivery_mode is DeliveryMode.BROADCAST else 1)
+        assert reader.read_bytes(reader.read_u32_be()) == entry.payload
+    assert reader.is_eof()
+
+
+async def test_schedule_list_v2_decodes_cursor_page() -> None:
+    response = BufferWriter()
+    response.write_u8(0)
+    response.write_u8(1)
+    response.write_u8(1)
+    response.write_u8(1)
+    response.write_string("next-cursor")
+    response.write_u8(1)
+    response.write_route("schedule://r/a/jobs/one")
+    response.write_string("* * * * *")
+    response.write_u8(0)
+    response.write_u32_be(3)
+    response.write_bytes(b"one")
+    response.write_u8(0)
+    connection = FakeConnection({707: response.build()})
+
+    page = await ScheduleClient(connection).list_v2(cursor="prior-cursor", limit=5)
+
+    message_type, payload = connection.sent[0]
+    assert message_type == MSG_SCHEDULE_LIST_V2
+    reader = BufferReader(payload)
+    assert reader.read_u8() == 1
+    assert reader.read_string() == "prior-cursor"
+    assert reader.read_optional_u64() == 5
+    assert reader.is_eof()
+    assert page.has_more is True
+    assert page.continuation == "next-cursor"
+    assert page.entries[0].route == "schedule://r/a/jobs/one"
+    assert page.entries[0].payload == b"one"
+
+
+@pytest.mark.parametrize("message_type", [MSG_SCHEDULE_CREATE_BATCH, MSG_SCHEDULE_LIST_V2])
+@pytest.mark.parametrize("coded", [False, True])
+async def test_schedule_extensions_decode_domain_and_broker_errors(
+    message_type: int, coded: bool
+) -> None:
+    failure = BufferWriter()
+    failure.write_u8(1)
+    if coded:
+        failure.write_u32_be(7010)
+    failure.write_string("busy")
+    connection = FakeConnection({message_type: failure.build()})
+    schedule = ScheduleClient(connection)
+
+    with pytest.raises(ScheduleError) as raised:
+        if message_type == MSG_SCHEDULE_CREATE_BATCH:
+            await schedule.create_batch(())
+        else:
+            await schedule.list_v2()
+
+    assert raised.value.domain_code == (7010 if coded else 0)
 
 
 class FakeConnection:

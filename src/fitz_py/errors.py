@@ -142,10 +142,11 @@ ERR_SCHEDULE_BACKEND_ERROR = 7010
 
 _RETRYABLE = {
     ("KV", 1004),
-    ("KV", 1009),
+    ("KV", 1014),
+    ("STREAM", 2014),
+    ("NOTICE", 3006),
     ("QUEUE", 4005),
     ("LEASE", 5001),
-    ("LEASE", 5006),
     ("LEASE", 5007),
     ("RPC", 6001),
     ("RPC", 6002),
