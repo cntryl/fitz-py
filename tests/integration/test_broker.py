@@ -4,7 +4,14 @@ import asyncio
 
 import pytest
 
-from fitz_py import DeliveryMode, InboundRequest, KVDurability, ResponseWriter, RPCError
+from fitz_py import (
+    DeliveryMode,
+    InboundRequest,
+    KVDurability,
+    ResponseWriter,
+    RPCError,
+    ScheduleEntry,
+)
 from tests.integration.fixture.fixture import IntegrationFixture, unique_route
 
 
@@ -98,4 +105,34 @@ async def test_lease_notice_stream_rpc_and_schedule_workflows(transport: str) ->
             pass
         await client.schedule.cancel(schedule_route)
     finally:
+        await fixture.aclose()
+
+
+@pytest.mark.parametrize("transport", ["tcp", "ws"])
+@pytest.mark.asyncio
+async def test_schedule_batch_and_cursor_extensions(transport: str) -> None:
+    fixture = await IntegrationFixture.connect_or_fail(transport, "anonymous")
+    schedule = fixture.client.schedule
+    route = unique_route("schedule")
+    routes = (route, f"{route}-second")
+    try:
+        await schedule.create_batch(
+            tuple(
+                ScheduleEntry(item, "0 0 * * *", DeliveryMode.BROADCAST, b"batch")
+                for item in routes
+            )
+        )
+        seen: set[str] = set()
+        cursor = None
+        while True:
+            page = await schedule.list_v2(cursor=cursor, limit=1)
+            seen.update(entry.route for entry in page.entries)
+            if not page.has_more:
+                break
+            assert page.continuation is not None
+            cursor = page.continuation
+        assert set(routes) <= seen
+    finally:
+        for item in routes:
+            await schedule.cancel(item)
         await fixture.aclose()
