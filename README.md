@@ -24,7 +24,8 @@ async with Client(
 ```
 
 `service_name` is optional. New brokers record it on the active session after
-advertising the `SESSION_METADATA` capability; older brokers receive no metadata frame.
+advertising the `SESSION_METADATA` capability; surrounding whitespace is trimmed before it is
+reported, and older brokers receive no metadata frame.
 
 `Client.aclose()` is permanent and idempotent. Reconnect is enabled by default after the first
 successful authentication; an authentication rejection permanently closes the client. Configure

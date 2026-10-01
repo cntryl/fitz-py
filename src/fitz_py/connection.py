@@ -401,7 +401,7 @@ class Connection:
                         and self._multiplexer.capabilities & CAP_SESSION_METADATA
                         and not self._service_name_sent
                     ):
-                        encoded = self._config.service_name.encode("utf-8")
+                        encoded = self._config.service_name.strip().encode("utf-8")
                         payload = len(encoded).to_bytes(4, "big") + encoded
                         await self._send_frame(
                             FrameCodec.encode_frame(MSG_SESSION_METADATA, payload)

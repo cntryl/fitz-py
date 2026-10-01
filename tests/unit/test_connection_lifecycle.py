@@ -128,6 +128,29 @@ async def test_connection_reports_service_name_only_after_metadata_capability() 
 
 
 @pytest.mark.asyncio
+async def test_connection_trims_service_name_before_utf8_limit_and_encoding() -> None:
+    service_name = "é" * 64
+    transport = FakeTransport()
+    connection = Connection(
+        lambda: transport,
+        config(service_name=f" {service_name} "),
+    )
+
+    await connection.connect()
+    transport.send_event.clear()
+    hello = (1).to_bytes(2, "big") + CAP_SESSION_METADATA.to_bytes(4, "big")
+    await transport.inbound.put(FrameCodec.encode_frame(MSG_SERVER_HELLO, hello))
+    async with asyncio.timeout(1):
+        await transport.send_event.wait()
+
+    metadata = FrameCodec.decode_frame(transport.sent[1])
+    assert metadata.message_type == MSG_SESSION_METADATA
+    encoded_name = service_name.encode("utf-8")
+    assert metadata.payload == len(encoded_name).to_bytes(4, "big") + encoded_name
+    await connection.close()
+
+
+@pytest.mark.asyncio
 async def test_connection_omits_service_name_when_metadata_capability_is_missing() -> None:
     transport = FakeTransport()
     connection = Connection(
