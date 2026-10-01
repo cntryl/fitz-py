@@ -9,7 +9,7 @@ import pytest
 
 import fitz_py
 from fitz_py._runtime import AsyncSubscription, RequestGate
-from fitz_py.domains.kv import KVTransaction
+from fitz_py.domains.kv import CAP_KV_SCAN_EXCLUSIVE, KVTransaction
 from fitz_py.domains.lease import LeaseClient
 from fitz_py.domains.notice import NoticeClient
 from fitz_py.domains.queue import QueueClient
@@ -95,6 +95,7 @@ def test_schedule_backend_error_code_is_distinct_and_retryable() -> None:
         (KVError, 1009, False),
         (LeaseError, 5006, False),
         (KVError, 1011, False),
+        (RPCError, 6010, False),
     ],
 )
 def test_retryability_matches_server_domain_codes(error_type, code, expected) -> None:
@@ -176,10 +177,16 @@ async def test_schedule_extensions_decode_domain_and_broker_errors(
 
 
 class FakeConnection:
-    def __init__(self, responses: dict[int, bytes] | None = None) -> None:
+    def __init__(
+        self,
+        responses: dict[int, bytes | list[bytes]] | None = None,
+        *,
+        capabilities: int = 0,
+    ) -> None:
         self.config = ClientConfig(url="tcp://localhost:1")
         self.generation = 1
         self.responses = responses or {}
+        self.capabilities = capabilities
         self.sent: list[tuple[int, bytes]] = []
         self.notifications = {}
         self.request_started = asyncio.Event()
@@ -190,7 +197,8 @@ class FakeConnection:
         self.request_started.set()
         if len(self.sent) >= 2:
             self.two_requests.set()
-        return self.responses[message_type]
+        response = self.responses[message_type]
+        return response.pop(0) if isinstance(response, list) else response
 
     async def send(self, message_type: int, payload: bytes) -> None:
         self.sent.append((message_type, payload))
@@ -573,6 +581,96 @@ async def test_kv_reverse_scan_accepts_descending_bounds() -> None:
     assert reader.read_bytes(reader.read_u32_be()) == b"a"
     assert reader.read_u8() == 0
     assert reader.read_u8() == 1
+
+
+@pytest.mark.asyncio
+async def test_kv_scan_rejects_pair_count_larger_than_payload() -> None:
+    response = BufferWriter()
+    response.write_u8(0)
+    response.write_u32_be(0xFFFFFFFF)
+    response.write_u8(0)
+    transaction = KVTransaction(
+        FakeConnection({MSG_KV_SCAN: response.build()}), "kv://r/a/items", 7
+    )
+
+    with pytest.raises(KVError, match="pair count exceeds payload"):
+        await transaction.scan_page()
+
+
+@pytest.mark.asyncio
+async def test_kv_scan_rejects_limit_outside_wire_range() -> None:
+    transaction = KVTransaction(FakeConnection(), "kv://r/a/items", 7)
+
+    for limit in (-1, 0x1_0000_0000, True, 1.5):
+        with pytest.raises(KVError, match="SCAN limit must be an integer"):
+            await transaction.scan_page(limit=limit)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_kv_scan_iterator_reports_truncation_even_with_page_limit() -> None:
+    connection = FakeConnection({MSG_KV_SCAN: b"\0\0\0\0\0\1"})
+    transaction = KVTransaction(connection, "kv://r/a/items", 7)
+
+    with pytest.raises(KVError, match="SCAN page was truncated") as raised:
+        async for _ in transaction.scan(limit=1):
+            pytest.fail("truncated scan must fail before yielding a partial result")
+
+    assert raised.value.code == "KV_SCAN_TRUNCATED"
+
+
+def _scan_page_response(pairs: list[tuple[bytes, bytes]], has_more: bool) -> bytes:
+    writer = BufferWriter()
+    writer.write_u8(0)
+    writer.write_u32_be(len(pairs))
+    for key, value in pairs:
+        writer.write_u32_be(len(key))
+        writer.write_bytes(key)
+        writer.write_u32_be(len(value))
+        writer.write_bytes(value)
+    writer.write_u8(1 if has_more else 0)
+    return writer.build()
+
+
+@pytest.mark.asyncio
+async def test_kv_scan_all_uses_forward_successor_without_capability() -> None:
+    connection = FakeConnection(
+        {MSG_KV_SCAN: [_scan_page_response([(b"a", b"1")], True), _scan_page_response([], False)]}
+    )
+    transaction = KVTransaction(connection, "kv://r/a/items", 7)
+
+    entries = [entry async for entry in transaction.scan_all()]
+
+    assert [entry.key for entry in entries] == [b"a"]
+    reader = BufferReader(connection.sent[1][1])
+    reader.read_u64_be()
+    reader.read_route()
+    assert reader.read_u8() == 1
+    assert reader.read_bytes(reader.read_u32_be()) == b"a\x00"
+    assert reader.read_u8() == 0
+    assert reader.read_u8() == 0
+
+
+@pytest.mark.asyncio
+async def test_kv_scan_all_fails_reverse_without_capability_after_yielding_page() -> None:
+    connection = FakeConnection({MSG_KV_SCAN: _scan_page_response([(b"z", b"1")], True)})
+    transaction = KVTransaction(connection, "kv://r/a/items", 7)
+    iterator = transaction.scan_all(reverse=True)
+
+    assert (await anext(iterator)).key == b"z"
+    with pytest.raises(KVError, match="exclusive KV SCAN"):
+        await anext(iterator)
+
+
+@pytest.mark.asyncio
+async def test_kv_scan_all_uses_exclusive_resume_when_advertised() -> None:
+    connection = FakeConnection(
+        {MSG_KV_SCAN: [_scan_page_response([(b"z", b"1")], True), _scan_page_response([], False)]},
+        capabilities=CAP_KV_SCAN_EXCLUSIVE,
+    )
+    transaction = KVTransaction(connection, "kv://r/a/items", 7)
+
+    assert [entry.key async for entry in transaction.scan_all(reverse=True)] == [b"z"]
+    assert connection.sent[1][1][-1] == 1
 
 
 @pytest.mark.asyncio

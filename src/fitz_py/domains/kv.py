@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from enum import StrEnum
+from operator import index
 
 from fitz_py._runtime import LazyAsyncContext, LazyAsyncIterator
 from fitz_py.connection import Connection
@@ -29,6 +30,8 @@ from fitz_py.protocol.messages import (
     MSG_KV_UNSUBSCRIBE,
 )
 from fitz_py.types import BytesLike
+
+CAP_KV_SCAN_EXCLUSIVE = 1 << 1
 
 
 class KVMode(StrEnum):
@@ -151,7 +154,28 @@ class KVTransaction:
         end_key: BytesLike | None = None,
         limit: int | None = None,
         reverse: bool = False,
+        start_exclusive: bool = False,
     ) -> KVScanPage:
+        if limit is not None:
+            if isinstance(limit, bool):
+                raise KVError(
+                    "SCAN limit must be an integer between 0 and 4294967295", "INVALID_LIMIT"
+                )
+            try:
+                limit = index(limit)
+            except TypeError as error:
+                raise KVError(
+                    "SCAN limit must be an integer between 0 and 4294967295", "INVALID_LIMIT"
+                ) from error
+            if not 0 <= limit <= 0xFFFFFFFF:
+                raise KVError(
+                    "SCAN limit must be an integer between 0 and 4294967295", "INVALID_LIMIT"
+                )
+        if start_exclusive and not (self._connection.capabilities & CAP_KV_SCAN_EXCLUSIVE):
+            raise KVError(
+                "Broker did not advertise exclusive KV SCAN resume support",
+                "UNSUPPORTED_CAPABILITY",
+            )
         start_key = None if start_key is None else bytes(start_key)
         end_key = None if end_key is None else bytes(end_key)
         if start_key is not None and end_key is not None:
@@ -176,9 +200,15 @@ class KVTransaction:
                 if limit is not None:
                     writer.write_u32_be(limit)
                 writer.write_u8(1 if reverse else 0)
+                if start_exclusive:
+                    writer.write_u8(1)
                 reader = BufferReader(await self._connection.request(MSG_KV_SCAN, writer.build()))
                 self._status(reader, "SCAN")
                 count = reader.read_u32_be()
+                # Every pair needs two u32 length prefixes; reserve at least one
+                # trailing byte for the required has_more flag.
+                if count > max(0, reader.remaining_bytes() - 1) // 8:
+                    raise KVError("SCAN response pair count exceeds payload", "INVALID_RESPONSE")
                 entries = tuple(
                     KVPair(
                         reader.read_bytes(reader.read_u32_be()),
@@ -201,16 +231,67 @@ class KVTransaction:
         limit: int | None = None,
         reverse: bool = False,
     ) -> AsyncIterator[KVPair]:
+        """Yield a single complete scan page or fail if the broker truncated it.
+
+        Use :meth:`scan_page` to inspect ``has_more`` manually or :meth:`scan_all`
+        to resume pages automatically.
+        A positive ``limit`` bounds one page; zero uses the broker's default bound.
+        Neither setting promises that the requested range fits in one page.
+        """
         page = await self.scan_page(
             start_key=start_key,
             end_key=end_key,
             limit=limit,
             reverse=reverse,
         )
-        if page.has_more and limit is None:
-            raise KVError("Unbounded scan was truncated", "SCAN_TRUNCATED")
+        if page.has_more:
+            raise KVError("SCAN page was truncated; use scan_page to continue", "SCAN_TRUNCATED")
         for entry in page.entries:
             yield entry
+
+    async def scan_all(
+        self,
+        *,
+        start_key: BytesLike | None = None,
+        end_key: BytesLike | None = None,
+        limit: int | None = None,
+        reverse: bool = False,
+    ) -> AsyncIterator[KVPair]:
+        """Yield matching pairs, resuming pages safely in either direction.
+
+        Earlier pages may have been yielded before a later page fails. Without
+        exclusive-scan capability, reverse scans yield the first page and then
+        raise if the broker reports more results.
+        """
+        next_start = None if start_key is None else bytes(start_key)
+        exclusive = False
+        while True:
+            page = await self.scan_page(
+                start_key=next_start,
+                end_key=end_key,
+                limit=limit,
+                reverse=reverse,
+                start_exclusive=exclusive,
+            )
+            if page.has_more and not page.entries:
+                raise KVError("SCAN returned an empty page with more entries", "SCAN_TRUNCATED")
+            for entry in page.entries:
+                yield entry
+            if not page.has_more:
+                return
+            last_key = page.entries[-1].key
+            if self._connection.capabilities & CAP_KV_SCAN_EXCLUSIVE:
+                next_start = last_key
+                exclusive = True
+            elif reverse:
+                raise KVError(
+                    "Broker did not advertise exclusive KV SCAN resume support "
+                    "for reverse pagination",
+                    "UNSUPPORTED_CAPABILITY",
+                )
+            else:
+                next_start = last_key + b"\x00"
+                exclusive = False
 
     async def commit(self) -> None:
         await self._finish(MSG_KV_COMMIT, "COMMIT")
