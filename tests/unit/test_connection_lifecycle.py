@@ -8,6 +8,12 @@ from fitz_py._runtime import AsyncSubscription
 from fitz_py.connection import Connection
 from fitz_py.errors import FitzConnectionError, FitzTransportError
 from fitz_py.protocol.frame import FrameCodec
+from fitz_py.protocol.messages import (
+    CAP_SESSION_METADATA,
+    MSG_CONNECT,
+    MSG_SERVER_HELLO,
+    MSG_SESSION_METADATA,
+)
 from fitz_py.transport.base import Transport
 from fitz_py.types import (
     ClientConfig,
@@ -70,6 +76,7 @@ async def test_connection_request_push_send_and_close_lifecycle() -> None:
     connection.register_notification_handler(88, pushes.append)
 
     await connection.connect()
+    transport.send_event.clear()
 
     assert connection.generation == 1
     assert connection.get_state() is ConnectionState.AUTHENTICATED
@@ -92,11 +99,47 @@ async def test_connection_request_push_send_and_close_lifecycle() -> None:
             await asyncio.sleep(0)
 
     await connection.close()
-    await connection.close()
     assert transport.closed
     assert connection.get_state() is ConnectionState.CLOSED
     with pytest.raises(FitzConnectionError, match="closed"):
         await connection.connect()
+
+
+@pytest.mark.asyncio
+async def test_connection_reports_service_name_only_after_metadata_capability() -> None:
+    transport = FakeTransport()
+    connection = Connection(
+        lambda: transport,
+        config(service_name="orders-worker"),
+    )
+
+    await connection.connect()
+    transport.send_event.clear()
+    hello = (1).to_bytes(2, "big") + CAP_SESSION_METADATA.to_bytes(4, "big")
+    await transport.inbound.put(FrameCodec.encode_frame(MSG_SERVER_HELLO, hello))
+    async with asyncio.timeout(1):
+        await transport.send_event.wait()
+
+    metadata = FrameCodec.decode_frame(transport.sent[1])
+    assert metadata.message_type == MSG_SESSION_METADATA
+    assert metadata.payload == b"\x00\x00\x00\x0dorders-worker"
+
+    await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_connection_omits_service_name_when_metadata_capability_is_missing() -> None:
+    transport = FakeTransport()
+    connection = Connection(
+        lambda: transport,
+        config(service_name="orders-worker", auth_settle_timeout=0),
+    )
+
+    await connection.connect()
+
+    assert len(transport.sent) == 1
+    assert FrameCodec.decode_frame(transport.sent[0]).message_type == MSG_CONNECT
+    await connection.close()
 
 
 @pytest.mark.asyncio

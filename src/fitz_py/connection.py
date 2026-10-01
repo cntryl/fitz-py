@@ -21,7 +21,13 @@ from fitz_py.errors import (
 )
 from fitz_py.multiplexer import Multiplexer
 from fitz_py.protocol.frame import FrameCodec, FrameParser
-from fitz_py.protocol.messages import MSG_CONNECT, MSG_CORRELATED, MSG_SERVER_HELLO
+from fitz_py.protocol.messages import (
+    CAP_SESSION_METADATA,
+    MSG_CONNECT,
+    MSG_CORRELATED,
+    MSG_SERVER_HELLO,
+    MSG_SESSION_METADATA,
+)
 from fitz_py.transport.base import Transport
 from fitz_py.types import ClientConfig, ConnectionState, LifecycleEvent
 
@@ -50,6 +56,7 @@ class Connection:
         self._connect_lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
         self._closed = False
+        self._service_name_sent = False
         self._ever_authenticated = False
         self._restoring = False
         self._last_activity = time.monotonic()
@@ -272,6 +279,7 @@ class Connection:
     async def _open_and_authenticate(self, reconnect: bool) -> None:
         if self._closed:
             raise FitzConnectionError("Client is closed")
+        self._service_name_sent = False
         parser = FrameParser()
         self._parser = parser
         self._gate = self._new_gate()
@@ -366,7 +374,7 @@ class Connection:
                 if self._closed or self._transport is not transport:
                     return
                 self._last_activity = time.monotonic()
-                self._dispatch_transport_frame(data, parser)
+                await self._dispatch_transport_frame(data, parser)
         except asyncio.CancelledError:
             return
         except BaseException as exc:  # noqa: BLE001
@@ -377,7 +385,7 @@ class Connection:
             if not self._closed and self._transport is transport:
                 await self._connection_lost(exc)
 
-    def _dispatch_transport_frame(self, data: bytes, parser: FrameParser) -> None:
+    async def _dispatch_transport_frame(self, data: bytes, parser: FrameParser) -> None:
         pending_correlation: int | None = None
         for frame in parser.parse_frames(data):
             if frame.message_type == MSG_SERVER_HELLO:
@@ -388,6 +396,17 @@ class Connection:
                         int.from_bytes(frame.payload[:2], "big"),
                         int.from_bytes(frame.payload[2:6], "big"),
                     )
+                    if (
+                        self._config.service_name is not None
+                        and self._multiplexer.capabilities & CAP_SESSION_METADATA
+                        and not self._service_name_sent
+                    ):
+                        encoded = self._config.service_name.encode("utf-8")
+                        payload = len(encoded).to_bytes(4, "big") + encoded
+                        await self._send_frame(
+                            FrameCodec.encode_frame(MSG_SESSION_METADATA, payload)
+                        )
+                        self._service_name_sent = True
                 continue
             if frame.message_type == MSG_CORRELATED:
                 if len(frame.payload) != 8 or pending_correlation is not None:

@@ -36,6 +36,7 @@ from fitz_py.multiplexer import Multiplexer
 from fitz_py.protocol.buffer import BufferReader, BufferWriter
 from fitz_py.protocol.frame import FrameCodec, FrameParser
 from fitz_py.protocol.messages import (
+    CAP_SESSION_METADATA,
     MSG_KV_GET,
     MSG_KV_INSERT,
     MSG_KV_SCAN,
@@ -251,6 +252,14 @@ def test_config_is_frozen_and_validated() -> None:
             url="tcp://localhost:7777",
             reconnect=fitz_py.ReconnectPolicy(backoff=0),
         )
+
+
+def test_service_name_uses_utf8_byte_limit_and_rejects_surrogates() -> None:
+    assert ClientConfig(url="tcp://localhost", service_name="é" * 64).service_name == "é" * 64
+    with pytest.raises(ValueError, match="128 UTF-8 bytes"):
+        ClientConfig(url="tcp://localhost", service_name="é" * 65)
+    with pytest.raises(ValueError, match="valid Unicode"):
+        ClientConfig(url="tcp://localhost", service_name="bad\ud800name")
 
 
 def test_buffer_round_trip() -> None:
@@ -652,7 +661,10 @@ async def test_kv_scan_all_uses_forward_successor_without_capability() -> None:
 
 @pytest.mark.asyncio
 async def test_kv_scan_all_fails_reverse_without_capability_after_yielding_page() -> None:
-    connection = FakeConnection({MSG_KV_SCAN: _scan_page_response([(b"z", b"1")], True)})
+    connection = FakeConnection(
+        {MSG_KV_SCAN: _scan_page_response([(b"z", b"1")], True)},
+        capabilities=CAP_SESSION_METADATA,
+    )
     transaction = KVTransaction(connection, "kv://r/a/items", 7)
     iterator = transaction.scan_all(reverse=True)
 

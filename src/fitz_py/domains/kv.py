@@ -31,7 +31,7 @@ from fitz_py.protocol.messages import (
 )
 from fitz_py.types import BytesLike
 
-CAP_KV_SCAN_EXCLUSIVE = 1 << 1
+CAP_KV_SCAN_EXCLUSIVE = 1 << 2
 
 
 class KVMode(StrEnum):

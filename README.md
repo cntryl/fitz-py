@@ -16,11 +16,15 @@ from fitz_py import Client
 async with Client(
     "ws://localhost:4190/ws",
     token_provider=lambda: "",
+    service_name="orders-worker",
 ) as client:
     async with client.kv.transaction("kv://example/app/users") as tx:
         await tx.put(b"alice", b"active")
         await tx.commit()
 ```
+
+`service_name` is optional. New brokers record it on the active session after
+advertising the `SESSION_METADATA` capability; older brokers receive no metadata frame.
 
 `Client.aclose()` is permanent and idempotent. Reconnect is enabled by default after the first
 successful authentication; an authentication rejection permanently closes the client. Configure

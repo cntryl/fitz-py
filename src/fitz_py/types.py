@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import unicodedata
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -121,10 +122,22 @@ class ClientConfig:
     limits: ConcurrencyLimits = field(default_factory=ConcurrencyLimits)
     observability: Observability = field(default_factory=Observability)
     websocket_headers: Mapping[str, str] = field(default_factory=_empty_headers)
+    service_name: str | None = None
 
     def __post_init__(self) -> None:
         if not self.url:
             raise ValueError("url is required")
+        if self.service_name is not None:
+            try:
+                encoded_name = self.service_name.encode("utf-8")
+            except UnicodeEncodeError as error:
+                raise ValueError("service_name must contain valid Unicode characters") from error
+            if not self.service_name.strip():
+                raise ValueError("service_name must not be empty")
+            if len(encoded_name) > 128:
+                raise ValueError("service_name must be at most 128 UTF-8 bytes")
+            if any(unicodedata.category(character) == "Cc" for character in self.service_name):
+                raise ValueError("service_name must not contain control characters")
         if self.request_timeout <= 0 or self.auth_settle_timeout < 0:
             raise ValueError("timeouts must be positive")
         if self.max_frame_size < 5:
