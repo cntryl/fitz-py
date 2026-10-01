@@ -1,6 +1,6 @@
 # fitz-py
 
-`fitz-py` is the typed, asyncio-native Python client for the Fitz broker. Version 0.3 is a
+`fitz-py` is the typed, asyncio-native Python client for the Fitz broker. Version 0.2.0 is a
 deliberate clean break: clients are configured once, domain clients are cached properties, streamed
 results are async iterators, and network/runtime queues are bounded.
 
@@ -111,6 +111,6 @@ The repository owns its broker Compose stack and a vendored copy of the canonica
 cross-language suite. CI runs Python 3.11-3.14, wheel smoke tests, TCP/WebSocket, and
 anonymous/JWT broker legs. Canonical behavior remains owned by the Fitz server documentation.
 
-See [MIGRATION.md](MIGRATION.md) for every 0.3 break and [PERFORMANCE.md](PERFORMANCE.md) for the
+See [MIGRATION.md](MIGRATION.md) for every 0.2.0 break and [PERFORMANCE.md](PERFORMANCE.md) for the
 benchmark evidence policy. [AUDIT_REMEDIATION.md](AUDIT_REMEDIATION.md) records the disposition and
 proof for the independent correctness review.
