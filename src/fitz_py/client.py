@@ -45,11 +45,13 @@ class Client:
         heartbeat: HeartbeatPolicy | None = None,
         observability: Observability | None = None,
         websocket_headers: Mapping[str, str] | None = None,
+        service_name: str | None = None,
     ) -> None:
         if not isinstance(url, str):  # pyright: ignore[reportUnnecessaryIsInstance]
             raise TypeError("url must be a string; pass Client options as keyword arguments")
         config = ClientConfig(
             url=url,
+            service_name=service_name,
             token_provider=token_provider,
             transport=transport,
             request_timeout=request_timeout,
