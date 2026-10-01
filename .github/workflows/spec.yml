@@ -1,0 +1,97 @@
+name: Spec
+
+on:
+  workflow_dispatch:
+    inputs:
+      broker_tag:
+        description: Fitz broker image tag
+        type: choice
+        options: [main, develop]
+        default: main
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 0 * * *"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FITZ_BROKER_IMAGE: ghcr.io/cntryl/fitz:${{ inputs.broker_tag || 'main' }}
+
+jobs:
+  spec:
+    name: Broker acceptance and shared spec (${{ matrix.transport }}, ${{ matrix.auth-mode }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        transport: [tcp, ws]
+        auth-mode: [anonymous, valid_jwt]
+    env:
+      FITZ_BROKER_ANON_TCP_ADDR: localhost:4191
+      FITZ_BROKER_ANON_WS_ADDR: ws://localhost:4190/ws
+      FITZ_BROKER_AUTH_TCP_ADDR: localhost:4091
+      FITZ_BROKER_AUTH_WS_ADDR: ws://localhost:4090/ws
+      FITZ_BROKER_JWT_HMAC_SECRET: test-secret-key
+      FITZ_BROKER_JWT_AUDIENCE: fitz
+      FITZ_BROKER_JWT_TENANT: dev
+      CONFORMANCE_TRANSPORT: ${{ matrix.transport }}
+      CONFORMANCE_AUTH_MODE: ${{ matrix.auth-mode }}
+      CONFORMANCE_OUTPUT: artifacts/conformance-${{ matrix.transport }}-${{ matrix.auth-mode }}.json
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install development dependencies
+        run: python -m pip install -e ".[dev]"
+
+      - name: Start broker stack
+        run: docker compose up -d
+
+      - name: Wait for brokers
+        run: |
+          for port in 4090 4091 4190 4191; do
+            timeout 60 bash -c "until (echo > /dev/tcp/127.0.0.1/$port) 2>/dev/null; do sleep 1; done"
+          done
+
+      - name: Run integration tests
+        run: python -m pytest tests/integration -v
+
+      - name: Run conformance tests
+        run: python -m pytest tests/conformance -v
+
+      - name: Enforce canonical conformance
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          data = json.loads(Path(os.environ["CONFORMANCE_OUTPUT"]).read_text())
+          required = {f"CS-{index:03d}" for index in range(1, 18)}
+          observed = {item["scenario_id"] for item in data["scenarios"] if item["verdict"] == "pass"}
+          assert data["overall_status"] == "pass"
+          assert observed == required, sorted(required - observed)
+          PY
+
+      - name: Upload conformance results
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: conformance-${{ matrix.transport }}-${{ matrix.auth-mode }}
+          path: artifacts/conformance-*.json
+          if-no-files-found: warn
+
+      - name: Stop broker stack
+        if: always()
+        run: docker compose down --volumes

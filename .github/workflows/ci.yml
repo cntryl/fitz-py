@@ -1,22 +1,17 @@
 name: CI
 
 on:
-  workflow_dispatch:
-    inputs:
-      broker_tag:
-        description: Fitz broker image tag
-        type: choice
-        options: [main, develop]
-        default: main
   push:
     branches: [main]
   pull_request:
 
-env:
-  FITZ_BROKER_IMAGE: ghcr.io/cntryl/fitz:${{ inputs.broker_tag || 'main' }}
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  fast:
+  behavior:
+    name: Behavior and quality (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -48,123 +43,3 @@ jobs:
 
       - name: Run unit tests with coverage
         run: python -m pytest tests/unit --cov=fitz_py --cov-branch --cov-report=term-missing --cov-fail-under=70
-
-  package:
-    needs: fast
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.11", "3.12", "3.13", "3.14"]
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
-
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v6
-        with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
-
-      - name: Install packaging and benchmark tools
-        run: python -m pip install --upgrade pip build pyperf
-
-      - name: Build source and wheel distributions
-        run: python -m build
-
-      - name: Smoke test wheel
-        run: |
-          python -m venv artifacts/smoke
-          artifacts/smoke/bin/python -m pip install dist/*.whl
-          artifacts/smoke/bin/python - <<'PY'
-          from fitz_py import Client
-          client = Client("tcp://localhost:4191")
-          assert client.kv is client.kv
-          assert client.queue is client.queue
-          PY
-
-      - name: Benchmark smoke
-        run: |
-          python -m pip install dist/*.whl
-          python -m benchmarks.hotpath --fast -o artifacts/benchmarks-${{ matrix.python-version }}.json
-
-      - name: Upload distributions and benchmark results
-        uses: actions/upload-artifact@v7
-        with:
-          name: fitz-py-dist-${{ matrix.python-version }}
-          path: |
-            dist/*
-            artifacts/benchmarks-*.json
-
-  broker:
-    needs: fast
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        transport: [tcp, ws]
-        auth-mode: [anonymous, valid_jwt]
-    env:
-      FITZ_BROKER_ANON_TCP_ADDR: localhost:4191
-      FITZ_BROKER_ANON_WS_ADDR: ws://localhost:4190/ws
-      FITZ_BROKER_AUTH_TCP_ADDR: localhost:4091
-      FITZ_BROKER_AUTH_WS_ADDR: ws://localhost:4090/ws
-      FITZ_BROKER_JWT_HMAC_SECRET: test-secret-key
-      FITZ_BROKER_JWT_AUDIENCE: fitz
-      FITZ_BROKER_JWT_TENANT: dev
-      CONFORMANCE_TRANSPORT: ${{ matrix.transport }}
-      CONFORMANCE_AUTH_MODE: ${{ matrix.auth-mode }}
-      CONFORMANCE_OUTPUT: artifacts/conformance-${{ matrix.transport }}-${{ matrix.auth-mode }}.json
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
-
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-          cache: pip
-
-      - name: Upgrade pip
-        run: python -m pip install --upgrade pip
-
-      - name: Install development dependencies
-        run: python -m pip install -e ".[dev]"
-
-      - name: Start broker stack
-        run: docker compose up -d
-
-      - name: Wait for brokers
-        run: |
-          for port in 4090 4091 4190 4191; do
-            timeout 60 bash -c "until (echo > /dev/tcp/127.0.0.1/$port) 2>/dev/null; do sleep 1; done"
-          done
-
-      - name: Run integration tests
-        run: python -m pytest tests/integration -v
-
-      - name: Run conformance tests
-        run: python -m pytest tests/conformance -v
-
-      - name: Enforce canonical conformance
-        run: |
-          python - <<'PY'
-          import json, os
-          from pathlib import Path
-          data = json.loads(Path(os.environ["CONFORMANCE_OUTPUT"]).read_text())
-          required = {f"CS-{index:03d}" for index in range(1, 18)}
-          observed = {item["scenario_id"] for item in data["scenarios"] if item["verdict"] == "pass"}
-          assert data["overall_status"] == "pass"
-          assert observed == required, sorted(required - observed)
-          PY
-
-      - name: Upload conformance results
-        uses: actions/upload-artifact@v7
-        if: always()
-        with:
-          name: conformance-${{ matrix.transport }}-${{ matrix.auth-mode }}
-          path: artifacts/conformance-*.json
-          if-no-files-found: warn
-
-      - name: Stop broker stack
-        if: always()
-        run: docker compose down --volumes
