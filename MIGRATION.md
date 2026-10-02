@@ -1,6 +1,6 @@
-# Migrating to 0.3
+# Migrating to 0.2.0
 
-Version 0.3 is a clean break. It intentionally provides no compatibility aliases.
+Version 0.2.0 is a clean break. It intentionally provides no compatibility aliases.
 
 - Construct clients with `Client(url, *, ...)`; `Client(ClientConfig(...))` is rejected.
 - Close clients with `await client.aclose()`.
@@ -21,7 +21,7 @@ Version 0.3 is a clean break. It intentionally provides no compatibility aliases
 - Queue and Lease durations must be integral seconds. Floats and booleans are rejected rather than truncated.
 - Lease expiration values are timezone-aware UTC `datetime` instances.
 - Removed exception/config aliases include `ConnectionError`, `TransportError`, `TimeoutError`,
-  `KvScanResult`, and `ReconnectOptions`; import the explicitly named 0.3 types instead.
+  `KvScanResult`, and `ReconnectOptions`; import the explicitly named 0.2.0 types instead.
 - The default maximum frame size is now the broker-default 1 MiB; override `max_frame_size=` when
   deploying against a stricter broker.
 

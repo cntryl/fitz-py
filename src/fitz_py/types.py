@@ -128,15 +128,16 @@ class ClientConfig:
         if not self.url:
             raise ValueError("url is required")
         if self.service_name is not None:
+            normalized_name = self.service_name.strip()
             try:
-                encoded_name = self.service_name.encode("utf-8")
+                encoded_name = normalized_name.encode("utf-8")
             except UnicodeEncodeError as error:
                 raise ValueError("service_name must contain valid Unicode characters") from error
-            if not self.service_name.strip():
+            if not normalized_name:
                 raise ValueError("service_name must not be empty")
             if len(encoded_name) > 128:
                 raise ValueError("service_name must be at most 128 UTF-8 bytes")
-            if any(unicodedata.category(character) == "Cc" for character in self.service_name):
+            if any(unicodedata.category(character) == "Cc" for character in normalized_name):
                 raise ValueError("service_name must not contain control characters")
         if self.request_timeout <= 0 or self.auth_settle_timeout < 0:
             raise ValueError("timeouts must be positive")
