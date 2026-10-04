@@ -159,8 +159,13 @@ async def test_rpc_terminal_frame_survives_capacity_one() -> None:
         def __init__(self) -> None:
             self._pending = {}
 
+        def _finish_call(self, call: RPCCall, outcome: str) -> None:
+            self._pending.pop(call._key, None)
+            if not call._cancellation.done():
+                call._cancellation.set_result(outcome)
+
     client = Pending()
-    call = RPCCall(client, b"key", 1, 1)  # type: ignore[arg-type]
+    call = RPCCall(client, b"key", asyncio.get_running_loop().time() + 1, 1)  # type: ignore[arg-type]
     client._pending[b"key"] = call
     call.push(ResponseFrame(b"last", 0), end=True)
     assert await anext(call) == ResponseFrame(b"last", 0)
@@ -176,8 +181,13 @@ async def test_rpc_empty_terminal_frame_is_delivered() -> None:
         def __init__(self) -> None:
             self._pending = {}
 
+        def _finish_call(self, call: RPCCall, outcome: str) -> None:
+            self._pending.pop(call._key, None)
+            if not call._cancellation.done():
+                call._cancellation.set_result(outcome)
+
     client = Pending()
-    call = RPCCall(client, b"key", 1, 1)  # type: ignore[arg-type]
+    call = RPCCall(client, b"key", asyncio.get_running_loop().time() + 1, 1)  # type: ignore[arg-type]
     client._pending[b"key"] = call
 
     call.push(ResponseFrame(b"", 0), end=True)

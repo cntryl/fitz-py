@@ -7,6 +7,7 @@ import contextlib
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
+from typing import Literal
 
 from fitz_py._runtime import LazyAsyncContext, LazyAsyncIterator
 from fitz_py.connection import Connection
@@ -21,6 +22,9 @@ from fitz_py.errors import (
 )
 from fitz_py.protocol.buffer import BufferReader, BufferWriter
 from fitz_py.protocol.messages import (
+    CAP_RPC_CANCELLATION,
+    MSG_RPC_CANCELLATION,
+    MSG_RPC_LIFECYCLE,
     MSG_RPC_REQUEST,
     MSG_RPC_RESPONSE,
     MSG_RPC_SUBSCRIBE_WORKER,
@@ -28,6 +32,22 @@ from fitz_py.protocol.messages import (
 )
 from fitz_py.protocol.response import parse_response
 from fitz_py.types import BytesLike
+
+_RPC_EXTENSION_VERSION = 1
+_RPC_CANCELLATION_GRACE_SECONDS = 5.0
+_MAX_RPC_BUDGET_MS = 86_400_000
+RpcCancellationOutcome = Literal[
+    "not_requested",
+    "unsupported",
+    "queued_removed",
+    "forwarded",
+    "worker_unsupported",
+    "already_terminal",
+    "unknown_or_unauthorized",
+    "forwarding_failed",
+    "unconfirmed",
+    "connection_closed",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +60,20 @@ class ResponseFrame:
 class InboundRequest:
     route: str
     body: bytes
+    context: RpcHandlerContext | None = None
+
+
+@dataclass(slots=True)
+class RpcHandlerContext:
+    """Cooperative cancellation and inherited deadline for one worker call."""
+
+    cancelled: asyncio.Event
+    _deadline: float | None = None
+
+    def remaining_time_ms(self) -> int | None:
+        if self._deadline is None:
+            return None
+        return max(0, int((self._deadline - asyncio.get_running_loop().time()) * 1000))
 
 
 class ResponseWriter:
@@ -66,16 +100,78 @@ class ResponseWriter:
             self._sequence += 1
             self._ended = end
 
+    @property
+    def ended(self) -> bool:
+        return self._ended
+
+
+@dataclass(slots=True)
+class _ActiveInvocation:
+    context: RpcHandlerContext
+    response: ResponseWriter
+    correlation_id: bytes
+    deadline_handle: asyncio.TimerHandle | None = None
+    cancellation_requested: bool = False
+    finished: bool = False
+    started: bool = False
+
 
 class RPCCall(AsyncIterator[ResponseFrame]):
-    def __init__(self, client: RPCClient, key: bytes, timeout: float, capacity: int) -> None:
+    def __init__(
+        self,
+        client: RPCClient,
+        key: bytes,
+        deadline: float | None,
+        capacity: int,
+    ) -> None:
         self._client = client
         self._key = key
-        self._timeout = timeout
+        self._deadline = deadline
         self._queue: asyncio.Queue[ResponseFrame | BaseException | None] = asyncio.Queue(capacity)
         self._closed = False
         self._terminal = False
         self._failure: BaseException | None = None
+        self._cancellation: asyncio.Future[RpcCancellationOutcome] = (
+            asyncio.get_running_loop().create_future()
+        )
+        self._parent_cancellation_task: asyncio.Task[None] | None = None
+        self._deadline_task: asyncio.Task[None] | None = None
+
+    def watch_deadline(self) -> None:
+        if self._deadline is not None:
+            self._deadline_task = asyncio.create_task(self._expire_at_deadline())
+
+    async def _expire_at_deadline(self) -> None:
+        if self._deadline is None:
+            return
+        await asyncio.sleep(max(0, self._deadline - asyncio.get_running_loop().time()))
+        if not self._closed and not self._terminal:
+            self._failure = FitzTimeoutError("RPC response timed out")
+            await self._close_and_cancel(2)
+
+    def watch_parent_cancellation(self, parent_cancellation: asyncio.Event) -> None:
+        self._parent_cancellation_task = asyncio.create_task(
+            self._cancel_when_parent_cancelled(parent_cancellation)
+        )
+
+    async def _cancel_when_parent_cancelled(self, parent_cancellation: asyncio.Event) -> None:
+        await parent_cancellation.wait()
+        await self._close_and_cancel(1)
+
+    def _stop_parent_cancellation(self) -> None:
+        task = self._parent_cancellation_task
+        self._parent_cancellation_task = None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+        deadline_task = self._deadline_task
+        self._deadline_task = None
+        if deadline_task is not None and deadline_task is not asyncio.current_task():
+            deadline_task.cancel()
+
+    @property
+    def cancellation(self) -> asyncio.Future[RpcCancellationOutcome]:
+        """Resolves with the broker's best-effort remote-cancellation result."""
+        return self._cancellation
 
     def __aiter__(self) -> RPCCall:
         return self
@@ -86,17 +182,29 @@ class RPCCall(AsyncIterator[ResponseFrame]):
             raise failure
         if (self._closed or self._terminal) and self._queue.empty():
             raise StopAsyncIteration
+        remaining = (
+            None if self._deadline is None else self._deadline - asyncio.get_running_loop().time()
+        )
+        if remaining is not None and remaining <= 0:
+            await self._close_and_cancel(2)
+            raise FitzTimeoutError("RPC response timed out")
         try:
-            async with asyncio.timeout(self._timeout):
+            if remaining is None:
                 item = await self._queue.get()
+            else:
+                async with asyncio.timeout(remaining):
+                    item = await self._queue.get()
         except asyncio.CancelledError:
-            await self.aclose()
+            await self._close_and_cancel(1)
             raise
         except TimeoutError as exc:
-            await self.aclose()
+            await self._close_and_cancel(2)
             raise FitzTimeoutError("RPC response timed out") from exc
         if item is None:
             self._closed = True
+            if self._failure is not None:
+                failure, self._failure = self._failure, None
+                raise failure
             raise StopAsyncIteration
         if isinstance(item, BaseException):
             self._closed = True
@@ -111,13 +219,23 @@ class RPCCall(AsyncIterator[ResponseFrame]):
         await self.aclose()
 
     async def aclose(self) -> None:
+        await self._close_and_cancel(1)
+
+    async def cancel(self) -> RpcCancellationOutcome:
+        await self._close_and_cancel(1)
+        return await self._cancellation
+
+    async def _close_and_cancel(self, reason: Literal[1, 2]) -> None:
+        if self._terminal:
+            return
         if not self._closed:
             self._closed = True
-            self._client._pending.pop(self._key, None)  # noqa: SLF001
             while not self._queue.empty():
                 with contextlib.suppress(asyncio.QueueEmpty):
                     self._queue.get_nowait()
             self._queue.put_nowait(None)
+            self._stop_parent_cancellation()
+            await self._client._abandon_call(self, reason)  # noqa: SLF001
 
     def push(self, frame: ResponseFrame, end: bool) -> None:
         if self._closed:
@@ -126,7 +244,8 @@ class RPCCall(AsyncIterator[ResponseFrame]):
             self._queue.put_nowait(frame)
             if end:
                 self._terminal = True
-                self._client._pending.pop(self._key, None)  # noqa: SLF001
+                self._stop_parent_cancellation()
+                self._client._finish_call(self, "not_requested")  # noqa: SLF001
         except asyncio.QueueFull:
             self.fail(
                 RPCError("RPC response consumer fell behind", "BACKPRESSURE"),
@@ -137,7 +256,11 @@ class RPCCall(AsyncIterator[ResponseFrame]):
         if self._closed:
             return
         self._closed = True
-        self._client._pending.pop(self._key, None)  # noqa: SLF001
+        self._stop_parent_cancellation()
+        outcome: RpcCancellationOutcome = (
+            "connection_closed" if isinstance(error, FitzConnectionError) else "not_requested"
+        )
+        self._client._finish_call(self, outcome)  # noqa: SLF001
         if not preserve_buffered:
             while not self._queue.empty():
                 with contextlib.suppress(asyncio.QueueEmpty):
@@ -148,6 +271,29 @@ class RPCCall(AsyncIterator[ResponseFrame]):
             self._failure = None
         except asyncio.QueueFull:
             pass
+
+
+class LazyRPCCall(LazyAsyncIterator[ResponseFrame]):
+    """Lazy RPC stream with explicit cancellation outcome access."""
+
+    @property
+    def cancellation(self) -> Awaitable[RpcCancellationOutcome]:
+        return self._get_cancellation()
+
+    async def cancel(self) -> RpcCancellationOutcome:
+        if self._resource is None:
+            await self.aclose()
+            return "not_requested"
+        if isinstance(self._resource, RPCCall):
+            return await self._resource.cancel()
+        raise FitzConnectionError("RPC call has no active handle")
+
+    async def _get_cancellation(self) -> RpcCancellationOutcome:
+        if self._resource is None:
+            return "not_requested"
+        if isinstance(self._resource, RPCCall):
+            return await self._resource.cancellation
+        raise FitzConnectionError("RPC call has no active handle")
 
 
 RPCHandler = Callable[[InboundRequest, ResponseWriter], Awaitable[None]]
@@ -184,6 +330,10 @@ class RPCClient(DomainClient):
     def __init__(self, connection: Connection) -> None:
         super().__init__(connection)
         self._pending: dict[bytes, RPCCall] = {}
+        self._pending_cancellations: dict[
+            bytes, tuple[asyncio.Future[RpcCancellationOutcome], asyncio.TimerHandle]
+        ] = {}
+        self._active_invocations: dict[bytes, _ActiveInvocation] = {}
         self._workers: dict[str, _Registration] = {}
         self._worker_locks: dict[str, asyncio.Lock] = {}
         self._terminal_tasks: set[asyncio.Task[None]] = set()
@@ -191,27 +341,63 @@ class RPCClient(DomainClient):
         connection.register_push_classifier(MSG_RPC_RESPONSE, _looks_like_response)
         connection.register_notification_handler(MSG_RPC_REQUEST, self._on_request)
         connection.register_notification_handler(MSG_RPC_RESPONSE, self._on_response)
+        connection.register_notification_handler(MSG_RPC_LIFECYCLE, self._on_lifecycle)
         connection.on_disconnect(self._disconnect)
         connection.on_reconnect(self._restore, domain="rpc", registration="workers")
 
-    def call(
-        self, route: str, body: BytesLike, *, timeout: float = 30.0
-    ) -> LazyAsyncIterator[ResponseFrame]:
+    def call(self, route: str, body: BytesLike, *, timeout: float = 30.0) -> LazyRPCCall:
         _route(route, patterns=False)
         if timeout <= 0:
             raise ValueError("timeout must be positive")
-        return LazyAsyncIterator(lambda: self.open_call(route, body, timeout=timeout))
+        if timeout * 1000 > _MAX_RPC_BUDGET_MS:
+            raise ValueError(f"timeout must be at most {_MAX_RPC_BUDGET_MS} milliseconds")
+        return LazyRPCCall(lambda: self.open_call(route, body, timeout=timeout))
 
-    async def open_call(self, route: str, body: BytesLike, *, timeout: float = 30.0) -> RPCCall:
+    def call_from_request(
+        self, request: InboundRequest, route: str, body: BytesLike
+    ) -> LazyRPCCall:
+        """Creates a downstream call linked to an inbound request's budget and cancellation."""
         _route(route, patterns=False)
-        if timeout <= 0:
+        context = request.context
+        if context is None:
+            raise ValueError("inbound RPC request has no handler context")
+
+        async def open_downstream_call() -> RPCCall:
+            if context.cancelled.is_set():
+                raise asyncio.CancelledError
+            remaining_ms = context.remaining_time_ms()
+            if remaining_ms == 0:
+                raise FitzTimeoutError("Inbound RPC request deadline elapsed")
+            timeout = None if remaining_ms is None else remaining_ms / 1000
+            return await self.open_call(
+                route,
+                body,
+                timeout=timeout,
+                parent_cancellation=context.cancelled,
+            )
+
+        return LazyRPCCall(open_downstream_call)
+
+    async def open_call(
+        self,
+        route: str,
+        body: BytesLike,
+        *,
+        timeout: float | None = 30.0,
+        parent_cancellation: asyncio.Event | None = None,
+    ) -> RPCCall:
+        _route(route, patterns=False)
+        if timeout is not None and timeout <= 0:
             raise ValueError("timeout must be positive")
+        if timeout is not None and timeout * 1000 > _MAX_RPC_BUDGET_MS:
+            raise ValueError(f"timeout must be at most {_MAX_RPC_BUDGET_MS} milliseconds")
         body = bytes(body)
         correlation_id = os.urandom(16)
+        deadline = None if timeout is None else asyncio.get_running_loop().time() + timeout
         call = RPCCall(
             self,
             correlation_id,
-            timeout,
+            deadline,
             self.connection.config.limits.subscription_buffer_size,
         )
         self._pending[correlation_id] = call
@@ -220,11 +406,24 @@ class RPCClient(DomainClient):
         writer.write_route(route)
         writer.write_u32_be(len(body))
         writer.write_bytes(body)
+        if self.connection.capabilities & CAP_RPC_CANCELLATION and deadline is not None:
+            loop = asyncio.get_running_loop()
+            remaining_ms = max(
+                0,
+                min(
+                    _MAX_RPC_BUDGET_MS,
+                    int((deadline - loop.time()) * 1000),
+                ),
+            )
+            _write_request_budget(writer, remaining_ms)
         try:
             await self.connection.send(MSG_RPC_REQUEST, writer.build())
         except BaseException:
             self._pending.pop(correlation_id, None)
             raise
+        call.watch_deadline()
+        if parent_cancellation is not None:
+            call.watch_parent_cancellation(parent_cancellation)
         return call
 
     def worker(
@@ -257,6 +456,9 @@ class RPCClient(DomainClient):
         writer = BufferWriter()
         writer.write_route(route)
         writer.write_u32_be(registration.max_concurrency)
+        if self.connection.capabilities & CAP_RPC_CANCELLATION:
+            writer.write_u8(_RPC_EXTENSION_VERSION)
+            writer.write_u8(1)
         response = parse_response(
             await self.request_frame(MSG_RPC_SUBSCRIBE_WORKER, writer.build())
         )
@@ -303,41 +505,171 @@ class RPCClient(DomainClient):
                 return
         call.push(ResponseFrame(body, sequence), bool(flags & 1))
 
+    def _on_lifecycle(self, payload: bytes) -> None:
+        if len(payload) != 18:
+            return
+        kind = payload[0]
+        correlation_id = payload[1:17]
+        value = payload[17]
+        if kind == 2 and 1 <= value <= 4:
+            invocation = self._active_invocations.get(correlation_id)
+            if invocation is None:
+                return
+            invocation.cancellation_requested = True
+            invocation.context.cancelled.set()
+            if invocation.finished or not invocation.started:
+                self._schedule_cleanup_ack(invocation)
+            return
+        if kind != 4:
+            return
+        outcomes: dict[int, RpcCancellationOutcome] = {
+            1: "queued_removed",
+            2: "forwarded",
+            3: "worker_unsupported",
+            4: "already_terminal",
+            5: "unknown_or_unauthorized",
+            6: "forwarding_failed",
+        }
+        outcome = outcomes.get(value)
+        if outcome is not None:
+            self._settle_cancellation(correlation_id, outcome)
+
+    async def _abandon_call(self, call: RPCCall, reason: Literal[1, 2]) -> None:
+        correlation_id = call._key  # noqa: SLF001
+        if self._pending.get(correlation_id) is call:
+            self._pending.pop(correlation_id, None)
+        if call._cancellation.done():  # noqa: SLF001
+            return
+        if not self.connection.capabilities & CAP_RPC_CANCELLATION:
+            self._resolve_call_outcome(call, "unsupported")
+            return
+        if call._key in self._pending_cancellations:  # noqa: SLF001
+            return
+        loop = asyncio.get_running_loop()
+        timeout = loop.call_later(
+            _RPC_CANCELLATION_GRACE_SECONDS,
+            self._settle_cancellation,
+            correlation_id,
+            "unconfirmed",
+        )
+        self._pending_cancellations[correlation_id] = (call._cancellation, timeout)  # noqa: SLF001
+        writer = BufferWriter()
+        writer.write_u8(1)
+        writer.write_bytes(correlation_id)
+        writer.write_u8(reason)
+        try:
+            await self.connection.send(MSG_RPC_CANCELLATION, writer.build())
+        except (FitzConnectionError, FitzTimeoutError):
+            self._settle_cancellation(correlation_id, "connection_closed")
+        except Exception:  # noqa: BLE001
+            self._settle_cancellation(correlation_id, "unconfirmed")
+
+    def _finish_call(self, call: RPCCall, outcome: RpcCancellationOutcome) -> None:
+        correlation_id = call._key  # noqa: SLF001
+        if self._pending.get(correlation_id) is call:
+            self._pending.pop(correlation_id, None)
+        self._resolve_call_outcome(call, outcome)
+
+    @staticmethod
+    def _resolve_call_outcome(call: RPCCall, outcome: RpcCancellationOutcome) -> None:
+        if not call._cancellation.done():  # noqa: SLF001
+            call._cancellation.set_result(outcome)  # noqa: SLF001
+
+    def _settle_cancellation(self, correlation_id: bytes, outcome: RpcCancellationOutcome) -> None:
+        pending = self._pending_cancellations.pop(correlation_id, None)
+        if pending is None:
+            return
+        future, timeout = pending
+        timeout.cancel()
+        if not future.done():
+            future.set_result(outcome)
+
+    def _forget_invocation(self, invocation: _ActiveInvocation) -> None:
+        if self._active_invocations.get(invocation.correlation_id) is invocation:
+            self._active_invocations.pop(invocation.correlation_id, None)
+        if invocation.deadline_handle is not None:
+            invocation.deadline_handle.cancel()
+            invocation.deadline_handle = None
+
+    def _schedule_cleanup_ack(self, invocation: _ActiveInvocation) -> None:
+        task = asyncio.create_task(self._acknowledge_invocation(invocation))
+        self._terminal_tasks.add(task)
+        task.add_done_callback(self._terminal_completed)
+
+    async def _acknowledge_invocation(self, invocation: _ActiveInvocation) -> None:
+        self._forget_invocation(invocation)
+        if not self.connection.capabilities & CAP_RPC_CANCELLATION:
+            return
+        with contextlib.suppress(Exception):
+            await self.connection.send(
+                MSG_RPC_CANCELLATION,
+                b"\x03" + invocation.correlation_id,
+            )
+
     def _on_request(self, payload: bytes) -> None:
         reader = BufferReader(payload)
         correlation_id = reader.read_bytes(16)
         route = reader.read_route()
         body = reader.read_bytes(reader.read_u32_be())
+        remaining_budget_ms = _read_request_budget(reader)
         if not reader.is_eof():
             raise RPCError("RPC request has trailing bytes", "INVALID_RESPONSE")
         registration = self._best_worker(route)
         if registration is None:
             return
-        request = InboundRequest(route, body)
-        response = ResponseWriter(self.connection, correlation_id)
+        deadline = (
+            asyncio.get_running_loop().time() + remaining_budget_ms / 1000
+            if remaining_budget_ms is not None
+            else None
+        )
+        context = RpcHandlerContext(asyncio.Event(), deadline)
+        active = _ActiveInvocation(
+            context, ResponseWriter(self.connection, correlation_id), correlation_id
+        )
+        if deadline is not None:
+            active.deadline_handle = asyncio.get_running_loop().call_later(
+                max(0, deadline - asyncio.get_running_loop().time()), context.cancelled.set
+            )
+        self._active_invocations[correlation_id] = active
+        request = InboundRequest(route, body, context)
+        response = active.response
         if not self.connection.dispatch_async(
-            lambda: self._run_worker(registration, request, response)
+            lambda: self._run_worker(registration, request, active)
         ):
-            self._schedule_terminal(response, 6003, "Worker is locally saturated")
+            self._forget_invocation(active)
+            self._schedule_terminal(response, 6003, "Worker is locally saturated", active)
 
-    @staticmethod
     async def _run_worker(
+        self,
         registration: _Registration,
         request: InboundRequest,
-        response: ResponseWriter,
+        active: _ActiveInvocation,
     ) -> None:
-        async with registration.semaphore:
-            try:
-                await registration.handler(request, response)
-            except asyncio.CancelledError:
-                if not response._ended:  # noqa: SLF001
-                    with contextlib.suppress(Exception):
-                        await RPCClient._send_error(response, 6010, "Worker handler cancelled")
-                raise
-            except Exception as exc:  # noqa: BLE001
-                if response._ended:  # noqa: SLF001
+        try:
+            async with registration.semaphore:
+                if active.context.cancelled.is_set():
                     return
-                await RPCClient._send_error(response, 6010, str(exc) or type(exc).__name__)
+                active.started = True
+                try:
+                    await registration.handler(request, active.response)
+                except asyncio.CancelledError:
+                    if not active.response.ended:
+                        with contextlib.suppress(Exception):
+                            await self._send_error(
+                                active.response, 6010, "Worker handler cancelled"
+                            )
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    if active.response.ended:
+                        return
+                    await self._send_error(active.response, 6010, str(exc) or type(exc).__name__)
+        finally:
+            active.finished = True
+            # Cancellation may already be ordered at the broker while its
+            # worker notification is still in transit. A completed handler must
+            # acknowledge cleanup even when it has not seen that notification.
+            if active.cancellation_requested or active.response.ended:
+                await self._acknowledge_invocation(active)
 
     def _best_worker(self, route: str) -> _Registration | None:
         matches = [
@@ -367,12 +699,35 @@ class RPCClient(DomainClient):
         for call in tuple(self._pending.values()):
             call.fail(FitzConnectionError("Connection closed while RPC response was pending"))
         self._pending.clear()
+        for correlation_id, (future, timeout) in tuple(self._pending_cancellations.items()):
+            timeout.cancel()
+            if not future.done():
+                future.set_result("connection_closed")
+            self._pending_cancellations.pop(correlation_id, None)
+        for invocation in tuple(self._active_invocations.values()):
+            invocation.context.cancelled.set()
+            if invocation.deadline_handle is not None:
+                invocation.deadline_handle.cancel()
+        self._active_invocations.clear()
 
     def _worker_lock(self, route: str) -> asyncio.Lock:
         return self._worker_locks.setdefault(route, asyncio.Lock())
 
-    def _schedule_terminal(self, response: ResponseWriter, code: int, message: str) -> None:
-        task = asyncio.create_task(self._send_error(response, code, message))
+    def _schedule_terminal(
+        self,
+        response: ResponseWriter,
+        code: int,
+        message: str,
+        invocation: _ActiveInvocation | None = None,
+    ) -> None:
+        async def terminate() -> None:
+            try:
+                await self._send_error(response, code, message)
+            finally:
+                if invocation is not None:
+                    await self._acknowledge_invocation(invocation)
+
+        task = asyncio.create_task(terminate())
         self._terminal_tasks.add(task)
         task.add_done_callback(self._terminal_completed)
 
@@ -428,9 +783,33 @@ def _looks_like_request(payload: bytes) -> bool:
         reader.read_bytes(16)
         reader.read_route()
         reader.read_bytes(reader.read_u32_be())
+        _read_request_budget(reader)
         return reader.is_eof()
     except BaseException:  # noqa: BLE001
         return False
+
+
+def _write_request_budget(writer: BufferWriter, remaining_budget_ms: int) -> None:
+    if not 0 <= remaining_budget_ms <= _MAX_RPC_BUDGET_MS:
+        raise ValueError(f"remaining budget must be in 0..={_MAX_RPC_BUDGET_MS} milliseconds")
+    writer.write_u8(_RPC_EXTENSION_VERSION)
+    writer.write_u8(1)
+    writer.write_u32_be(remaining_budget_ms)
+
+
+def _read_request_budget(reader: BufferReader) -> int | None:
+    if reader.is_eof():
+        return None
+    if reader.remaining_bytes() != 6:
+        raise RPCError("RPC request has trailing or truncated extension bytes", "INVALID_RESPONSE")
+    version = reader.read_u8()
+    flags = reader.read_u8()
+    remaining_budget_ms = reader.read_u32_be()
+    if version != _RPC_EXTENSION_VERSION or flags != 1:
+        raise RPCError("Unsupported RPC request extension", "INVALID_RESPONSE")
+    if remaining_budget_ms > _MAX_RPC_BUDGET_MS:
+        raise RPCError("RPC remaining budget exceeds one day", "INVALID_RESPONSE")
+    return remaining_budget_ms
 
 
 def _looks_like_response(payload: bytes) -> bool:
