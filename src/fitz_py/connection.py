@@ -298,12 +298,9 @@ class Connection:
             self._auth_error = asyncio.get_running_loop().create_future()
             receive_task = asyncio.create_task(self._receive_loop(transport, parser))
             self._receive_task = receive_task
-            await self._send_connect()
-            try:
-                async with asyncio.timeout(self._config.auth_settle_timeout):
-                    await asyncio.shield(self._auth_error)
-            except TimeoutError:
-                pass
+            async with asyncio.timeout(self._config.request_timeout):
+                await self._send_connect()
+                await asyncio.shield(self._auth_error)
             if self._auth_error.done():
                 self._auth_error.result()
             self._auth_error = None
@@ -396,6 +393,8 @@ class Connection:
                         int.from_bytes(frame.payload[:2], "big"),
                         int.from_bytes(frame.payload[2:6], "big"),
                     )
+                    if self._auth_error is not None and not self._auth_error.done():
+                        self._auth_error.set_result(None)
                     if (
                         self._config.service_name is not None
                         and self._multiplexer.capabilities & CAP_SESSION_METADATA

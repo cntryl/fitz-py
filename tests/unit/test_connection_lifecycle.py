@@ -24,16 +24,21 @@ from fitz_py.types import (
 
 
 class FakeTransport(Transport):
-    def __init__(self) -> None:
+    def __init__(self, *, send_hello: bool = True) -> None:
         self.connected = False
         self.closed = False
         self.sent: list[bytes] = []
         self.inbound: asyncio.Queue[bytes | BaseException] = asyncio.Queue()
         self.send_event = asyncio.Event()
         self.heartbeat_calls = 0
+        self.send_hello = send_hello
 
     async def connect(self) -> None:
         self.connected = True
+        if self.send_hello and self.inbound.empty():
+            self.inbound.put_nowait(
+                FrameCodec.encode_frame(MSG_SERVER_HELLO, b"\x00\x01\x00\x00\x00\x00")
+            )
 
     async def close(self) -> None:
         self.closed = True

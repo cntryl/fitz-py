@@ -10,6 +10,12 @@ python -m pip install cntryl-fitz
 
 ## Connect
 
+Connection readiness waits for `SERVER_HELLO` within `request_timeout`, so the
+first domain command uses the broker's advertised capabilities. An explicit
+zero capability advertisement preserves legacy behavior; a missing advertisement
+times out and closes the transport. `auth_settle_timeout` is retained as a
+deprecated option.
+
 ```python
 from fitz_py import Client
 
@@ -75,6 +81,25 @@ All library failures derive from `FitzError`. Transport, connection, timeout, pr
 queue, stale-handle, and domain failures have stable string codes and structured context. Task
 cancellation is preserved. Requests cancelled after transmission leave a FIFO tombstone so a late
 reply cannot corrupt the next same-type request.
+
+When the broker advertises `CAP_RPC_CANCELLATION`, RPC calls carry their remaining timeout budget.
+Closing a started `client.rpc.call()` or cancelling its asyncio task sends a best-effort remote
+cancellation; await `call.cancellation` for the broker result, or use `await call.cancel()` to
+cancel and wait for that result. A worker receives `request.context.cancelled` and
+`request.context.remaining_time_ms()`. Pass the remaining time to downstream RPC calls and wait
+for the cancellation event while cleaning up request-owned work. Brokers without this capability
+keep the legacy wire format, and local cancellation cannot stop work already admitted by a worker.
+The deadline also expires when the caller is not polling its response stream.
+Workers await request-owned cleanup before returning; the SDK acknowledges cleanup afterward.
+A forwarded cancellation does not prove rollback or make a dispatched call safe to retry.
+
+For an explicit A→B→C link, create B's downstream call from the inbound request:
+
+```python
+async with client.rpc.call_from_request(request, "rpc://realm/area/child", body) as child:
+    async for frame in child:
+        await process(frame.body)
+```
 
 Schedule backend unavailability and broker saturation use the distinct coded
 error `ERR_SCHEDULE_BACKEND_ERROR` (`7010`). It is retryable subject to the

@@ -23,11 +23,14 @@ from fitz_py.domains.notice import Notice, NoticeClient
 from fitz_py.domains.queue import Availability, QueueClient, QueueItem
 from fitz_py.domains.rpc import (
     InboundRequest,
+    LazyRPCCall,
     ResponseFrame,
     ResponseWriter,
     RPCCall,
+    RpcCancellationOutcome,
     RPCClient,
     RPCHandler,
+    RpcHandlerContext,
     Worker,
 )
 from fitz_py.domains.schedule import (
@@ -65,6 +68,7 @@ __all__ = [
     "KVPair",
     "KVScanPage",
     "KVTransaction",
+    "LazyRPCCall",
     "Lease",
     "LeaseClient",
     "LeaseInfo",
@@ -82,6 +86,8 @@ __all__ = [
     "RPCHandler",
     "ResponseFrame",
     "ResponseWriter",
+    "RpcCancellationOutcome",
+    "RpcHandlerContext",
     "ScheduleClient",
     "ScheduleCursorPage",
     "ScheduleEntry",

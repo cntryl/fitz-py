@@ -114,7 +114,7 @@ class ClientConfig:
     token_provider: TokenProvider | None = None
     transport: TransportType | str = TransportType.AUTO
     request_timeout: float = 30.0
-    auth_settle_timeout: float = 1.0
+    auth_settle_timeout: float = 1.0  # Deprecated; readiness waits for SERVER_HELLO.
     max_frame_size: int = 1_048_576
     reconnect: ReconnectPolicy = field(default_factory=ReconnectPolicy)
     retry: RetryPolicy = field(default_factory=RetryPolicy)
