@@ -654,6 +654,8 @@ class RPCClient(DomainClient):
             return
         try:
             async with registration.semaphore:
+                if self._active_invocations.get(active.correlation_id) is not active:
+                    return
                 if active.context.remaining_time_ms() == 0:
                     active.context.cancelled.set()
                     if not active.cancellation_requested:

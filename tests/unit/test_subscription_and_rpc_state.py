@@ -437,6 +437,48 @@ async def test_rpc_does_not_send_expired_buffered_response_after_disconnect() ->
 
 
 @pytest.mark.asyncio
+async def test_rpc_does_not_send_expired_semaphore_waiter_after_disconnect() -> None:
+    connection = StubConnection()
+    connection.capabilities = CAP_RPC_CANCELLATION
+    client = RPCClient(connection)  # type: ignore[arg-type]
+    holder_started, release_holder = asyncio.Event(), asyncio.Event()
+
+    async def handler(request: InboundRequest, _response: ResponseWriter) -> None:
+        assert request.body == b"holder"
+        holder_started.set()
+        await release_holder.wait()
+
+    await client.register_worker("rpc://realm/app/work", handler, max_concurrency=1)
+
+    def request(key: bytes, body: bytes, budget: int) -> bytes:
+        writer = BufferWriter()
+        writer.write_bytes(key)
+        writer.write_route("rpc://realm/app/work")
+        writer.write_u32_be(len(body))
+        writer.write_bytes(body)
+        writer.write_bytes(b"\x01\x01")
+        writer.write_u32_be(budget)
+        return writer.build()
+
+    client._on_request(request(b"h" * 16, b"holder", 10000))
+    await asyncio.wait_for(holder_started.wait(), 1)
+    queued = []
+    connection.dispatch_async = lambda work: queued.append(work) is None  # type: ignore[method-assign]
+    client._on_request(request(b"w" * 16, b"waiter", 0))
+    waiter = asyncio.create_task(queued[0]())
+    try:
+        await asyncio.sleep(0)
+        client._disconnect()
+        sent_before_release = len(connection.sent)
+        release_holder.set()
+        await asyncio.wait_for(waiter, 1)
+        assert len(connection.sent) == sent_before_release
+    finally:
+        release_holder.set()
+        await waiter
+
+
+@pytest.mark.asyncio
 async def test_rpc_downstream_call_inherits_budget_and_parent_cancellation() -> None:
     connection = StubConnection()
     connection.capabilities = CAP_RPC_CANCELLATION
