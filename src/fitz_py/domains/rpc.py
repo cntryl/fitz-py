@@ -276,24 +276,28 @@ class RPCCall(AsyncIterator[ResponseFrame]):
 class LazyRPCCall(LazyAsyncIterator[ResponseFrame]):
     """Lazy RPC stream with explicit cancellation outcome access."""
 
+    def __init__(self, factory: Callable[[], Awaitable[RPCCall]]) -> None:
+        self._cancellation: asyncio.Future[RpcCancellationOutcome] | None = None
+
+        async def start() -> RPCCall:
+            resource = await factory()
+            self._cancellation = resource.cancellation
+            return resource
+
+        super().__init__(start)
+
     @property
     def cancellation(self) -> Awaitable[RpcCancellationOutcome]:
         return self._get_cancellation()
 
     async def cancel(self) -> RpcCancellationOutcome:
-        if self._resource is None:
-            await self.aclose()
-            return "not_requested"
-        if isinstance(self._resource, RPCCall):
-            return await self._resource.cancel()
-        raise FitzConnectionError("RPC call has no active handle")
+        await self.aclose()
+        return await self._get_cancellation()
 
     async def _get_cancellation(self) -> RpcCancellationOutcome:
-        if self._resource is None:
+        if self._cancellation is None:
             return "not_requested"
-        if isinstance(self._resource, RPCCall):
-            return await self._resource.cancellation
-        raise FitzConnectionError("RPC call has no active handle")
+        return await self._cancellation
 
 
 RPCHandler = Callable[[InboundRequest, ResponseWriter], Awaitable[None]]
@@ -645,8 +649,18 @@ class RPCClient(DomainClient):
         request: InboundRequest,
         active: _ActiveInvocation,
     ) -> None:
+        if self._active_invocations.get(active.correlation_id) is not active:
+            active.finished = True
+            return
         try:
             async with registration.semaphore:
+                if active.context.remaining_time_ms() == 0:
+                    active.context.cancelled.set()
+                    if not active.cancellation_requested:
+                        await self._send_error(
+                            active.response, 6001, "Inbound RPC request deadline elapsed"
+                        )
+                    return
                 if active.context.cancelled.is_set():
                     return
                 active.started = True

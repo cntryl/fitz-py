@@ -369,6 +369,74 @@ async def test_rpc_negotiated_budget_and_cancellation_result() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("close_mode", ["aclose", "context_exit"])
+async def test_lazy_rpc_retains_cancellation_outcome_after_disposal(close_mode: str) -> None:
+    connection = StubConnection()
+    connection.capabilities = CAP_RPC_CANCELLATION
+    client = RPCClient(connection)  # type: ignore[arg-type]
+    call = client.call("rpc://realm/app/work", b"body")
+    await call.__aenter__()
+    key = BufferReader(connection.sent[0][1]).read_bytes(16)
+    if close_mode == "aclose":
+        await call.aclose()
+    else:
+        await call.__aexit__(None, None, None)
+    await asyncio.wait_for(connection.rpc_control_sent.wait(), 1)
+    client._on_lifecycle(b"\x04" + key + b"\x02")
+    assert await call.cancellation == "forwarded"
+    assert await call.cancel() == "forwarded"
+
+
+@pytest.mark.asyncio
+async def test_rpc_does_not_start_handler_with_zero_inbound_budget() -> None:
+    connection = StubConnection()
+    connection.capabilities = CAP_RPC_CANCELLATION
+    queued = []
+    connection.dispatch_async = lambda work: queued.append(work) is None  # type: ignore[method-assign]
+    client = RPCClient(connection)  # type: ignore[arg-type]
+    called = False
+
+    async def handler(_request: InboundRequest, _response: ResponseWriter) -> None:
+        nonlocal called
+        called = True
+
+    await client.register_worker("rpc://realm/app/work", handler)
+    request = BufferWriter()
+    request.write_bytes(b"z" * 16)
+    request.write_route("rpc://realm/app/work")
+    request.write_u32_be(0)
+    request.write_bytes(b"\x01\x01\x00\x00\x00\x00")
+    client._on_request(request.build())
+    await queued[0]()
+    assert not called
+    assert b"z" * 16 not in client._active_invocations
+
+
+@pytest.mark.asyncio
+async def test_rpc_does_not_send_expired_buffered_response_after_disconnect() -> None:
+    connection = StubConnection()
+    connection.capabilities = CAP_RPC_CANCELLATION
+    queued = []
+    connection.dispatch_async = lambda work: queued.append(work) is None  # type: ignore[method-assign]
+    client = RPCClient(connection)  # type: ignore[arg-type]
+
+    async def handler(_request: InboundRequest, _response: ResponseWriter) -> None:
+        pytest.fail("disconnected invocation entered handler")
+
+    await client.register_worker("rpc://realm/app/work", handler)
+    request = BufferWriter()
+    request.write_bytes(b"x" * 16)
+    request.write_route("rpc://realm/app/work")
+    request.write_u32_be(0)
+    request.write_bytes(b"\x01\x01\x00\x00\x00\x00")
+    client._on_request(request.build())
+    client._disconnect()
+    sent_before_dispatch = len(connection.sent)
+    await queued[0]()
+    assert len(connection.sent) == sent_before_dispatch
+
+
+@pytest.mark.asyncio
 async def test_rpc_downstream_call_inherits_budget_and_parent_cancellation() -> None:
     connection = StubConnection()
     connection.capabilities = CAP_RPC_CANCELLATION
@@ -545,8 +613,7 @@ async def test_rpc_counts_dispatch_buffer_time_against_inherited_deadline() -> N
         await client._active_invocations[b"b" * 16].context.cancelled.wait()
     await queued[0]()
     assert not called
-    assert client._active_invocations[b"b" * 16].context.remaining_time_ms() == 0
-    client._on_lifecycle(b"\x02" + b"b" * 16 + b"\x02")
+    assert b"b" * 16 not in client._active_invocations
     await asyncio.wait_for(connection.rpc_control_sent.wait(), 1)
 
 
