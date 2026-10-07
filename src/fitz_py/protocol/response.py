@@ -38,3 +38,14 @@ def parse_response(payload: bytes, *, plain: bool = False, stream: bool = False)
 def parse_stream_response(payload: bytes, *, plain: bool = False) -> Response:
     """Decode status-2 Stream errors or legacy operation-specific status-1 errors."""
     return parse_response(payload, plain=plain, stream=True)
+
+
+def parse_plain_or_coded_response(payload: bytes) -> Response:
+    """Parse legacy plain domain errors and coded ingress errors without guessing."""
+    if not payload or payload[0] != 1:
+        return parse_response(payload, plain=True)
+    plain = len(payload) >= 5 and int.from_bytes(payload[1:5], "big") == len(payload) - 5
+    coded = len(payload) >= 9 and int.from_bytes(payload[5:9], "big") == len(payload) - 9
+    if plain == coded:
+        raise ProtocolError("Malformed or ambiguous error response")
+    return parse_response(payload, plain=plain)

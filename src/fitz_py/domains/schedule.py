@@ -23,7 +23,7 @@ from fitz_py.protocol.messages import (
     MSG_SCHEDULE_SUBSCRIBE,
     MSG_SCHEDULE_UNSUBSCRIBE,
 )
-from fitz_py.protocol.response import Response, parse_response
+from fitz_py.protocol.response import Response, parse_plain_or_coded_response, parse_response
 from fitz_py.types import BytesLike
 
 
@@ -105,11 +105,11 @@ class ScheduleClient(DomainClient):
         writer.write_u8(0 if mode is DeliveryMode.BROADCAST else 1)
         writer.write_u32_be(len(payload))
         writer.write_bytes(payload)
-        response = parse_response(
-            await self.request_frame(MSG_SCHEDULE_CREATE, writer.build()), plain=True
+        response = parse_plain_or_coded_response(
+            await self.request_frame(MSG_SCHEDULE_CREATE, writer.build())
         )
         if not response.success:
-            raise ScheduleError(f"CREATE failed: {response.error}", "CREATE")
+            raise ScheduleError(f"CREATE failed: {response.error}", "CREATE", response.error_code)
         if response.data:
             raise ScheduleError("CREATE response has trailing bytes", "INVALID_RESPONSE")
         return route
@@ -118,11 +118,11 @@ class ScheduleClient(DomainClient):
         _route(route)
         writer = BufferWriter()
         writer.write_route(route)
-        response = parse_response(
-            await self.request_frame(MSG_SCHEDULE_CANCEL, writer.build()), plain=True
+        response = parse_plain_or_coded_response(
+            await self.request_frame(MSG_SCHEDULE_CANCEL, writer.build())
         )
         if not response.success:
-            raise ScheduleError(f"CANCEL failed: {response.error}", "CANCEL")
+            raise ScheduleError(f"CANCEL failed: {response.error}", "CANCEL", response.error_code)
         if response.data:
             raise ScheduleError("CANCEL response has trailing bytes", "INVALID_RESPONSE")
 
@@ -245,11 +245,13 @@ class ScheduleClient(DomainClient):
     async def _subscribe_wire(self, route: str) -> int:
         writer = BufferWriter()
         writer.write_route(route)
-        response = parse_response(
-            await self.request_frame(MSG_SCHEDULE_SUBSCRIBE, writer.build()), plain=True
+        response = parse_plain_or_coded_response(
+            await self.request_frame(MSG_SCHEDULE_SUBSCRIBE, writer.build())
         )
         if not response.success:
-            raise ScheduleError(f"SUBSCRIBE failed: {response.error}", "SUBSCRIBE")
+            raise ScheduleError(
+                f"SUBSCRIBE failed: {response.error}", "SUBSCRIBE", response.error_code
+            )
         reader = BufferReader(response.data)
         if reader.read_u8() != 1:
             raise ScheduleError("SUBSCRIBE response omitted its id", "INVALID_RESPONSE")
@@ -261,11 +263,13 @@ class ScheduleClient(DomainClient):
     async def _unsubscribe_wire(self, route: str) -> None:
         writer = BufferWriter()
         writer.write_route(route)
-        response = parse_response(
-            await self.request_frame(MSG_SCHEDULE_UNSUBSCRIBE, writer.build()), plain=True
+        response = parse_plain_or_coded_response(
+            await self.request_frame(MSG_SCHEDULE_UNSUBSCRIBE, writer.build())
         )
         if not response.success:
-            raise ScheduleError(f"UNSUBSCRIBE failed: {response.error}", "UNSUBSCRIBE")
+            raise ScheduleError(
+                f"UNSUBSCRIBE failed: {response.error}", "UNSUBSCRIBE", response.error_code
+            )
         if response.data:
             raise ScheduleError("UNSUBSCRIBE response has trailing bytes", "INVALID_RESPONSE")
 
@@ -281,10 +285,7 @@ class ScheduleClient(DomainClient):
 
 
 def _parse_extension_response(payload: bytes) -> Response:
-    if len(payload) >= 5 and payload[0] == 1:
-        plain_length = int.from_bytes(payload[1:5], "big")
-        return parse_response(payload, plain=len(payload) == 5 + plain_length)
-    return parse_response(payload, plain=True)
+    return parse_plain_or_coded_response(payload)
 
 
 def _route(route: str) -> None:
