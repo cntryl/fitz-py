@@ -20,7 +20,7 @@ from fitz_py.protocol.messages import (
     MSG_QUEUE_SUBSCRIBE,
     MSG_QUEUE_UNSUBSCRIBE,
 )
-from fitz_py.protocol.response import parse_response
+from fitz_py.protocol.response import parse_plain_or_coded_response, parse_response
 from fitz_py.types import BytesLike
 
 
@@ -160,11 +160,11 @@ class QueueClient(DomainClient):
         writer.write_route(route)
         writer.write_u64_be(item_id)
         writer.write_u64_be(token)
-        response = parse_response(
-            await self.request_frame(MSG_QUEUE_COMPLETE, writer.build()), plain=True
+        response = parse_plain_or_coded_response(
+            await self.request_frame(MSG_QUEUE_COMPLETE, writer.build())
         )
         if not response.success:
-            raise QueueError(f"COMPLETE failed: {response.error}", "COMPLETE")
+            raise QueueError(f"COMPLETE failed: {response.error}", "COMPLETE", response.error_code)
         if response.data:
             raise QueueError("COMPLETE response has trailing bytes", "INVALID_RESPONSE")
 
@@ -175,22 +175,24 @@ class QueueClient(DomainClient):
         writer.write_u64_be(item_id)
         writer.write_u64_be(token)
         writer.write_u64_be(lease)
-        response = parse_response(
-            await self.request_frame(MSG_QUEUE_EXTEND, writer.build()), plain=True
+        response = parse_plain_or_coded_response(
+            await self.request_frame(MSG_QUEUE_EXTEND, writer.build())
         )
         if not response.success:
-            raise QueueError(f"EXTEND failed: {response.error}", "EXTEND")
+            raise QueueError(f"EXTEND failed: {response.error}", "EXTEND", response.error_code)
         if response.data:
             raise QueueError("EXTEND response has trailing bytes", "INVALID_RESPONSE")
 
     async def _subscribe_wire(self, selector: str) -> int:
         writer = BufferWriter()
         writer.write_route(selector)
-        response = parse_response(
-            await self.request_frame(MSG_QUEUE_SUBSCRIBE, writer.build()), plain=True
+        response = parse_plain_or_coded_response(
+            await self.request_frame(MSG_QUEUE_SUBSCRIBE, writer.build())
         )
         if not response.success:
-            raise QueueError(f"SUBSCRIBE failed: {response.error}", "SUBSCRIBE")
+            raise QueueError(
+                f"SUBSCRIBE failed: {response.error}", "SUBSCRIBE", response.error_code
+            )
         reader = BufferReader(response.data)
         if reader.read_u8() != 1:
             raise QueueError("SUBSCRIBE response omitted its id", "INVALID_RESPONSE")
@@ -202,11 +204,13 @@ class QueueClient(DomainClient):
     async def _unsubscribe_wire(self, selector: str) -> None:
         writer = BufferWriter()
         writer.write_route(selector)
-        response = parse_response(
-            await self.request_frame(MSG_QUEUE_UNSUBSCRIBE, writer.build()), plain=True
+        response = parse_plain_or_coded_response(
+            await self.request_frame(MSG_QUEUE_UNSUBSCRIBE, writer.build())
         )
         if not response.success:
-            raise QueueError(f"UNSUBSCRIBE failed: {response.error}", "UNSUBSCRIBE")
+            raise QueueError(
+                f"UNSUBSCRIBE failed: {response.error}", "UNSUBSCRIBE", response.error_code
+            )
         if response.data:
             raise QueueError("UNSUBSCRIBE response has trailing bytes", "INVALID_RESPONSE")
 
