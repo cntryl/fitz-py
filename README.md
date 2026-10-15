@@ -26,7 +26,7 @@ async with Client(
 ) as client:
     async with client.kv.transaction("kv://example/app/users") as tx:
         await tx.put(b"alice", b"active")
-        await tx.commit()
+        await tx.commit(KVDurability.SYNC)
 ```
 
 `service_name` is optional. New brokers record it on the active session after
