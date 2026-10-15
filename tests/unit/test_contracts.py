@@ -923,7 +923,7 @@ async def test_stream_operations_decode_plain_error_envelopes() -> None:
     client = StreamClient(connection)
     operations = (
         StreamSession(connection, 1).append(0, b"event"),
-        StreamSession(connection, 2).commit(),
+        StreamSession(connection, 2).commit("sync"),
         StreamSession(connection, 3).rollback(),
         client.peek("stream://r/a/events"),
         client.metadata("stream://r/a/events"),
@@ -1192,7 +1192,7 @@ async def test_stream_session_preserves_versioned_error_code(
         if operation == "append":
             await session.append(0, b"event")
         else:
-            await session.commit()
+            await session.commit("sync")
 
     assert raised.value.domain_code == code
     assert message in str(raised.value)

@@ -27,3 +27,7 @@ Version 0.2.0 is a clean break. It intentionally provides no compatibility alias
 
 Lazy stream/context objects start at most once. Closing one before it starts performs no network I/O.
 Closing during startup waits for the factory and immediately cleans up any resource it created.
+
+## Explicit commit persistence (breaking)
+
+KV BEGIN and transaction contexts now select scope/mode only. Pass `KVDurability.BUFFERED` or `KVDurability.SYNC` to `await tx.commit(...)`. Stream `commit` also requires an explicit `StreamCommitMode.BUFFERED` or `StreamCommitMode.SYNC`; its implicit Buffered default is removed. Context exit rolls back unless explicitly committed. Sync preserves local synced-WAL/cloud acknowledgement semantics, Buffered maps to buffered WAL/CloudAsync. Queue stays best effort. Old KV BEGIN/COMMIT wire frames are not supported.

@@ -218,7 +218,7 @@ class StreamSession:
             raise StreamError("APPEND response has trailing bytes", "INVALID_RESPONSE")
         return int.from_bytes(data, "big") if len(data) == 8 else None
 
-    async def commit(self, mode: StreamCommitMode | str = StreamCommitMode.BUFFERED) -> None:
+    async def commit(self, mode: StreamCommitMode | str) -> None:
         self._ensure_open("COMMIT")
         resolved_mode = StreamCommitMode(mode)
         writer = BufferWriter()

@@ -293,8 +293,9 @@ class KVTransaction:
                 next_start = last_key + b"\x00"
                 exclusive = False
 
-    async def commit(self) -> None:
-        await self._finish(MSG_KV_COMMIT, "COMMIT")
+    async def commit(self, durability: KVDurability | str) -> None:
+        resolved = KVDurability(durability)
+        await self._finish(MSG_KV_COMMIT, "COMMIT", 1 if resolved is KVDurability.SYNC else 0)
 
     async def rollback(self) -> None:
         if self._closed:
@@ -316,14 +317,17 @@ class KVTransaction:
                 operation,
             )
 
-    async def _finish(self, message_type: int, operation: str) -> None:
+    async def _finish(
+        self, message_type: int, operation: str, persistence: int | None = None
+    ) -> None:
         async with self._lock:
             self._ensure_open()
             self._closed = True
             self._disconnect()
-            reader = BufferReader(
-                await self._connection.request(message_type, self._prefix().build())
-            )
+            writer = self._prefix()
+            if persistence is not None:
+                writer.write_u8(persistence)
+            reader = BufferReader(await self._connection.request(message_type, writer.build()))
             self._status(reader, operation)
 
     def _prefix(self) -> BufferWriter:
@@ -369,7 +373,6 @@ class KVClient(DomainClient):
         self,
         route: str,
         *,
-        durability: KVDurability | str = KVDurability.BUFFERED,
         mode: KVMode | str = KVMode.READ_WRITE,
     ) -> KVTransaction:
         if not is_exact_route_shape(route, "kv", 3):
@@ -377,7 +380,6 @@ class KVClient(DomainClient):
         writer = BufferWriter()
         writer.write_route(route)
         writer.write_u8(1 if KVMode(mode) is KVMode.READ_WRITE else 0)
-        writer.write_u8(1 if KVDurability(durability) is KVDurability.SYNC else 0)
         reader = BufferReader(await self.request_frame(MSG_KV_BEGIN, writer.build()))
         KVTransaction._status(reader, "BEGIN")  # noqa: SLF001
         if reader.remaining_bytes() != 8:
@@ -388,11 +390,10 @@ class KVClient(DomainClient):
         self,
         route: str,
         *,
-        durability: KVDurability | str = KVDurability.BUFFERED,
         mode: KVMode | str = KVMode.READ_WRITE,
     ) -> LazyAsyncContext[KVTransaction]:
         return LazyAsyncContext(
-            lambda: self.begin(route, durability=durability, mode=mode),
+            lambda: self.begin(route, mode=mode),
             lambda transaction: transaction.rollback(),
         )
 

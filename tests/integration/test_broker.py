@@ -7,7 +7,6 @@ import pytest
 from fitz_py import (
     DeliveryMode,
     InboundRequest,
-    KVDurability,
     ResponseWriter,
     RPCError,
     ScheduleEntry,
@@ -22,11 +21,11 @@ async def test_connect_and_kv_round_trip(transport: str, auth_mode: str) -> None
     fixture = await IntegrationFixture.connect_or_fail(transport, auth_mode)  # type: ignore[arg-type]
     try:
         route = unique_route("kv")
-        async with fixture.client.kv.transaction(route, durability=KVDurability.SYNC) as tx:
+        async with fixture.client.kv.transaction(route) as tx:
             await tx.put(b"key", b"value")
             assert await tx.get(b"key") == b"value"
-            await tx.commit()
-        async with fixture.client.kv.transaction(route, durability=KVDurability.BUFFERED) as tx:
+            await tx.commit("sync")
+        async with fixture.client.kv.transaction(route) as tx:
             assert await tx.get(b"key") == b"value"
     finally:
         await fixture.aclose()
@@ -66,7 +65,7 @@ async def test_lease_notice_stream_rpc_and_schedule_workflows(transport: str) ->
         stream_route = unique_route("stream")
         session = await client.stream.begin(stream_route, ingest_metadata=b"")
         assert await session.append(0, b"event", metadata=b"", discriminator="") == 0
-        await session.commit()
+        await session.commit("sync")
         assert [record.body for record in await client.stream.read(stream_route, 0)] == [b"event"]
 
         rpc_route = f"rpc://integration-realm/{unique_route('rpc').split('/')[-2]}/work"

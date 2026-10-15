@@ -233,9 +233,9 @@ async def test_cs001_connect_success() -> None:
         evidence.append("connect returned successfully")
 
         route = _unique_route("kv")
-        tx = await client.kv.begin(route, durability="sync")
+        tx = await client.kv.begin(route)
         await tx.put(b"cs001-key", b"cs001-value")
-        await tx.commit()
+        await tx.commit("sync")
         evidence.append("first domain request (kv) succeeded")
 
         verdict: Verdict = "pass"
@@ -291,7 +291,7 @@ async def test_cs002_auth_failure() -> None:
         evidence.append("connect did not raise (unexpected)")
         # Try a domain operation for diagnostic evidence only.
         try:
-            await client.kv.begin(_unique_route("kv"), durability="sync")
+            await client.kv.begin(_unique_route("kv"))
             evidence.append("WARNING: domain request unexpectedly succeeded")
         except Exception as dom_exc:
             evidence.append(f"domain request failed post-auth: {dom_exc}")
@@ -324,12 +324,12 @@ async def test_cs003_request_success() -> None:
     client = await _new_client()
     try:
         route = _unique_route("kv")
-        tx = await client.kv.begin(route, durability="sync")
+        tx = await client.kv.begin(route)
         await tx.put(b"user:1", b"Alice")
-        await tx.commit()
+        await tx.commit("sync")
         evidence.append("kv begin/put/commit succeeded")
 
-        rtx = await client.kv.begin(route, mode="read_only", durability="sync")
+        rtx = await client.kv.begin(route, mode="read_only")
         result = await rtx.get(b"user:1")
         assert result == b"Alice"
         evidence.append(f'read-after-commit returned "{result.decode()}" (correct)')
@@ -375,9 +375,9 @@ async def test_cs004_unknown_route() -> None:
 
         # Client must remain usable
         route = _unique_route("kv")
-        tx = await client.kv.begin(route, durability="sync")
+        tx = await client.kv.begin(route)
         await tx.put(b"k", b"v")
-        await tx.commit()
+        await tx.commit("sync")
         evidence.append("client remains usable after unknown-route error")
     finally:
         await client.aclose()
@@ -408,12 +408,12 @@ async def test_cs005_invalid_payload() -> None:
     client = await _new_client()
     try:
         route = _unique_route("kv")
-        tx1 = await client.kv.begin(route, durability="sync")
+        tx1 = await client.kv.begin(route)
         await tx1.insert(b"dup-key", b"first")
-        await tx1.commit()
+        await tx1.commit("sync")
         evidence.append("first insert succeeded")
 
-        tx2 = await client.kv.begin(route, durability="sync")
+        tx2 = await client.kv.begin(route)
         caught: Exception | None = None
         try:
             await tx2.insert(b"dup-key", b"second")
@@ -428,7 +428,7 @@ async def test_cs005_invalid_payload() -> None:
         assert caught is not None, "expected error on duplicate insert"
         evidence.append(f"duplicate insert raised {type(caught).__name__}: {caught}")
 
-        rtx = await client.kv.begin(route, mode="read_only", durability="sync")
+        rtx = await client.kv.begin(route, mode="read_only")
         result = await rtx.get(b"dup-key")
         assert result is not None
         evidence.append("client remains usable after server-rejected operation")
@@ -476,11 +476,11 @@ async def test_cs006_server_error_mapping() -> None:
 
         # KV conflict — verify typed error
         kv_route = _unique_route("kv")
-        tx = await client.kv.begin(kv_route, durability="sync")
+        tx = await client.kv.begin(kv_route)
         await tx.insert(b"x", b"1")
-        await tx.commit()
+        await tx.commit("sync")
 
-        tx2 = await client.kv.begin(kv_route, durability="sync")
+        tx2 = await client.kv.begin(kv_route)
         kv_err: Exception | None = None
         try:
             await tx2.insert(b"x", b"2")
@@ -553,9 +553,9 @@ async def test_cs007_timeout_handling() -> None:
 
         # Connection must remain healthy
         kv_route = _unique_route("kv")
-        tx = await client.kv.begin(kv_route, durability="sync")
+        tx = await client.kv.begin(kv_route)
         await tx.put(b"post-timeout", b"ok")
-        await tx.commit()
+        await tx.commit("sync")
         evidence.append("connection healthy after timeout")
         await worker.aclose()
     finally:
@@ -631,9 +631,9 @@ async def test_cs008_caller_cancellation() -> None:
 
         # Subsequent request must succeed
         kv_route = _unique_route("kv")
-        tx = await caller_client.kv.begin(kv_route, durability="sync")
+        tx = await caller_client.kv.begin(kv_route)
         await tx.put(b"after-cancel", b"ok")
-        await tx.commit()
+        await tx.commit("sync")
         evidence.append("subsequent request succeeded after cancellation")
     finally:
         await worker_client.aclose()
@@ -750,9 +750,9 @@ async def test_cs010_reconnect_behavior() -> None:
                 await asyncio.sleep(0.01)
         evidence.append(f"same client reconnected at generation {client._connection.generation}")
         route = _unique_route("kv")
-        tx = await client.kv.begin(route, durability="sync")
+        tx = await client.kv.begin(route)
         await tx.put(b"after-reconnect", b"ok")
-        await tx.commit()
+        await tx.commit("sync")
         evidence.append("new requests succeed on the reconnected client")
     finally:
         await client.aclose()
@@ -786,7 +786,7 @@ async def test_cs011_stream_receive_sequence() -> None:
         session = await client.stream.begin(route)
         for i in range(3):
             await session.append(i, bytes([i * 10]))
-        await session.commit()
+        await session.commit("sync")
         evidence.append("stream session appended 3 records")
 
         records = await client.stream.read(route, start_offset=0, limit=10)
@@ -833,7 +833,7 @@ async def test_cs012_stream_completion() -> None:
         session = await client.stream.begin(route)
         await session.append(0, b"first")
         await session.append(1, b"last")
-        await session.commit()
+        await session.commit("sync")
         evidence.append("stream session committed")
 
         records = await client.stream.read(route, start_offset=0, limit=100)
@@ -879,7 +879,7 @@ async def test_cs013_stream_error_mid_flight() -> None:
         route = _unique_route("stream")
         session = await client.stream.begin(route)
         await session.append(0, b"record-1")
-        await session.commit()
+        await session.commit("sync")
         evidence.append("written first record at offset 0")
 
         caught: Exception | None = None
@@ -895,9 +895,9 @@ async def test_cs013_stream_error_mid_flight() -> None:
 
         # Client must remain usable
         kv_route = _unique_route("kv")
-        tx = await client.kv.begin(kv_route, durability="sync")
+        tx = await client.kv.begin(kv_route)
         await tx.put(b"after-stream-error", b"ok")
-        await tx.commit()
+        await tx.commit("sync")
         evidence.append("client still usable after stream error")
     finally:
         if wrong_session is not None:
@@ -935,10 +935,10 @@ async def test_cs014_concurrent_requests() -> None:
         routes = [_unique_route("kv") for _ in range(3)]
 
         async def _kv_roundtrip(route: str, idx: int) -> str:
-            tx = await client.kv.begin(route, durability="sync")
+            tx = await client.kv.begin(route)
             await tx.put(f"key-{idx}".encode(), f"value-{idx}".encode())
-            await tx.commit()
-            rtx = await client.kv.begin(route, mode="read_only", durability="sync")
+            await tx.commit("sync")
+            rtx = await client.kv.begin(route, mode="read_only")
             result = await rtx.get(f"key-{idx}".encode())
             return result.decode() if result is not None else ""
 
@@ -1056,7 +1056,7 @@ async def test_cs016_filtered_stream_replay() -> None:
         session = await client.stream.begin(route)
         await session.append(0, b"accepted", discriminator="keep")
         await session.append(1, b"filtered", discriminator="drop")
-        await session.commit()
+        await session.commit("sync")
         page = await client.stream.read_page(
             route,
             0,
@@ -1097,10 +1097,7 @@ async def test_cs017_bounded_concurrency_under_burst_load() -> None:
     evidence: list[str] = []
     client = await _new_client(max_in_flight_requests=1, request_queue_size=1)
     try:
-        tasks = [
-            asyncio.create_task(client.kv.begin(_unique_route("kv"), durability="sync"))
-            for _ in range(32)
-        ]
+        tasks = [asyncio.create_task(client.kv.begin(_unique_route("kv"))) for _ in range(32)]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         saturated = [result for result in results if isinstance(result, RequestQueueFullError)]
         unexpected = [
