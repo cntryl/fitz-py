@@ -4,9 +4,16 @@
 deliberate clean break: clients are configured once, domain clients are cached properties, streamed
 results are async iterators, and network/runtime queues are bounded.
 
+PyPI publication is deferred. With Python 3.11 or later, build and install a
+local wheel from this checkout:
+
 ```bash
-python -m pip install cntryl-fitz
+python -m pip install build
+python -m build --wheel
+python -m pip install dist/cntryl_fitz-0.2.0-py3-none-any.whl
 ```
+
+If the release wheel has already been supplied, only the last command is needed.
 
 ## Connect
 
@@ -17,16 +24,23 @@ times out and closes the transport. `auth_settle_timeout` is retained as a
 deprecated option.
 
 ```python
-from fitz_py import Client
+import asyncio
 
-async with Client(
-    "ws://localhost:4190/ws",
-    token_provider=lambda: "",
-    service_name="orders-worker",
-) as client:
-    async with client.kv.transaction("kv://example/app/users") as tx:
-        await tx.put(b"alice", b"active")
-        await tx.commit(KVDurability.SYNC)
+from fitz_py import Client, KVDurability
+
+
+async def main():
+    async with Client(
+        "ws://localhost:4190/ws",
+        token_provider=lambda: "",
+        service_name="orders-worker",
+    ) as client:
+        async with client.kv.transaction("kv://example/app/users") as tx:
+            await tx.put(b"alice", b"active")
+            await tx.commit(KVDurability.SYNC)
+
+
+asyncio.run(main())
 ```
 
 `service_name` is optional. New brokers record it on the active session after
