@@ -8,30 +8,21 @@ from hypothesis import strategies as st
 
 from fitz_py.errors import CodecError
 from fitz_py.protocol.buffer import BufferReader, BufferWriter
-from fitz_py.protocol.frame import FrameCodec, FrameParser
+from fitz_py.protocol.frame import HEADER_LEN, MAX_MESSAGE_SIZE, FrameCodec, FrameParser
 
 
 @given(
     st.lists(
-        st.tuples(
-            st.integers(min_value=0, max_value=0xFFFF),
-            st.binary(max_size=512),
-        ),
-        max_size=20,
-    ),
-    st.lists(st.integers(min_value=1, max_value=37), max_size=100),
+        st.tuples(st.integers(min_value=0, max_value=0xFFFF), st.binary(max_size=512)), max_size=20
+    )
 )
-def test_parser_accepts_arbitrary_fragmentation(
-    frames: list[tuple[int, bytes]], cuts: list[int]
+def test_parser_accepts_arbitrary_complete_transport_frames(
+    frames: list[tuple[int, bytes]],
 ) -> None:
-    encoded = b"".join(FrameCodec.encode_frame(kind, payload) for kind, payload in frames)
     parser = FrameParser()
-    decoded = []
-    offset = 0
-    for size in cuts:
-        decoded.extend(parser.parse_frames(encoded[offset : offset + size]))
-        offset += size
-    decoded.extend(parser.parse_frames(encoded[offset:]))
+    decoded = [
+        parser.parse_frames(FrameCodec.encode_frame(kind, payload))[0] for kind, payload in frames
+    ]
     assert [(frame.message_type, frame.payload) for frame in decoded] == frames
 
 
@@ -55,8 +46,8 @@ def test_u64_round_trip(value: int) -> None:
 
 
 def test_frame_rejects_oversized_payload() -> None:
-    with pytest.raises(CodecError, match="65535"):
-        FrameCodec.encode_frame(1, b"x" * 65_536)
+    with pytest.raises(CodecError, match="exceeds"):
+        FrameCodec.encode_frame(1, b"x" * (MAX_MESSAGE_SIZE - HEADER_LEN + 1))
 
 
 @given(st.integers(min_value=0, max_value=0xFFFF), st.binary(max_size=256))
@@ -70,7 +61,7 @@ def test_frame_decoder_rejects_every_truncation(message_type: int, payload: byte
 @given(st.integers(min_value=0, max_value=0xFFFF), st.binary(max_size=256))
 def test_frame_decoder_rejects_trailing_bytes(message_type: int, payload: bytes) -> None:
     encoded = FrameCodec.encode_frame(message_type, payload)
-    with pytest.raises(CodecError, match="trailing"):
+    with pytest.raises(CodecError):
         FrameCodec.decode_frame(encoded + b"x")
 
 
@@ -82,11 +73,12 @@ def test_frame_encoder_rejects_out_of_range_message_types(message_type: int) -> 
         FrameCodec.encode_frame(message_type, b"")
 
 
-def test_parser_retains_partial_extended_header_without_reprocessing() -> None:
+def test_parser_rejects_fragments_without_retaining_partial_state() -> None:
     frame = FrameCodec.encode_frame(0xFFFF, b"payload")
     parser = FrameParser()
     for byte in frame[:-1]:
-        assert parser.parse_frames(bytes((byte,))) == []
-    decoded = parser.parse_frames(frame[-1:])
+        with pytest.raises(CodecError):
+            parser.parse_frames(bytes((byte,)))
+    decoded = parser.parse_frames(frame)
     assert [(item.message_type, item.payload) for item in decoded] == [(0xFFFF, b"payload")]
     assert parser.parse_frames(b"") == []

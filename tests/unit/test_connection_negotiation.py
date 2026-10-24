@@ -6,8 +6,8 @@ import pytest
 
 from fitz_py.connection import Connection
 from fitz_py.protocol.frame import FrameCodec
-from fitz_py.protocol.messages import CAP_RPC_CANCELLATION, MSG_SERVER_HELLO
-from tests.unit.test_connection_lifecycle import FakeTransport, config
+from fitz_py.protocol.messages import MSG_SERVER_HELLO
+from tests.unit.test_connection_lifecycle import FakeTransport, config, hello_payload
 
 
 @pytest.mark.asyncio
@@ -18,10 +18,11 @@ async def test_connect_waits_for_hello_beyond_authentication_settlement() -> Non
     try:
         await asyncio.sleep(0.025)
         assert not connected.done()
-        hello = (1).to_bytes(2, "big") + CAP_RPC_CANCELLATION.to_bytes(4, "big")
+        hello = hello_payload()
         await transport.inbound.put(FrameCodec.encode_frame(MSG_SERVER_HELLO, hello))
         await connected
-        assert connection.capabilities == CAP_RPC_CANCELLATION
+        assert connection.protocol_version == 2
+        assert connection.capabilities == 0
     finally:
         await connection.close()
 
