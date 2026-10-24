@@ -187,14 +187,10 @@ class Connection:
         try:
             try:
                 correlation_id = (
-                    self._multiplexer.next_correlation_id()
-                    if 300 <= message_type <= 305
-                    else 0
+                    self._multiplexer.next_correlation_id() if 300 <= message_type <= 305 else 0
                 )
                 await self._send_frame(
-                    FrameCodec.encode_frame(
-                        message_type, payload, correlation_id=correlation_id
-                    )
+                    FrameCodec.encode_frame(message_type, payload, correlation_id=correlation_id)
                 )
             except (FitzTransportError, FitzConnectionError, FitzTimeoutError) as exc:
                 self._schedule_connection_loss(exc)
@@ -400,7 +396,8 @@ class Connection:
             raise FitzConnectionError("No active transport")
         if len(frame) > self._max_message_bytes:
             raise FitzTransportError(
-                f"Fitz message length {len(frame)} exceeds max message size {self._max_message_bytes}"
+                f"Fitz message length {len(frame)} exceeds max message size "
+                f"{self._max_message_bytes}"
             )
         async with self._write_lock:
             await transport.send(frame)
@@ -427,7 +424,8 @@ class Connection:
     async def _dispatch_transport_frame(self, data: bytes, parser: FrameParser) -> None:
         if len(data) > self._max_message_bytes:
             raise FitzConnectionError(
-                f"Fitz message length {len(data)} exceeds max message size {self._max_message_bytes}"
+                f"Fitz message length {len(data)} exceeds max message size "
+                f"{self._max_message_bytes}"
             )
         frames = parser.parse_frames(data)
         if not frames:
@@ -447,16 +445,12 @@ class Connection:
             self._max_message_bytes = min(
                 server_max_message_bytes, self._config.max_frame_size, 1_048_576
             )
-            self._max_in_flight = min(
-                server_max_in_flight, self._config.limits.max_in_flight
-            )
+            self._max_in_flight = min(server_max_in_flight, self._config.limits.max_in_flight)
             transport = self._transport
             if transport is not None:
                 transport.set_max_frame_size(self._max_message_bytes)
             self._multiplexer.set_capabilities(version, capabilities)
-            self._gate = RequestGate(
-                self._max_in_flight, self._config.limits.request_queue_size
-            )
+            self._gate = RequestGate(self._max_in_flight, self._config.limits.request_queue_size)
             if self._auth_error is not None and not self._auth_error.done():
                 self._auth_error.set_result(None)
             return

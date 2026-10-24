@@ -151,7 +151,8 @@ ERR_SCHEDULE_BACKEND_ERROR = 7006
 
 _RETRYABLE = {
     ("KV", 1053),
-    ("LEASE", 5050), ("LEASE", 5056),
+    ("LEASE", 5050),
+    ("LEASE", 5056),
     ("RPC", 6051),
 }
 

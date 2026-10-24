@@ -26,6 +26,8 @@ class Transport(ABC):
 
     def set_max_frame_size(self, size: int) -> None:
         """Apply a negotiated transport message limit when supported."""
+        if size <= 0:
+            raise ValueError("max frame size must be positive")
 
     @abstractmethod
     def get_url(self) -> str:

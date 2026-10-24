@@ -22,7 +22,7 @@ from fitz_py.protocol.messages import (
     MSG_SCHEDULE_SUBSCRIBE,
     MSG_SCHEDULE_UNSUBSCRIBE,
 )
-from fitz_py.protocol.response import Response, parse_plain_or_coded_response, parse_response
+from fitz_py.protocol.response import Response, parse_plain_or_coded_response
 from fitz_py.types import BytesLike
 
 
@@ -157,8 +157,12 @@ class ScheduleClient(DomainClient):
         )
         if not response.success:
             raise domain_error(
-                ScheduleError, "CREATE_BATCH", response.error_code or 0, response.error,
-                response.error_class, response.effect
+                ScheduleError,
+                "CREATE_BATCH",
+                response.error_code or 0,
+                response.error,
+                response.error_class,
+                response.effect,
             )
         if response.data:
             raise ScheduleError("CREATE_BATCH response has trailing bytes", "INVALID_RESPONSE")
@@ -178,8 +182,12 @@ class ScheduleClient(DomainClient):
         )
         if not response.success:
             raise domain_error(
-                ScheduleError, "LIST_V2", response.error_code or 0, response.error,
-                response.error_class, response.effect
+                ScheduleError,
+                "LIST_V2",
+                response.error_code or 0,
+                response.error,
+                response.error_class,
+                response.effect,
             )
         reader = BufferReader(response.data)
         if reader.read_u8() != 1:
@@ -240,8 +248,11 @@ class ScheduleClient(DomainClient):
         )
         if not response.success:
             raise ScheduleError(
-                f"SUBSCRIBE failed: {response.error}", "SUBSCRIBE", response.error_code,
-                response.error_class, response.effect
+                f"SUBSCRIBE failed: {response.error}",
+                "SUBSCRIBE",
+                response.error_code,
+                response.error_class,
+                response.effect,
             )
         reader = BufferReader(response.data)
         if reader.read_u8() != 1:
@@ -259,8 +270,11 @@ class ScheduleClient(DomainClient):
         )
         if not response.success:
             raise ScheduleError(
-                f"UNSUBSCRIBE failed: {response.error}", "UNSUBSCRIBE", response.error_code,
-                response.error_class, response.effect
+                f"UNSUBSCRIBE failed: {response.error}",
+                "UNSUBSCRIBE",
+                response.error_code,
+                response.error_class,
+                response.effect,
             )
         if response.data:
             raise ScheduleError("UNSUBSCRIBE response has trailing bytes", "INVALID_RESPONSE")

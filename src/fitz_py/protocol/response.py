@@ -22,6 +22,8 @@ class Response:
 
 
 def parse_response(payload: bytes, *, plain: bool = False, stream: bool = False) -> Response:
+    # These flags remain accepted for source compatibility; Wire 2 uses one envelope.
+    del plain, stream
     if not payload:
         raise ProtocolError("Response payload is empty")
     reader = BufferReader(payload)
@@ -43,6 +45,7 @@ def parse_response(payload: bytes, *, plain: bool = False, stream: bool = False)
 
 def parse_stream_response(payload: bytes, *, plain: bool = False) -> Response:
     """Decode the common wire-2 response envelope used by Stream."""
+    del plain
     return parse_response(payload)
 
 

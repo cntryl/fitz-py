@@ -31,6 +31,7 @@ from fitz_py.protocol.messages import (
 )
 from fitz_py.types import BytesLike
 
+
 class KVMode(StrEnum):
     READ_ONLY = "read_only"
     READ_WRITE = "read_write"

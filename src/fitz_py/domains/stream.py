@@ -209,7 +209,13 @@ class StreamSession:
             await self._connection.request(MSG_STREAM_APPEND, writer.build()), plain=True
         )
         if not response.success:
-            raise StreamError(f"APPEND failed: {response.error}", "APPEND", response.error_code, response.error_class, response.effect)
+            raise StreamError(
+                f"APPEND failed: {response.error}",
+                "APPEND",
+                response.error_code,
+                response.error_class,
+                response.effect,
+            )
         if not response.data:
             return None
         reader = BufferReader(response.data)
@@ -242,8 +248,11 @@ class StreamSession:
         response = parse_response(await self._connection.request(message_type, payload), plain=True)
         if not response.success:
             raise StreamError(
-                f"{operation} failed: {response.error}", operation, response.error_code,
-                response.error_class, response.effect
+                f"{operation} failed: {response.error}",
+                operation,
+                response.error_code,
+                response.error_class,
+                response.effect,
             )
         if message_type == MSG_STREAM_COMMIT:
             reader = BufferReader(response.data)
@@ -315,7 +324,13 @@ class StreamClient(DomainClient):
             await self.request_frame(MSG_STREAM_BEGIN, writer.build()), plain=True
         )
         if not response.success:
-            raise StreamError(f"BEGIN failed: {response.error}", "BEGIN", response.error_code, response.error_class, response.effect)
+            raise StreamError(
+                f"BEGIN failed: {response.error}",
+                "BEGIN",
+                response.error_code,
+                response.error_class,
+                response.effect,
+            )
         reader = BufferReader(response.data)
         if reader.remaining_bytes() < 12:
             raise StreamError("BEGIN response missing session id", "MISSING_SESSION_ID")
@@ -377,7 +392,14 @@ class StreamClient(DomainClient):
         writer.write_optional_u64(captured_watermark)
         response = parse_response(await self.request_frame(MSG_STREAM_READ, writer.build()))
         if not response.success:
-            raise domain_error(StreamError, "READ", response.error_code or 0, response.error, response.error_class, response.effect)
+            raise domain_error(
+                StreamError,
+                "READ",
+                response.error_code or 0,
+                response.error,
+                response.error_class,
+                response.effect,
+            )
         if not response.data:
             return StreamReadPage()
         envelope = BufferReader(response.data)
@@ -396,7 +418,13 @@ class StreamClient(DomainClient):
             await self.request_frame(MSG_STREAM_LAST, writer.build()), plain=True
         )
         if not response.success:
-            raise StreamError(f"LAST failed: {response.error}", "LAST", response.error_code, response.error_class, response.effect)
+            raise StreamError(
+                f"LAST failed: {response.error}",
+                "LAST",
+                response.error_code,
+                response.error_class,
+                response.effect,
+            )
         if not response.data:
             return None
         inner = BufferReader(response.data)
@@ -413,7 +441,13 @@ class StreamClient(DomainClient):
             await self.request_frame(MSG_STREAM_GET_METADATA, writer.build()), plain=True
         )
         if not response.success:
-            raise StreamError(f"METADATA failed: {response.error}", "METADATA", response.error_code, response.error_class, response.effect)
+            raise StreamError(
+                f"METADATA failed: {response.error}",
+                "METADATA",
+                response.error_code,
+                response.error_class,
+                response.effect,
+            )
         if not response.data:
             return StreamMetadata(first_offset=0, last_offset=0, record_count=0)
         inner = BufferReader(response.data)
@@ -443,8 +477,11 @@ class StreamClient(DomainClient):
         )
         if not response.success:
             raise StreamError(
-                f"SUBSCRIBE failed: {response.error}", "SUBSCRIBE", response.error_code,
-                response.error_class, response.effect
+                f"SUBSCRIBE failed: {response.error}",
+                "SUBSCRIBE",
+                response.error_code,
+                response.error_class,
+                response.effect,
             )
         reader = BufferReader(response.data)
         has_sub_id = reader.read_u8()
@@ -463,8 +500,11 @@ class StreamClient(DomainClient):
         )
         if not response.success:
             raise StreamError(
-                f"UNSUBSCRIBE failed: {response.error}", "UNSUBSCRIBE", response.error_code,
-                response.error_class, response.effect
+                f"UNSUBSCRIBE failed: {response.error}",
+                "UNSUBSCRIBE",
+                response.error_code,
+                response.error_class,
+                response.effect,
             )
         if response.data:
             raise StreamError("UNSUBSCRIBE response has trailing bytes", "INVALID_RESPONSE")

@@ -464,7 +464,14 @@ class RPCClient(DomainClient):
             await self.request_frame(MSG_RPC_SUBSCRIBE_WORKER, writer.build())
         )
         if not response.success:
-            raise domain_error(RPCError, "SUBSCRIBE", response.error_code or 0, response.error, response.error_class, response.effect)
+            raise domain_error(
+                RPCError,
+                "SUBSCRIBE",
+                response.error_code or 0,
+                response.error,
+                response.error_class,
+                response.effect,
+            )
         _expect_empty_rpc_success(response.data, "SUBSCRIBE")
 
     async def _unregister(self, route: str, identity: object) -> None:
@@ -479,8 +486,12 @@ class RPCClient(DomainClient):
             )
             if not response.success:
                 raise domain_error(
-                    RPCError, "UNSUBSCRIBE", response.error_code or 0, response.error,
-                    response.error_class, response.effect
+                    RPCError,
+                    "UNSUBSCRIBE",
+                    response.error_code or 0,
+                    response.error,
+                    response.error_class,
+                    response.effect,
                 )
             _expect_empty_rpc_success(response.data, "UNSUBSCRIBE")
             if self._workers.get(route) is registration:
@@ -848,10 +859,7 @@ def _decode_terminal_error(body: bytes) -> RPCError | None:
     if (
         response.success
         or response.error_code is None
-        or not (
-            6001 <= response.error_code <= 6010
-            or 6050 <= response.error_code <= 6055
-        )
+        or not (6001 <= response.error_code <= 6010 or 6050 <= response.error_code <= 6055)
         or response.data
     ):
         return None

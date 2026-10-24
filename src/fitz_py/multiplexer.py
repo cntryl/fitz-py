@@ -97,7 +97,9 @@ class Multiplexer:
         if not self.correlation_enabled:
             raise FitzConnectionError("Wire-2 HELLO is required before sending requests")
         correlation_id = self.next_correlation_id()
-        frame_data = frame_data[:2] + bytes((flags,)) + correlation_id.to_bytes(8, "big") + frame_data[11:]
+        frame_data = (
+            frame_data[:2] + bytes((flags,)) + correlation_id.to_bytes(8, "big") + frame_data[11:]
+        )
         pending = PendingRequest(future, correlation_id=correlation_id)
         if correlation_id is None:
             self._pending[message_type].append(pending)

@@ -54,7 +54,8 @@ class FrameCodec:
         payload_length = int.from_bytes(data[11:15], "big")
         if len(data) != HEADER_LEN + payload_length:
             raise CodecError(
-                f"Message length {payload_length} does not match frame size {len(data) - HEADER_LEN}"
+                f"Message length {payload_length} does not match frame size "
+                f"{len(data) - HEADER_LEN}"
             )
         return Frame(message_type, flags, correlation_id, data[HEADER_LEN:])
 

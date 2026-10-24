@@ -163,7 +163,14 @@ class NoticeClient(DomainClient):
         writer.write_route(pattern)
         response = parse_response(await self.request_frame(MSG_NOTICE_SUBSCRIBE, writer.build()))
         if not response.success:
-            raise domain_error(NoticeError, "SUBSCRIBE", response.error_code or 0, response.error, response.error_class, response.effect)
+            raise domain_error(
+                NoticeError,
+                "SUBSCRIBE",
+                response.error_code or 0,
+                response.error,
+                response.error_class,
+                response.effect,
+            )
         reader = BufferReader(response.data)
         if reader.read_u8() != 1:
             raise NoticeError("SUBSCRIBE response omitted its id", "INVALID_RESPONSE")
