@@ -660,13 +660,13 @@ async def test_kv_scan_all_resumes_exclusively_without_optional_capabilities(
 
 @pytest.mark.asyncio
 async def test_kv_error_response_decodes_domain_code_and_message() -> None:
-    connection = FakeConnection({MSG_KV_INSERT: _coded_error(1050, "Key already exists")})
+    connection = FakeConnection({MSG_KV_INSERT: _coded_error(1055, "Key already exists")})
     transaction = KVTransaction(connection, "kv://r/a/items", 7)
 
     with pytest.raises(KVError, match="Key already exists") as raised:
         await transaction.insert(b"key", b"value")
 
-    assert raised.value.domain_code == 1050
+    assert raised.value.domain_code == 1055
 
 
 @pytest.mark.asyncio

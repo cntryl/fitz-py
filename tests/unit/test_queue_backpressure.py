@@ -57,7 +57,7 @@ async def test_should_preserve_coded_capacity_for_schedule_cancel() -> None:
     assert is_retryable(caught.value)
 
 
-@pytest.mark.parametrize("code, retryable", [(4005, True), (4051, False)])
+@pytest.mark.parametrize("code, retryable", [(4005, True), (4050, False)])
 @pytest.mark.parametrize("operation", ["complete", "extend"])
 @pytest.mark.asyncio
 async def test_should_surface_queue_rejection_without_automatic_replay(code, retryable, operation):
