@@ -114,7 +114,7 @@ class ClientConfig:
     token_provider: TokenProvider | None = None
     transport: TransportType | str = TransportType.AUTO
     request_timeout: float = 30.0
-    auth_settle_timeout: float = 1.0  # Deprecated; readiness waits for SERVER_HELLO.
+    auth_settle_timeout: float = 1.0  # Deprecated; readiness waits for Wire-2 HELLO.
     max_frame_size: int = 1_048_576
     reconnect: ReconnectPolicy = field(default_factory=ReconnectPolicy)
     retry: RetryPolicy = field(default_factory=RetryPolicy)
@@ -123,6 +123,7 @@ class ClientConfig:
     observability: Observability = field(default_factory=Observability)
     websocket_headers: Mapping[str, str] = field(default_factory=_empty_headers)
     service_name: str | None = None
+    on_goaway: Callable[[int, float, str], None] | None = None
 
     def __post_init__(self) -> None:
         if not self.url:
@@ -141,8 +142,8 @@ class ClientConfig:
                 raise ValueError("service_name must not contain control characters")
         if self.request_timeout <= 0 or self.auth_settle_timeout < 0:
             raise ValueError("timeouts must be positive")
-        if self.max_frame_size < 5:
-            raise ValueError("max_frame_size must include the five-byte frame header")
+        if self.max_frame_size < 15:
+            raise ValueError("max_frame_size must include the 15-byte Fitz header")
         if self.reconnect.max_attempts is not None and self.reconnect.max_attempts < 0:
             raise ValueError("reconnect.max_attempts must be non-negative or None")
         if self.retry.max_attempts < 1:

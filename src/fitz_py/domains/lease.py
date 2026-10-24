@@ -671,7 +671,7 @@ class LeaseClient(DomainClient):
         writer.write_route(route)
         response = parse_response(await self.request_frame(MSG_LEASE_QUERY, writer.build()))
         if not response.success:
-            raise domain_error(LeaseError, "QUERY", response.error_code or 0, response.error)
+            raise domain_error(LeaseError, "QUERY", response.error_code or 0, response.error, response.error_class, response.effect)
         reader = BufferReader(response.data)
         held_flag = reader.read_u8()
         if held_flag not in {0, 1}:
@@ -731,7 +731,7 @@ class LeaseClient(DomainClient):
         writer.write_u32_be(0 if limit is None else limit)
         response = parse_response(await self.request_frame(MSG_LEASE_LIST, writer.build()))
         if not response.success:
-            raise domain_error(LeaseError, "LIST", response.error_code or 0, response.error)
+            raise domain_error(LeaseError, "LIST", response.error_code or 0, response.error, response.error_class, response.effect)
         reader = BufferReader(response.data)
         count = reader.read_u32_be()
         items = tuple(
@@ -816,7 +816,7 @@ class LeaseClient(DomainClient):
         writer.write_u64_be(ttl)
         response = parse_response(await self.request_frame(MSG_LEASE_EXTEND, writer.build()))
         if not response.success:
-            raise domain_error(LeaseError, "EXTEND", response.error_code or 0, response.error)
+            raise domain_error(LeaseError, "EXTEND", response.error_code or 0, response.error, response.error_class, response.effect)
         if len(response.data) != 8:
             raise LeaseError("EXTEND response must contain one fencing token", "INVALID_RESPONSE")
         return BufferReader(response.data).read_u64_be()
@@ -828,14 +828,14 @@ class LeaseClient(DomainClient):
         writer.write_u64_be(token)
         response = parse_response(await self.request_frame(MSG_LEASE_RELEASE, writer.build()))
         if not response.success:
-            raise domain_error(LeaseError, "RELEASE", response.error_code or 0, response.error)
+            raise domain_error(LeaseError, "RELEASE", response.error_code or 0, response.error, response.error_class, response.effect)
         if response.data:
             raise LeaseError("RELEASE response has trailing bytes", "INVALID_RESPONSE")
 
     def _decode_acquire(self, payload: bytes) -> tuple[int, int]:
         response = parse_response(payload)
         if not response.success:
-            raise domain_error(LeaseError, "ACQUIRE", response.error_code or 0, response.error)
+            raise domain_error(LeaseError, "ACQUIRE", response.error_code or 0, response.error, response.error_class, response.effect)
         reader = BufferReader(response.data)
         response_type, token = reader.read_u8(), reader.read_u64_be()
         if response_type not in {0, 1, 2, 3} or not reader.is_eof():
@@ -873,7 +873,7 @@ class LeaseClient(DomainClient):
         writer.write_route(route)
         response = parse_response(await self.request_frame(MSG_LEASE_SUBSCRIBE, writer.build()))
         if not response.success:
-            raise domain_error(LeaseError, "SUBSCRIBE", response.error_code or 0, response.error)
+            raise domain_error(LeaseError, "SUBSCRIBE", response.error_code or 0, response.error, response.error_class, response.effect)
         if len(response.data) != 8:
             raise LeaseError("SUBSCRIBE response must contain one id", "INVALID_RESPONSE")
         return BufferReader(response.data).read_u64_be()
@@ -883,7 +883,7 @@ class LeaseClient(DomainClient):
         writer.write_route(route)
         response = parse_response(await self.request_frame(MSG_LEASE_UNSUBSCRIBE, writer.build()))
         if not response.success:
-            raise domain_error(LeaseError, "UNSUBSCRIBE", response.error_code or 0, response.error)
+            raise domain_error(LeaseError, "UNSUBSCRIBE", response.error_code or 0, response.error, response.error_class, response.effect)
         if response.data:
             raise LeaseError("UNSUBSCRIBE response has trailing bytes", "INVALID_RESPONSE")
 

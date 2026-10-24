@@ -31,9 +31,6 @@ from fitz_py.protocol.messages import (
 )
 from fitz_py.types import BytesLike
 
-CAP_KV_SCAN_EXCLUSIVE = 1 << 2
-
-
 class KVMode(StrEnum):
     READ_ONLY = "read_only"
     READ_WRITE = "read_write"
@@ -171,11 +168,6 @@ class KVTransaction:
                 raise KVError(
                     "SCAN limit must be an integer between 0 and 4294967295", "INVALID_LIMIT"
                 )
-        if start_exclusive and not (self._connection.capabilities & CAP_KV_SCAN_EXCLUSIVE):
-            raise KVError(
-                "Broker did not advertise exclusive KV SCAN resume support",
-                "UNSUPPORTED_CAPABILITY",
-            )
         start_key = None if start_key is None else bytes(start_key)
         end_key = None if end_key is None else bytes(end_key)
         if start_key is not None and end_key is not None:
@@ -199,9 +191,7 @@ class KVTransaction:
                 writer.write_u8(0 if limit is None else 1)
                 if limit is not None:
                     writer.write_u32_be(limit)
-                writer.write_u8(1 if reverse else 0)
-                if start_exclusive:
-                    writer.write_u8(1)
+                writer.write_u8(int(reverse) | (int(start_exclusive) << 1))
                 reader = BufferReader(await self._connection.request(MSG_KV_SCAN, writer.build()))
                 self._status(reader, "SCAN")
                 count = reader.read_u32_be()
@@ -259,9 +249,7 @@ class KVTransaction:
     ) -> AsyncIterator[KVPair]:
         """Yield matching pairs, resuming pages safely in either direction.
 
-        Earlier pages may have been yielded before a later page fails. Without
-        exclusive-scan capability, reverse scans yield the first page and then
-        raise if the broker reports more results.
+        Earlier pages may have been yielded before a later page fails.
         """
         next_start = None if start_key is None else bytes(start_key)
         exclusive = False
@@ -280,18 +268,8 @@ class KVTransaction:
             if not page.has_more:
                 return
             last_key = page.entries[-1].key
-            if self._connection.capabilities & CAP_KV_SCAN_EXCLUSIVE:
-                next_start = last_key
-                exclusive = True
-            elif reverse:
-                raise KVError(
-                    "Broker did not advertise exclusive KV SCAN resume support "
-                    "for reverse pagination",
-                    "UNSUPPORTED_CAPABILITY",
-                )
-            else:
-                next_start = last_key + b"\x00"
-                exclusive = False
+            next_start = last_key
+            exclusive = True
 
     async def commit(self, durability: KVDurability | str) -> None:
         resolved = KVDurability(durability)
@@ -339,12 +317,16 @@ class KVTransaction:
     @staticmethod
     def _status(reader: BufferReader, operation: str) -> None:
         status = reader.read_u8()
-        if status != 0:
-            code = reader.read_u32_be()
+        if status == 1:
+            code = reader.read_u16_be()
+            error_class = reader.read_u8()
+            effect = reader.read_u8()
             message = reader.read_string()
             if not reader.is_eof():
                 raise KVError(f"{operation} error response has trailing bytes", "INVALID_RESPONSE")
-            raise domain_error(KVError, operation, code, message)
+            raise domain_error(KVError, operation, code, message, error_class, effect)
+        if status != 0:
+            raise KVError(f"{operation} response has unknown status {status}", "INVALID_RESPONSE")
 
 
 class KVClient(DomainClient):

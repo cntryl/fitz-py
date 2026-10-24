@@ -104,9 +104,18 @@ class LeaseLifecycleError(ExceptionGroup, FitzError):
 class DomainError(FitzError):
     prefix = "DOMAIN"
 
-    def __init__(self, message: str, reason: str, domain_code: int | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        reason: str,
+        domain_code: int | None = None,
+        error_class: int | None = None,
+        effect: int | None = None,
+    ) -> None:
         super().__init__(message, f"{self.prefix}_{reason}", domain_code)
         self.reason = reason
+        self.error_class = error_class
+        self.effect = effect
 
 
 class KVError(DomainError):
@@ -137,22 +146,13 @@ class ScheduleError(DomainError):
     prefix = "SCHEDULE"
 
 
-ERR_SCHEDULE_BACKEND_ERROR = 7010
+ERR_SCHEDULE_BACKEND_ERROR = 7006
 
 
 _RETRYABLE = {
-    ("KV", 1004),
-    ("KV", 1014),
-    ("STREAM", 2014),
-    ("NOTICE", 3006),
-    ("QUEUE", 4005),
-    ("LEASE", 5001),
-    ("LEASE", 5007),
-    ("RPC", 6001),
-    ("RPC", 6002),
-    ("RPC", 6003),
-    ("RPC", 6004),
-    ("SCHEDULE", ERR_SCHEDULE_BACKEND_ERROR),
+    ("KV", 1053),
+    ("LEASE", 5050), ("LEASE", 5056),
+    ("RPC", 6051),
 }
 
 
@@ -161,14 +161,23 @@ def is_retryable(error: BaseException) -> bool:
         return True
     if not isinstance(error, DomainError) or error.domain_code is None:
         return False
+    if error.effect != 0:
+        return False
+    if error.error_class == 5:
+        return True
     return (error.prefix, error.domain_code) in _RETRYABLE
 
 
 def domain_error(
-    error_type: type[DomainError], operation: str, status: int, message: str | None = None
+    error_type: type[DomainError],
+    operation: str,
+    status: int,
+    message: str | None = None,
+    error_class: int | None = None,
+    effect: int | None = None,
 ) -> DomainError:
     reason = message or f"status {status}"
-    return error_type(f"{operation} failed: {reason}", operation, status)
+    return error_type(f"{operation} failed: {reason}", operation, status, error_class, effect)
 
 
 def kv_error(message: str, domain_code: int | None = None) -> KVError:

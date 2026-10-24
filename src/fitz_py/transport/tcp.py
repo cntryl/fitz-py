@@ -95,6 +95,11 @@ class TcpTransport(Transport):
     def get_url(self) -> str:
         return self._url
 
+    def set_max_frame_size(self, size: int) -> None:
+        if size < 15:
+            raise ValueError("maximum Fitz message size must be at least 15 bytes")
+        self._max_frame_size = size
+
     async def heartbeat(self, timeout: float) -> None:
         writer = self._writer
         if writer is None or writer.is_closing():

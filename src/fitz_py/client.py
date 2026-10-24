@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import random
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 from fitz_py.connection import Connection
 from fitz_py.domains.kv import KVClient
@@ -46,6 +46,7 @@ class Client:
         observability: Observability | None = None,
         websocket_headers: Mapping[str, str] | None = None,
         service_name: str | None = None,
+        on_goaway: Callable[[int, float, str], None] | None = None,
     ) -> None:
         if not isinstance(url, str):  # pyright: ignore[reportUnnecessaryIsInstance]
             raise TypeError("url must be a string; pass Client options as keyword arguments")
@@ -63,6 +64,7 @@ class Client:
             limits=ConcurrencyLimits() if limits is None else limits,
             observability=Observability() if observability is None else observability,
             websocket_headers={} if websocket_headers is None else websocket_headers,
+            on_goaway=on_goaway,
         )
         self.config = config
         self._closed = False

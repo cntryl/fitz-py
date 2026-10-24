@@ -24,6 +24,9 @@ class Transport(ABC):
     async def heartbeat(self, timeout: float) -> None:
         raise NotImplementedError
 
+    def set_max_frame_size(self, size: int) -> None:
+        """Apply a negotiated transport message limit when supported."""
+
     @abstractmethod
     def get_url(self) -> str:
         raise NotImplementedError

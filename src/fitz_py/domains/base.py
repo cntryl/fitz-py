@@ -13,3 +13,8 @@ class DomainClient:
 
     async def request_frame(self, message_type: int, payload: bytes) -> bytes:
         return await self.connection.request(message_type, payload)
+
+    async def request_frame_with_flags(
+        self, message_type: int, payload: bytes, *, flags: int
+    ) -> bytes:
+        return await self.connection.request(message_type, payload, flags=flags)

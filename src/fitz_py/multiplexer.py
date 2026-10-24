@@ -53,11 +53,16 @@ class Multiplexer:
 
     @property
     def correlation_enabled(self) -> bool:
-        return bool(self._capabilities & 1)
+        return self._protocol_version >= 2
 
     def set_capabilities(self, protocol_version: int, capabilities: int) -> None:
         self._protocol_version = protocol_version
         self._capabilities = capabilities
+
+    def next_correlation_id(self) -> int:
+        correlation_id = self._next_correlation_id
+        self._next_correlation_id = (correlation_id + 1) & 0xFFFFFFFFFFFFFFFF or 1
+        return correlation_id
 
     def register_notification_handler(
         self, message_type: int, handler: NotificationHandler
@@ -76,12 +81,9 @@ class Multiplexer:
         frame_data: bytes,
         send: Callable[[bytes], Awaitable[None]],
         timeout: float,
+        flags: int = 0,
     ) -> bytes:
-        if not self.correlation_enabled or message_type in {302, 303}:
-            lane = self._legacy_lanes.setdefault(message_type, asyncio.Lock())
-            async with lane:
-                return await self._issue_request(message_type, frame_data, send, timeout)
-        return await self._issue_request(message_type, frame_data, send, timeout)
+        return await self._issue_request(message_type, frame_data, send, timeout, flags)
 
     async def _issue_request(
         self,
@@ -89,13 +91,13 @@ class Multiplexer:
         frame_data: bytes,
         send: Callable[[bytes], Awaitable[None]],
         timeout: float,
+        flags: int,
     ) -> bytes:
         future = asyncio.get_running_loop().create_future()
-        correlation_id: int | None = None
-        if self.correlation_enabled and message_type not in {302, 303}:
-            correlation_id = self._next_correlation_id
-            self._next_correlation_id = (correlation_id + 1) & 0xFFFFFFFFFFFFFFFF or 1
-            frame_data = b"\x02\x00\x08" + correlation_id.to_bytes(8, "big") + frame_data
+        if not self.correlation_enabled:
+            raise FitzConnectionError("Wire-2 HELLO is required before sending requests")
+        correlation_id = self.next_correlation_id()
+        frame_data = frame_data[:2] + bytes((flags,)) + correlation_id.to_bytes(8, "big") + frame_data[11:]
         pending = PendingRequest(future, correlation_id=correlation_id)
         if correlation_id is None:
             self._pending[message_type].append(pending)
