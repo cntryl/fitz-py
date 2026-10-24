@@ -101,10 +101,7 @@ class Multiplexer:
             frame_data[:2] + bytes((flags,)) + correlation_id.to_bytes(8, "big") + frame_data[11:]
         )
         pending = PendingRequest(future, correlation_id=correlation_id)
-        if correlation_id is None:
-            self._pending[message_type].append(pending)
-        else:
-            self._correlated[correlation_id] = pending
+        self._correlated[correlation_id] = pending
         try:
             send_future = asyncio.ensure_future(send(frame_data))
             try:
