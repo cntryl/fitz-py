@@ -35,6 +35,7 @@ class Multiplexer:
 
     def set_connected(self) -> None:
         self._connected = True
+        self._next_correlation_id = 1
 
     def set_disconnected(self) -> None:
         self._connected = False
@@ -60,8 +61,12 @@ class Multiplexer:
         self._capabilities = capabilities
 
     def next_correlation_id(self) -> int:
+        if self._next_correlation_id > 0xFFFFFFFFFFFFFFFF:
+            raise FitzConnectionError(
+                "Correlation IDs exhausted; reconnect before sending another request"
+            )
         correlation_id = self._next_correlation_id
-        self._next_correlation_id = (correlation_id + 1) & 0xFFFFFFFFFFFFFFFF or 1
+        self._next_correlation_id = correlation_id + 1
         return correlation_id
 
     def register_notification_handler(

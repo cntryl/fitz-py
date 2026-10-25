@@ -11,6 +11,12 @@ from fitz_py.protocol.buffer import BufferReader, BufferWriter
 from fitz_py.protocol.frame import HEADER_LEN, MAX_MESSAGE_SIZE, FrameCodec, FrameParser
 
 
+def test_frame_accepts_response_final_flag() -> None:
+    encoded = FrameCodec.encode_frame(104, b"ok", flags=2, correlation_id=1)
+    decoded = FrameCodec.decode_frame(encoded)
+    assert (decoded.flags, decoded.correlation_id, decoded.payload) == (2, 1, b"ok")
+
+
 @given(
     st.lists(
         st.tuples(st.integers(min_value=0, max_value=0xFFFF), st.binary(max_size=512)), max_size=20

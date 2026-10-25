@@ -812,6 +812,16 @@ async def test_queued_lease_wait_serializes_uncorrelated_deferred_responses() ->
 
 
 @pytest.mark.asyncio
+async def test_duplicate_queued_lease_acquire_returns_typed_terminal_error() -> None:
+    client = LeaseClient(FakeConnection({MSG_LEASE_ACQUIRE: _lease_success(3, 0)}))
+
+    with pytest.raises(LeaseError) as raised:
+        await client.acquire("lease://r/a/leader", ttl=30, wait=5)
+
+    assert raised.value.code == "LEASE_ALREADY_QUEUED"
+
+
+@pytest.mark.asyncio
 async def test_cancelled_queued_lease_retains_fifo_tombstone() -> None:
     connection = FakeConnection({MSG_LEASE_ACQUIRE: _lease_success(2, 0)})
     client = LeaseClient(connection)

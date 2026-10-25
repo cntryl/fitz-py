@@ -10,6 +10,7 @@ from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import NoReturn
 
 from fitz_py._runtime import LazyAsyncIterator
 from fitz_py.connection import Connection
@@ -624,7 +625,9 @@ class LeaseClient(DomainClient):
             writer.write_u32_be(wait)
             payload = await self.request_frame(MSG_LEASE_ACQUIRE, writer.build())
             response_type, token = self._decode_acquire(payload)
-            if response_type not in {2, 3}:
+            if response_type == 3:
+                _raise_already_queued_acquire()
+            if response_type != 2:
                 if queued is not None:
                     self._queued.remove(queued)
             else:
@@ -971,6 +974,10 @@ def _u32(value: object, name: str) -> None:
 def _validate_final_acquire(response_type: int) -> None:
     if response_type not in {0, 1}:
         raise LeaseError("ACQUIRE returned a second queued response", "INVALID_RESPONSE")
+
+
+def _raise_already_queued_acquire() -> NoReturn:
+    raise LeaseError("ACQUIRE request is already queued", "ALREADY_QUEUED")
 
 
 def _observe_acquire_future(future: asyncio.Future[bytes]) -> None:

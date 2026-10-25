@@ -7,6 +7,8 @@ from fitz_py.errors import CodecError
 HEADER_LEN = 15
 MAX_MESSAGE_SIZE = 1_048_576
 ACK_REQUESTED = 1
+RESPONSE_FINAL = 2
+VALID_FLAGS = ACK_REQUESTED | RESPONSE_FINAL
 
 
 @dataclass(slots=True)
@@ -28,7 +30,7 @@ class FrameCodec:
     ) -> bytes:
         if not 0 <= message_type <= 0xFFFF:
             raise CodecError(f"Invalid message type: {message_type}")
-        if flags & ~ACK_REQUESTED:
+        if flags & ~VALID_FLAGS:
             raise CodecError(f"Unsupported frame flags: {flags:#x}")
         if not 0 <= correlation_id <= 0xFFFFFFFFFFFFFFFF:
             raise CodecError("Correlation ID must fit in u64")
@@ -48,7 +50,7 @@ class FrameCodec:
             raise CodecError(f"Message header is truncated: {len(data)} bytes")
         message_type = int.from_bytes(data[:2], "big")
         flags = data[2]
-        if flags & ~ACK_REQUESTED:
+        if flags & ~VALID_FLAGS:
             raise CodecError(f"Unsupported frame flags: {flags:#x}")
         correlation_id = int.from_bytes(data[3:11], "big")
         payload_length = int.from_bytes(data[11:15], "big")
