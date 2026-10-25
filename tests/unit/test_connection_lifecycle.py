@@ -8,7 +8,7 @@ from fitz_py._runtime import AsyncSubscription
 from fitz_py.connection import Connection
 from fitz_py.errors import FitzConnectionError, FitzTransportError
 from fitz_py.protocol.buffer import BufferReader
-from fitz_py.protocol.frame import FrameCodec
+from fitz_py.protocol.frame import RESPONSE_FINAL, FrameCodec
 from fitz_py.protocol.messages import (
     MSG_SERVER_HELLO,
 )
@@ -109,7 +109,9 @@ async def test_connection_request_push_send_and_close_lifecycle() -> None:
     outbound = FrameCodec.decode_frame(transport.sent[-1])
     assert (outbound.message_type, outbound.payload) == (77, b"request")
     await transport.inbound.put(
-        FrameCodec.encode_frame(77, b"response", correlation_id=outbound.correlation_id)
+        FrameCodec.encode_frame(
+            77, b"response", flags=RESPONSE_FINAL, correlation_id=outbound.correlation_id
+        )
     )
     assert await request == b"response"
 
@@ -340,6 +342,7 @@ async def test_old_transport_frame_cannot_resolve_new_generation_request() -> No
         FrameCodec.encode_frame(
             77,
             b"stale",
+            flags=RESPONSE_FINAL,
             correlation_id=FrameCodec.decode_frame(transports[0].sent[-1]).correlation_id,
         )
     )
@@ -349,6 +352,7 @@ async def test_old_transport_frame_cannot_resolve_new_generation_request() -> No
         FrameCodec.encode_frame(
             77,
             b"current",
+            flags=RESPONSE_FINAL,
             correlation_id=FrameCodec.decode_frame(transports[1].sent[-1]).correlation_id,
         )
     )

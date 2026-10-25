@@ -7,7 +7,7 @@ from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
-from fitz_py.errors import FitzConnectionError, FitzTimeoutError
+from fitz_py.errors import FitzConnectionError, FitzTimeoutError, ProtocolError
 
 NotificationHandler = Callable[[bytes], None]
 PushClassifier = Callable[[bytes], bool]
@@ -141,7 +141,10 @@ class Multiplexer:
 
     def _abandon(self, message_type: int, pending: PendingRequest) -> None:
         if pending.correlation_id is not None:
-            self._correlated.pop(pending.correlation_id, None)
+            if pending.sent:
+                pending.future = None
+            else:
+                self._correlated.pop(pending.correlation_id, None)
             return
         if pending.sent:
             pending.future = None  # tombstone consumes a possible late reply
@@ -182,13 +185,21 @@ class Multiplexer:
             return
         self._dispatch_push(message_type, payload)
 
-    def dispatch_correlated(self, correlation_id: int, message_type: int, payload: bytes) -> None:
-        pending = self._correlated.pop(correlation_id, None)
+    def dispatch_correlated(
+        self,
+        correlation_id: int,
+        message_type: int,
+        payload: bytes,
+        response_final: bool = True,
+    ) -> None:
+        pending = self._correlated.get(correlation_id)
         if pending is None:
-            # A correlation may have a later domain-defined phase after its
-            # original waiter completed. Route that phase normally.
-            self.dispatch(message_type, payload)
+            raise ProtocolError(
+                f"Unexpected response correlation {correlation_id} for message type {message_type}"
+            )
+        if not response_final:
             return
+        self._correlated.pop(correlation_id, None)
         if pending.future is not None and not pending.future.done():
             pending.future.set_result(payload)
 

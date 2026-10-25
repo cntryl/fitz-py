@@ -21,7 +21,7 @@ from fitz_py.errors import (
 )
 from fitz_py.multiplexer import Multiplexer
 from fitz_py.protocol.buffer import BufferReader, BufferWriter
-from fitz_py.protocol.frame import FrameCodec, FrameParser
+from fitz_py.protocol.frame import RESPONSE_FINAL, FrameCodec, FrameParser
 from fitz_py.protocol.messages import (
     MSG_CONNECT,
     MSG_CONNECT_REJECTED,
@@ -478,7 +478,10 @@ class Connection:
             self._multiplexer.dispatch(frame.message_type, frame.payload)
         else:
             self._multiplexer.dispatch_correlated(
-                frame.correlation_id, frame.message_type, frame.payload
+                frame.correlation_id,
+                frame.message_type,
+                frame.payload,
+                bool(frame.flags & RESPONSE_FINAL),
             )
 
     async def _connection_lost(self, cause: BaseException) -> None:

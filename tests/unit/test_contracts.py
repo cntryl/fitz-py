@@ -408,14 +408,39 @@ async def test_multiplexer_requires_hello_before_requests() -> None:
         await mux.request(100, FrameCodec.encode_frame(100, b""), lambda _: asyncio.sleep(0), 1)
 
 
-def test_unknown_correlation_falls_through_to_push_handler() -> None:
+def test_unknown_correlation_is_a_protocol_error_and_never_falls_through() -> None:
     mux = Multiplexer()
     received: list[bytes] = []
     mux.register_notification_handler(400, received.append)
 
-    mux.dispatch_correlated(99, 400, b"later-grant")
+    with pytest.raises(ProtocolError, match="Unexpected response correlation"):
+        mux.dispatch_correlated(99, 400, b"later-grant")
 
-    assert received == [b"later-grant"]
+    assert received == []
+
+
+@pytest.mark.asyncio
+async def test_correlated_request_waits_for_final_phase() -> None:
+    mux = Multiplexer()
+    mux.set_connected()
+    mux.set_capabilities(2, 0)
+    sent: list[bytes] = []
+
+    async def send(frame: bytes) -> None:
+        sent.append(frame)
+
+    pending = asyncio.create_task(
+        mux.request(400, FrameCodec.encode_frame(400, b"acquire"), send, 1)
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    correlation = FrameCodec.decode_frame(sent[0]).correlation_id
+
+    mux.dispatch_correlated(correlation, 400, b"queued", response_final=False)
+    assert not pending.done()
+    mux.dispatch_correlated(correlation, 400, b"granted", response_final=True)
+
+    assert await pending == b"granted"
 
 
 def test_multiplexer_reports_push_decoder_failures() -> None:
