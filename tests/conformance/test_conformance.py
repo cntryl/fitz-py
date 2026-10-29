@@ -1088,13 +1088,81 @@ async def test_cs016_filtered_stream_replay() -> None:
     assert result.verdict == "pass"
 
 
-# CS-017 - bounded concurrency under burst load
+# CS-017 - global filtered multi-page replay
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_cs017_bounded_concurrency_under_burst_load() -> None:
+async def test_cs017_global_filtered_multi_page_replay() -> None:
     evidence: list[str] = []
+    client = await _new_client()
+    try:
+        first_route = _unique_route("stream")
+        second_route = first_route.replace("stream://conformance-realm/", "stream://other-realm/")
+        discriminator = f"match-{first_route}"
+        stream_filter = StreamFilterSet(
+            clauses=[StreamFilterClause(kind="Equals", value=discriminator)]
+        )
+        initial = await client.stream.read_page("stream://**", 0, limit=1)
+        assert initial.cursor.captured_watermark is not None
+        next_offset = initial.cursor.captured_watermark
+
+        for route in (first_route, second_route):
+            session = await client.stream.begin(route)
+            await session.append(0, b"skip", discriminator="skip")
+            await session.append(1, b"keep", discriminator=discriminator)
+            await session.commit("sync")
+
+        pages = []
+        fingerprint = None
+        watermark = None
+        while True:
+            page = await client.stream.read_page(
+                "stream://**",
+                next_offset,
+                limit=1,
+                stream_filter=stream_filter,
+                cursor_fingerprint=fingerprint,
+                captured_watermark=watermark,
+            )
+            pages.append(page)
+            if not page.cursor.has_more:
+                break
+            assert page.cursor.last_global_offset is not None
+            assert page.cursor.last_global_offset >= next_offset
+            next_offset = page.cursor.last_global_offset + 1
+            fingerprint = page.cursor.cursor_fingerprint
+            watermark = page.cursor.captured_watermark
+
+        assert len(pages) > 1
+        assert any(page.items and all(item.record is None for item in page.items) for page in pages)
+        records = [item.record for page in pages for item in page.items if item.record is not None]
+        assert [record.route for record in records] == [first_route, second_route]
+        offsets = [record.global_offset for record in records]
+        assert offsets[0] is not None and offsets[1] is not None and offsets[0] < offsets[1]
+        assert not pages[-1].cursor.has_more
+        evidence.append(f"global filtered replay yielded {len(pages)} pages across two realms")
+        evidence.append("filtered-only pages advanced the global cursor through the captured tail")
+    finally:
+        await client.aclose()
+
+    result = ScenarioResult(
+        "CS-017",
+        "global filtered multi-page replay",
+        "P1",
+        CLIENT_NAME,
+        CONFORMANCE_TRANSPORT,
+        CONFORMANCE_AUTH_MODE,
+        "pass",
+        evidence,
+        0,
+    )
+    _record(result)
+    assert result.verdict == "pass"
+
+
+@pytest.mark.asyncio
+async def test_bounded_concurrency_burst_smoke() -> None:
     client = await _new_client(max_in_flight_requests=1, request_queue_size=1)
     try:
         tasks = [asyncio.create_task(client.kv.begin(_unique_route("kv"))) for _ in range(32)]
@@ -1110,23 +1178,8 @@ async def test_cs017_bounded_concurrency_under_burst_load() -> None:
         for transaction in results:
             if not isinstance(transaction, BaseException):
                 await transaction.rollback()
-        evidence.append(f"{len(saturated)} live client requests failed explicitly at capacity")
     finally:
         await client.aclose()
-
-    r = ScenarioResult(
-        "CS-017",
-        "bounded concurrency under burst load",
-        "P1",
-        CLIENT_NAME,
-        CONFORMANCE_TRANSPORT,
-        CONFORMANCE_AUTH_MODE,
-        "pass",
-        evidence,
-        0,
-    )
-    _record(r)
-    assert r.verdict == "pass"
 
 
 # ---------------------------------------------------------------------------
