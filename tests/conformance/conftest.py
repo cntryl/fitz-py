@@ -43,5 +43,5 @@ def pytest_sessionfinish(session, exitstatus) -> None:
         return
     if _results:
         overall = _write_results()
-        if len(_results) >= 19 and overall == "fail":
+        if overall == "fail":
             session.exitstatus = pytest.ExitCode.TESTS_FAILED
