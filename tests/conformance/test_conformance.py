@@ -39,8 +39,10 @@ from fitz_py import (
     KVError,
     RequestQueueFullError,
     RPCError,
+    ScheduleError,
     StreamFilterClause,
     StreamFilterSet,
+    is_retryable,
 )
 from tests.integration.fixture.jwt import make_expired_jwt, make_valid_jwt
 from tests.integration.test_stream_boundaries import (
@@ -370,7 +372,8 @@ async def test_cs004_unknown_route() -> None:
         except Exception as exc:
             caught = exc
 
-        assert caught is not None, "expected error for unregistered route"
+        assert isinstance(caught, RPCError), type(caught).__name__
+        assert caught.domain_code == 6051
         evidence.append(f"rpc to unregistered route raised {type(caught).__name__}")
 
         # Client must remain usable
@@ -398,7 +401,7 @@ async def test_cs004_unknown_route() -> None:
 
 
 # ---------------------------------------------------------------------------
-# CS-005 — invalid payload (duplicate insert)
+# CS-005 — invalid payload
 # ---------------------------------------------------------------------------
 
 
@@ -407,31 +410,18 @@ async def test_cs005_invalid_payload() -> None:
     evidence: list[str] = []
     client = await _new_client()
     try:
-        route = _unique_route("kv")
-        tx1 = await client.kv.begin(route)
-        await tx1.insert(b"dup-key", b"first")
-        await tx1.commit("sync")
-        evidence.append("first insert succeeded")
-
-        tx2 = await client.kv.begin(route)
-        caught: Exception | None = None
-        try:
-            await tx2.insert(b"dup-key", b"second")
-        except Exception as exc:
-            caught = exc
-        finally:
-            try:
-                await tx2.rollback()
-            except Exception:
-                pass
-
-        assert caught is not None, "expected error on duplicate insert"
-        evidence.append(f"duplicate insert raised {type(caught).__name__}: {caught}")
-
-        rtx = await client.kv.begin(route, mode="read_only")
-        result = await rtx.get(b"dup-key")
-        assert result is not None
-        evidence.append("client remains usable after server-rejected operation")
+        with pytest.raises(ScheduleError):
+            await client.schedule.create(
+                _unique_route("schedule"),
+                "not a cron",
+                delivery_mode="broadcast",
+                payload=b"payload",
+            )
+        evidence.append("invalid cron produced a Schedule domain error")
+        tx = await client.kv.begin(_unique_route("kv"))
+        await tx.put(b"after-invalid", b"ok")
+        await tx.commit("sync")
+        evidence.append("client remains usable after the rejected operation")
     finally:
         await client.aclose()
 
@@ -470,7 +460,9 @@ async def test_cs006_server_error_mapping() -> None:
             rpc_err = exc
 
         assert isinstance(rpc_err, RPCError), type(rpc_err).__name__
-        assert rpc_err.domain_code is not None
+        assert rpc_err.domain_code == 6051
+        assert rpc_err.effect == 0
+        assert is_retryable(rpc_err)
         evidence.append(f"rpc error type: {type(rpc_err).__name__}")
         evidence.append(f"error.code = {rpc_err.code}")
 
@@ -494,6 +486,7 @@ async def test_cs006_server_error_mapping() -> None:
 
         assert isinstance(kv_err, KVError), type(kv_err).__name__
         assert kv_err.domain_code is not None
+        assert not is_retryable(kv_err)
         evidence.append(f"kv conflict error type: {type(kv_err).__name__}")
         evidence.append(f"kv error code: {kv_err.domain_code}")
     finally:
@@ -719,12 +712,15 @@ async def test_cs009_disconnect_during_request() -> None:
         CLIENT_NAME,
         CONFORMANCE_TRANSPORT,
         CONFORMANCE_AUTH_MODE,
-        "pass",
-        evidence,
+        "partial",
+        [
+            *evidence,
+            "explicit client close does not exercise unexpected transport loss or reconnect",
+        ],
         0,
     )
     _record(r)
-    assert r.verdict == "pass"
+    assert r.verdict == "partial"
 
 
 # ---------------------------------------------------------------------------
@@ -764,12 +760,12 @@ async def test_cs010_reconnect_behavior() -> None:
         CLIENT_NAME,
         CONFORMANCE_TRANSPORT,
         CONFORMANCE_AUTH_MODE,
-        "pass",
-        evidence,
+        "partial",
+        [*evidence, "subscription and worker restoration and stale handles were not checked"],
         0,
     )
     _record(r)
-    assert r.verdict == "pass"
+    assert r.verdict == "partial"
 
 
 # ---------------------------------------------------------------------------
@@ -790,13 +786,11 @@ async def test_cs011_stream_receive_sequence() -> None:
         evidence.append("stream session appended 3 records")
 
         records = await client.stream.read(route, start_offset=0, limit=10)
-        assert len(records) >= 3, f"expected >=3 stream records, got {len(records)}"
+        assert len(records) == 3, f"expected 3 stream records, got {len(records)}"
         evidence.append(f"read {len(records)} records after commit")
 
-        for i in range(1, len(records)):
-            assert records[i].offset > records[i - 1].offset, (
-                f"out-of-order offsets at {i}: {records[i].offset} <= {records[i - 1].offset}"
-            )
+        for i, record in enumerate(records):
+            assert record.offset == i, f"expected offset {i}, got {record.offset}"
 
         if records:
             evidence.append(f"first offset: {records[0].offset}, last: {records[-1].offset}")
@@ -914,12 +908,12 @@ async def test_cs013_stream_error_mid_flight() -> None:
         CLIENT_NAME,
         CONFORMANCE_TRANSPORT,
         CONFORMANCE_AUTH_MODE,
-        "pass",
-        evidence,
+        "partial",
+        [*evidence, "an error during an active streaming read was not exercised"],
         0,
     )
     _record(r)
-    assert r.verdict == "pass"
+    assert r.verdict == "partial"
 
 
 # ---------------------------------------------------------------------------
@@ -962,12 +956,12 @@ async def test_cs014_concurrent_requests() -> None:
         CLIENT_NAME,
         CONFORMANCE_TRANSPORT,
         CONFORMANCE_AUTH_MODE,
-        "pass",
-        evidence,
+        "partial",
+        [*evidence, "cross-domain concurrency and within-domain ordering were not exercised"],
         0,
     )
     _record(r)
-    assert r.verdict == "pass"
+    assert r.verdict == "partial"
 
 
 # ---------------------------------------------------------------------------
