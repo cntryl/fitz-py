@@ -10,6 +10,11 @@ from fitz_py.errors import FitzConnectionError, FitzTransportError
 from fitz_py.protocol.buffer import BufferReader
 from fitz_py.protocol.frame import RESPONSE_FINAL, FrameCodec
 from fitz_py.protocol.messages import (
+    MSG_NOTICE_PUBLISH,
+    MSG_RPC_CANCELLATION,
+    MSG_RPC_LIFECYCLE,
+    MSG_RPC_REQUEST,
+    MSG_RPC_RESPONSE,
     MSG_SERVER_HELLO,
 )
 from fitz_py.transport.base import Transport
@@ -127,6 +132,33 @@ async def test_connection_request_push_send_and_close_lifecycle() -> None:
     assert connection.get_state() is ConnectionState.CLOSED
     with pytest.raises(FitzConnectionError, match="closed"):
         await connection.connect()
+
+
+@pytest.mark.parametrize(
+    ("message_type", "payload", "requires_correlation"),
+    [
+        (MSG_RPC_RESPONSE, b"response", False),
+        (MSG_RPC_CANCELLATION, b"\x03" + b"x" * 16, False),
+        (MSG_RPC_CANCELLATION, b"\x01" + b"x" * 16, True),
+        (MSG_RPC_REQUEST, b"request", True),
+        (MSG_RPC_LIFECYCLE, b"lifecycle", False),
+        (MSG_NOTICE_PUBLISH, b"publish", False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_one_way_send_uses_message_correlation_policy(
+    message_type: int, payload: bytes, requires_correlation: bool
+) -> None:
+    transport = FakeTransport()
+    connection = Connection(lambda: transport, config())
+    await connection.connect()
+    try:
+        await connection.send_fire_and_forget(message_type, payload)
+        frame = FrameCodec.decode_frame(transport.sent[-1])
+        assert frame.message_type == message_type
+        assert (frame.correlation_id != 0) is requires_correlation
+    finally:
+        await connection.close()
 
 
 @pytest.mark.asyncio

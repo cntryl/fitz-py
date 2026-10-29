@@ -27,6 +27,10 @@ from fitz_py.protocol.messages import (
     MSG_CONNECT_REJECTED,
     MSG_GOAWAY,
     MSG_HELLO,
+    MSG_RPC_CANCELLATION,
+    MSG_RPC_LIFECYCLE,
+    MSG_RPC_RESPONSE,
+    MSG_RPC_SUBSCRIBE_WORKER,
 )
 from fitz_py.transport.base import Transport
 from fitz_py.types import ClientConfig, ConnectionState, LifecycleEvent
@@ -36,6 +40,16 @@ ReconnectListener = Callable[[], Awaitable[None] | None]
 DisconnectListener = Callable[[], Awaitable[None] | None]
 CloseListener = Callable[[], Awaitable[None] | None]
 T = TypeVar("T")
+
+
+def _one_way_needs_correlation(message_type: int, payload: bytes) -> bool:
+    if not MSG_RPC_SUBSCRIBE_WORKER <= message_type <= MSG_RPC_LIFECYCLE:
+        return False
+    if message_type in (MSG_RPC_RESPONSE, MSG_RPC_LIFECYCLE):
+        return False
+    if message_type == MSG_RPC_CANCELLATION:
+        return payload[:1] == b"\x01"
+    return True
 
 
 class Connection:
@@ -187,7 +201,9 @@ class Connection:
         try:
             try:
                 correlation_id = (
-                    self._multiplexer.next_correlation_id() if 300 <= message_type <= 305 else 0
+                    self._multiplexer.next_correlation_id()
+                    if _one_way_needs_correlation(message_type, payload)
+                    else 0
                 )
                 await self._send_frame(
                     FrameCodec.encode_frame(message_type, payload, correlation_id=correlation_id)
