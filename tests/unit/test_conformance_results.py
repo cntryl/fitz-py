@@ -48,5 +48,9 @@ def test_missing_scenario_counts_against_release_gate(
     aggregate = json.loads(output.read_text(encoding="utf-8"))
 
     assert status == expected_status
+    assert aggregate["p0_total"] == 11
+    assert aggregate["p1_total"] == 13
+    assert aggregate["p0_pass"] == (10 if missing == 20 else 11)
+    assert aggregate["p1_pass"] == (12 if missing == 18 else 13)
     assert aggregate[rate_field] == expected_rate
     assert aggregate["missing_scenarios"] == [f"CS-{missing:03d}"]

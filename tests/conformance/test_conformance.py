@@ -158,11 +158,13 @@ def _write_results() -> str:
     by_id = {result.scenario_id: result for result in _results}
     missing_ids = sorted(required_ids - by_id.keys())
 
-    def rate(ids: set[str]) -> float:
-        return sum(1 for item in ids if item in by_id and by_id[item].verdict == "pass") / len(ids)
+    def passed(ids: set[str]) -> int:
+        return sum(1 for item in ids if item in by_id and by_id[item].verdict == "pass")
 
-    p0_rate = rate(p0_ids)
-    p1_rate = rate(p1_ids)
+    p0_pass = passed(p0_ids)
+    p1_pass = passed(p1_ids)
+    p0_rate = p0_pass / len(p0_ids)
+    p1_rate = p1_pass / len(p1_ids)
     overall = "fail" if p0_rate < 1 else ("partial" if p1_rate < 1 else "pass")
 
     aggregate = {
@@ -172,6 +174,10 @@ def _write_results() -> str:
         "client": CLIENT_NAME,
         "transport": CONFORMANCE_TRANSPORT,
         "auth_mode": CONFORMANCE_AUTH_MODE,
+        "p0_pass": p0_pass,
+        "p0_total": len(p0_ids),
+        "p1_pass": p1_pass,
+        "p1_total": len(p1_ids),
         "p0_pass_rate": p0_rate,
         "p1_pass_rate": p1_rate,
         "overall_status": overall,
@@ -581,10 +587,12 @@ async def test_cs008_caller_cancellation() -> None:
     worker_client = await _new_client()
     caller_client = await _new_client()
     handler_finished = asyncio.Event()
+    handler_started = asyncio.Event()
     try:
         route = _unique_route("rpc")
 
         async def _slow_handler(req, writer) -> None:
+            handler_started.set()
             try:
                 await asyncio.sleep(3.0)
                 await writer.send(b"late", end=True)
@@ -599,7 +607,7 @@ async def test_cs008_caller_cancellation() -> None:
                 pass
 
         task = asyncio.create_task(_do_call())
-        await asyncio.sleep(0.1)
+        await asyncio.wait_for(handler_started.wait(), timeout=2.0)
         task.cancel()
 
         caught: BaseException | None = None
