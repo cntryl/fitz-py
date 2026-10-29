@@ -16,6 +16,7 @@ from fitz_py.errors import (
     FitzConnectionError,
     FitzTimeoutError,
     FitzTransportError,
+    ProtocolError,
     ReconnectRestoreError,
     is_retryable,
 )
@@ -476,6 +477,8 @@ class Connection:
             message = reader.read_string()
             if not reader.is_eof() or frame.flags != 0 or frame.correlation_id != 0:
                 raise FitzConnectionError("Malformed CONNECT_REJECTED message")
+            if code == 50:
+                raise ProtocolError(f"wire version mismatch: {message}", domain_code=code)
             raise AuthenticationError(message or "authentication rejected", {"code": code})
         if frame.message_type == MSG_GOAWAY:
             reader = BufferReader(frame.payload)
@@ -547,6 +550,10 @@ class Connection:
                 return
             except BaseException as exc:  # noqa: BLE001
                 self._emit("reconnect_failed", attempt=attempt, error=exc)
+                if isinstance(exc, ProtocolError) and exc.domain_code == 50:
+                    self._set_state(ConnectionState.DISCONNECTED, "reconnect_exhausted")
+                    await self._notify_close()
+                    return
                 delay = min(delay * 2, policy.max_backoff)
         if not self._closed:
             self._set_state(ConnectionState.DISCONNECTED, "reconnect_exhausted")
