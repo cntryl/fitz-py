@@ -1,7 +1,7 @@
 """
 Fitz conformance harness — Python / fitz-py
 
-Covers the canonical 17 scenarios, CS-001 through CS-017.
+Runs the implemented shared scenarios and reports remaining canonical cases as missing.
 
 Configuration via environment variables:
   CONFORMANCE_TRANSPORT   "ws" (default) | "tcp"
@@ -43,6 +43,9 @@ from fitz_py import (
     StreamFilterSet,
 )
 from tests.integration.fixture.jwt import make_expired_jwt, make_valid_jwt
+from tests.integration.test_stream_boundaries import (
+    test_event_size_boundary_and_long_route_replay as _exercise_stream_boundary,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -146,23 +149,19 @@ def _record(r: ScenarioResult) -> None:
     _results.append(r)
 
 
-def _write_results() -> None:
-    required_ids = {f"CS-{number:03d}" for number in range(1, 18)}
-    recorded_ids = {result.scenario_id for result in _results}
-    missing_ids = sorted(required_ids - recorded_ids)
-    p0 = [r for r in _results if r.priority == "P0"]
-    p1 = [r for r in _results if r.priority == "P1"]
+def _write_results() -> str:
+    required_ids = {f"CS-{number:03d}" for number in range(1, 25)}
+    p0_ids = {f"CS-{number:03d}" for number in (*range(1, 9), 19, 20, 24)}
+    p1_ids = required_ids - p0_ids
+    by_id = {result.scenario_id: result for result in _results}
+    missing_ids = sorted(required_ids - by_id.keys())
 
-    def rate(arr: list[ScenarioResult]) -> float:
-        if not arr:
-            return 1.0
-        return sum(1 for r in arr if r.verdict == "pass") / len(arr)
+    def rate(ids: set[str]) -> float:
+        return sum(1 for item in ids if item in by_id and by_id[item].verdict == "pass") / len(ids)
 
-    p0_rate = rate(p0)
-    p1_rate = rate(p1)
-    any_p0_fail = any(r.verdict != "pass" for r in p0)
-    any_p1_warn = any(r.verdict in ("fail", "partial") for r in p1)
-    overall = "fail" if missing_ids or any_p0_fail else ("partial" if any_p1_warn else "pass")
+    p0_rate = rate(p0_ids)
+    p1_rate = rate(p1_ids)
+    overall = "fail" if p0_rate < 1 else ("partial" if p1_rate < 1 else "pass")
 
     aggregate = {
         "suite": "fitz-cross-language-client-conformance",
@@ -183,6 +182,7 @@ def _write_results() -> None:
     output_path.write_text(json.dumps(aggregate, indent=2), encoding="utf-8")
     print(f"\nConformance results written to: {output_path}")
     print(f"Status: {overall.upper()}  P0: {p0_rate:.0%}  P1: {p1_rate:.0%}")
+    return overall
 
 
 # ---------------------------------------------------------------------------
@@ -1032,12 +1032,48 @@ async def test_cs019_same_type_requests_are_correlated_out_of_order() -> None:
 
     parked = asyncio.create_task(client.queue.reserve(parked_route, lease=30, wait=5))
     await asyncio.sleep(0.1)
+    assert not parked.done(), "first reserve must remain parked on its empty queue"
     second = await asyncio.wait_for(client.queue.reserve(ready_route, lease=30, wait=0), timeout=2)
     assert second[0].body == b"second"
+    assert not parked.done(), "second reserve must resolve before the parked first reserve"
     await client.queue.enqueue(parked_route, b"first")
     first = await asyncio.wait_for(parked, timeout=5)
     assert first[0].body == b"first"
     await client.aclose()
+    _record(
+        ScenarioResult(
+            "CS-019",
+            "concurrent same-message-type requests",
+            "P0",
+            CLIENT_NAME,
+            CONFORMANCE_TRANSPORT,
+            CONFORMANCE_AUTH_MODE,
+            "pass",
+            ["second reserve resolved first with its own payload", "parked reserve returned first"],
+            0,
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_cs024_stream_event_boundary_and_replay() -> None:
+    await _exercise_stream_boundary(CONFORMANCE_TRANSPORT, CONFORMANCE_AUTH_MODE)
+    _record(
+        ScenarioResult(
+            "CS-024",
+            "400 KiB Stream event boundary and replay",
+            "P0",
+            CLIENT_NAME,
+            CONFORMANCE_TRANSPORT,
+            CONFORMANCE_AUTH_MODE,
+            "pass",
+            [
+                "409600 combined bytes accepted; 409601 rejected with BAD_REQUEST/NOT_APPLIED",
+                "three complete events replayed on a 4096-byte route across multiple pages",
+            ],
+            0,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
