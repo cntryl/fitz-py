@@ -24,7 +24,7 @@ concurrency:
 # Automatic acceptance pins the qualified candidate required by RPC chain tests.
 # Explicit main/develop dispatches remain diagnostic; no broker promotion occurs.
 env:
-  FITZ_BROKER_IMAGE: ghcr.io/cntryl/fitz:${{ inputs.broker_tag || 'develop@sha256:639832120496ae98309f7f8f947fbf431ea28ef3371cf0f00a70411b0e73e110' }}
+  FITZ_BROKER_IMAGE: ghcr.io/cntryl/fitz:${{ inputs.broker_tag || 'develop' }}
 
 jobs:
   spec:
@@ -77,15 +77,20 @@ jobs:
       - name: Run conformance tests
         run: python -m pytest tests/conformance -v
 
-      - name: Enforce canonical conformance
+      - name: Enforce canonical P0 conformance
         run: |
           python - <<'PY'
           import json, os
           from pathlib import Path
           data = json.loads(Path(os.environ["CONFORMANCE_OUTPUT"]).read_text())
-          required = {f"CS-{index:03d}" for index in range(1, 18)}
-          observed = {item["scenario_id"] for item in data["scenarios"] if item["verdict"] == "pass"}
-          assert data["overall_status"] == "pass"
+          required = {f"CS-{index:03d}" for index in (*range(1, 9), 19, 20, 24)}
+          observed = {
+              item["scenario_id"]
+              for item in data["scenarios"]
+              if item["priority"] == "P0" and item["verdict"] == "pass"
+          }
+          assert data["p0_pass_rate"] == 1.0
+          assert data["overall_status"] in {"pass", "partial"}
           assert observed == required, sorted(required - observed)
           PY
 

@@ -7,7 +7,7 @@ from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
-from fitz_py.errors import FitzConnectionError, FitzTimeoutError
+from fitz_py.errors import FitzConnectionError, FitzTimeoutError, ProtocolError
 
 NotificationHandler = Callable[[bytes], None]
 PushClassifier = Callable[[bytes], bool]
@@ -35,6 +35,7 @@ class Multiplexer:
 
     def set_connected(self) -> None:
         self._connected = True
+        self._next_correlation_id = 1
 
     def set_disconnected(self) -> None:
         self._connected = False
@@ -53,11 +54,20 @@ class Multiplexer:
 
     @property
     def correlation_enabled(self) -> bool:
-        return bool(self._capabilities & 1)
+        return self._protocol_version >= 2
 
     def set_capabilities(self, protocol_version: int, capabilities: int) -> None:
         self._protocol_version = protocol_version
         self._capabilities = capabilities
+
+    def next_correlation_id(self) -> int:
+        if self._next_correlation_id > 0xFFFFFFFFFFFFFFFF:
+            raise FitzConnectionError(
+                "Correlation IDs exhausted; reconnect before sending another request"
+            )
+        correlation_id = self._next_correlation_id
+        self._next_correlation_id = correlation_id + 1
+        return correlation_id
 
     def register_notification_handler(
         self, message_type: int, handler: NotificationHandler
@@ -76,12 +86,9 @@ class Multiplexer:
         frame_data: bytes,
         send: Callable[[bytes], Awaitable[None]],
         timeout: float,
+        flags: int = 0,
     ) -> bytes:
-        if not self.correlation_enabled or message_type in {302, 303}:
-            lane = self._legacy_lanes.setdefault(message_type, asyncio.Lock())
-            async with lane:
-                return await self._issue_request(message_type, frame_data, send, timeout)
-        return await self._issue_request(message_type, frame_data, send, timeout)
+        return await self._issue_request(message_type, frame_data, send, timeout, flags)
 
     async def _issue_request(
         self,
@@ -89,18 +96,17 @@ class Multiplexer:
         frame_data: bytes,
         send: Callable[[bytes], Awaitable[None]],
         timeout: float,
+        flags: int,
     ) -> bytes:
         future = asyncio.get_running_loop().create_future()
-        correlation_id: int | None = None
-        if self.correlation_enabled and message_type not in {302, 303}:
-            correlation_id = self._next_correlation_id
-            self._next_correlation_id = (correlation_id + 1) & 0xFFFFFFFFFFFFFFFF or 1
-            frame_data = b"\x02\x00\x08" + correlation_id.to_bytes(8, "big") + frame_data
+        if not self.correlation_enabled:
+            raise FitzConnectionError("Wire-2 HELLO is required before sending requests")
+        correlation_id = self.next_correlation_id()
+        frame_data = (
+            frame_data[:2] + bytes((flags,)) + correlation_id.to_bytes(8, "big") + frame_data[11:]
+        )
         pending = PendingRequest(future, correlation_id=correlation_id)
-        if correlation_id is None:
-            self._pending[message_type].append(pending)
-        else:
-            self._correlated[correlation_id] = pending
+        self._correlated[correlation_id] = pending
         try:
             send_future = asyncio.ensure_future(send(frame_data))
             try:
@@ -135,7 +141,10 @@ class Multiplexer:
 
     def _abandon(self, message_type: int, pending: PendingRequest) -> None:
         if pending.correlation_id is not None:
-            self._correlated.pop(pending.correlation_id, None)
+            if pending.sent:
+                pending.future = None
+            else:
+                self._correlated.pop(pending.correlation_id, None)
             return
         if pending.sent:
             pending.future = None  # tombstone consumes a possible late reply
@@ -176,13 +185,21 @@ class Multiplexer:
             return
         self._dispatch_push(message_type, payload)
 
-    def dispatch_correlated(self, correlation_id: int, message_type: int, payload: bytes) -> None:
-        pending = self._correlated.pop(correlation_id, None)
+    def dispatch_correlated(
+        self,
+        correlation_id: int,
+        message_type: int,
+        payload: bytes,
+        response_final: bool = True,
+    ) -> None:
+        pending = self._correlated.get(correlation_id)
         if pending is None:
-            # A correlation may have a later domain-defined phase after its
-            # original waiter completed. Route that phase normally.
-            self.dispatch(message_type, payload)
+            raise ProtocolError(
+                f"Unexpected response correlation {correlation_id} for message type {message_type}"
+            )
+        if not response_final:
             return
+        self._correlated.pop(correlation_id, None)
         if pending.future is not None and not pending.future.done():
             pending.future.set_result(payload)
 

@@ -9,7 +9,7 @@ import pytest
 
 import fitz_py
 from fitz_py._runtime import AsyncSubscription, RequestGate
-from fitz_py.domains.kv import CAP_KV_SCAN_EXCLUSIVE, KVTransaction
+from fitz_py.domains.kv import KVTransaction
 from fitz_py.domains.lease import LeaseClient
 from fitz_py.domains.notice import NoticeClient
 from fitz_py.domains.queue import QueueClient
@@ -18,12 +18,14 @@ from fitz_py.domains.schedule import DeliveryMode, ScheduleClient, ScheduleEntry
 from fitz_py.domains.stream import StreamClient, StreamSession, _assert_stream_pattern
 from fitz_py.errors import (
     ERR_SCHEDULE_BACKEND_ERROR,
+    CodecError,
     FitzConnectionError,
     FitzTimeoutError,
     FitzTransportError,
     KVError,
     LeaseError,
     NoticeError,
+    ProtocolError,
     QueueError,
     RequestQueueFullError,
     RPCError,
@@ -36,7 +38,6 @@ from fitz_py.multiplexer import Multiplexer
 from fitz_py.protocol.buffer import BufferReader, BufferWriter
 from fitz_py.protocol.frame import FrameCodec, FrameParser
 from fitz_py.protocol.messages import (
-    CAP_SESSION_METADATA,
     MSG_KV_GET,
     MSG_KV_INSERT,
     MSG_KV_SCAN,
@@ -82,17 +83,17 @@ from fitz_py.types import ClientConfig, ConcurrencyLimits
 def test_schedule_backend_error_code_is_distinct_and_retryable() -> None:
     error = ScheduleError("backend busy", "BACKEND_ERROR", ERR_SCHEDULE_BACKEND_ERROR)
 
-    assert ERR_SCHEDULE_BACKEND_ERROR == 7010
-    assert is_retryable(error)
+    assert ERR_SCHEDULE_BACKEND_ERROR == 7006
+    assert not is_retryable(error)
 
 
 @pytest.mark.parametrize(
     ("error_type", "code", "expected"),
     [
-        (KVError, 1014, True),
-        (StreamError, 2014, True),
-        (NoticeError, 3006, True),
-        (LeaseError, 5007, True),
+        (KVError, 1005, True),
+        (StreamError, 2005, True),
+        (NoticeError, 3005, True),
+        (LeaseError, 5005, True),
         (KVError, 1009, False),
         (LeaseError, 5006, False),
         (KVError, 1011, False),
@@ -100,7 +101,10 @@ def test_schedule_backend_error_code_is_distinct_and_retryable() -> None:
     ],
 )
 def test_retryability_matches_server_domain_codes(error_type, code, expected) -> None:
-    assert is_retryable(error_type("server error", "SERVER", code)) is expected
+    assert (
+        is_retryable(error_type("server error", "SERVER", code, 5 if expected else 0, 0))
+        is expected
+    )
 
 
 async def test_schedule_create_batch_encodes_each_definition() -> None:
@@ -138,7 +142,7 @@ async def test_schedule_list_v2_decodes_cursor_page() -> None:
     response.write_u32_be(3)
     response.write_bytes(b"one")
     response.write_u8(0)
-    connection = FakeConnection({707: response.build()})
+    connection = FakeConnection({MSG_SCHEDULE_LIST: response.build()})
 
     page = await ScheduleClient(connection).list_v2(cursor="prior-cursor", limit=5)
 
@@ -156,25 +160,28 @@ async def test_schedule_list_v2_decodes_cursor_page() -> None:
 
 
 @pytest.mark.parametrize("message_type", [MSG_SCHEDULE_CREATE_BATCH, MSG_SCHEDULE_LIST_V2])
-@pytest.mark.parametrize("coded", [False, True])
-async def test_schedule_extensions_decode_domain_and_broker_errors(
-    message_type: int, coded: bool
-) -> None:
-    failure = BufferWriter()
-    failure.write_u8(1)
-    if coded:
-        failure.write_u32_be(7010)
-    failure.write_string("busy")
-    connection = FakeConnection({message_type: failure.build()})
+async def test_schedule_extensions_decode_common_error_envelope(message_type: int) -> None:
+    connection = FakeConnection({message_type: _coded_error(7006, "busy", error_class=6, effect=1)})
     schedule = ScheduleClient(connection)
-
-    with pytest.raises(ScheduleError) as raised:
+    with pytest.raises(ScheduleError, match="busy") as raised:
         if message_type == MSG_SCHEDULE_CREATE_BATCH:
             await schedule.create_batch(())
         else:
             await schedule.list_v2()
+    assert raised.value.domain_code == 7006
+    assert raised.value.error_class == 6
+    assert raised.value.effect == 1
+    assert not is_retryable(raised.value)
 
-    assert raised.value.domain_code == (7010 if coded else 0)
+
+@pytest.mark.parametrize("message_type", [MSG_SCHEDULE_CREATE_BATCH, MSG_SCHEDULE_LIST_V2])
+async def test_schedule_extensions_reject_legacy_uncoded_error(message_type: int) -> None:
+    schedule = ScheduleClient(FakeConnection({message_type: _plain_error("busy")}))
+    with pytest.raises(ProtocolError):
+        if message_type == MSG_SCHEDULE_CREATE_BATCH:
+            await schedule.create_batch(())
+        else:
+            await schedule.list_v2()
 
 
 class FakeConnection:
@@ -272,21 +279,18 @@ def test_buffer_round_trip() -> None:
     assert reader.is_eof()
 
 
-def test_frame_parser_handles_fragmentation() -> None:
+def test_frame_parser_requires_a_complete_transport_frame() -> None:
     frame = FrameCodec.encode_frame(42, b"payload")
     parser = FrameParser()
-    assert parser.parse_frames(frame[:3]) == []
-    parsed = parser.parse_frames(frame[3:])
+    with pytest.raises(CodecError, match="truncated"):
+        parser.parse_frames(frame[:3])
+    parsed = parser.parse_frames(frame)
     assert [(item.message_type, item.payload) for item in parsed] == [(42, b"payload")]
 
 
 def test_response_envelopes_are_strict() -> None:
     assert parse_response(b"\0data").data == b"data"
-    writer = BufferWriter()
-    writer.write_u8(1)
-    writer.write_u32_be(4005)
-    writer.write_string("full")
-    response = parse_response(writer.build())
+    response = parse_response(_coded_error(4005, "full", error_class=5, effect=0))
     assert (response.error_code, response.error) == (4005, "full")
 
 
@@ -310,54 +314,66 @@ async def test_subscription_backpressure_is_explicit() -> None:
         await anext(subscription)
 
 
-@pytest.mark.asyncio
-async def test_multiplexer_tombstone_consumes_late_reply() -> None:
+def connected_multiplexer() -> Multiplexer:
     mux = Multiplexer()
+    mux.set_capabilities(2, 0)
     mux.set_connected()
-    sent = asyncio.Event()
+    return mux
 
-    async def send(_frame: bytes) -> None:
-        sent.set()
 
-    task = asyncio.create_task(mux.request(9, b"x", send, 0.01))
-    await sent.wait()
+@pytest.mark.asyncio
+async def test_multiplexer_late_reply_cannot_consume_new_request_response() -> None:
+    mux = connected_multiplexer()
+    sent: list[bytes] = []
+
+    async def send(frame: bytes) -> None:
+        sent.append(frame)
+
+    request = FrameCodec.encode_frame(9, b"x")
     with pytest.raises(FitzTimeoutError):
-        await task
-    mux.dispatch(9, b"late")
-    next_task = asyncio.create_task(mux.request(9, b"x", send, 1))
+        await mux.request(9, request, send, 0.01)
+    next_task = asyncio.create_task(mux.request(9, request, send, 1))
     await asyncio.sleep(0)
-    mux.dispatch(9, b"current")
+    await asyncio.sleep(0)
+    first_id, second_id = [FrameCodec.decode_frame(frame).correlation_id for frame in sent]
+    mux.dispatch_correlated(first_id, 9, b"late")
+    assert not next_task.done()
+    mux.dispatch_correlated(second_id, 9, b"current")
     assert await next_task == b"current"
 
 
 @pytest.mark.asyncio
-async def test_multiplexer_ambiguous_send_timeout_keeps_tombstone() -> None:
-    mux = Multiplexer()
-    mux.set_connected()
+async def test_multiplexer_ambiguous_send_timeout_does_not_reuse_correlation() -> None:
+    mux = connected_multiplexer()
+    sent: list[bytes] = []
 
-    async def ambiguous_send(_frame: bytes) -> None:
+    async def ambiguous_send(frame: bytes) -> None:
+        sent.append(frame)
         raise FitzTimeoutError("drain timed out")
 
+    request = FrameCodec.encode_frame(9, b"x")
     with pytest.raises(FitzTimeoutError, match="drain"):
-        await mux.request(9, b"first", ambiguous_send, 1)
+        await mux.request(9, request, ambiguous_send, 1)
 
-    sent = asyncio.Event()
+    async def send(frame: bytes) -> None:
+        sent.append(frame)
 
-    async def send(_frame: bytes) -> None:
-        sent.set()
-
-    next_task = asyncio.create_task(mux.request(9, b"second", send, 1))
-    await sent.wait()
-    mux.dispatch(9, b"late-first")
-    mux.dispatch(9, b"second-response")
+    next_task = asyncio.create_task(mux.request(9, request, send, 1))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    first_id, second_id = [FrameCodec.decode_frame(frame).correlation_id for frame in sent]
+    assert first_id != second_id
+    mux.dispatch_correlated(first_id, 9, b"late-first")
+    mux.dispatch_correlated(second_id, 9, b"second-response")
     assert await next_task == b"second-response"
 
 
 @pytest.mark.asyncio
 async def test_multiplexer_disconnect_fails_waiters() -> None:
-    mux = Multiplexer()
-    mux.set_connected()
-    task = asyncio.create_task(mux.request(1, b"", lambda _: asyncio.sleep(0), 1))
+    mux = connected_multiplexer()
+    task = asyncio.create_task(
+        mux.request(100, FrameCodec.encode_frame(100, b""), lambda _: asyncio.sleep(0), 1)
+    )
     await asyncio.sleep(0)
     mux.set_disconnected()
     with pytest.raises(FitzConnectionError):
@@ -366,59 +382,65 @@ async def test_multiplexer_disconnect_fails_waiters() -> None:
 
 @pytest.mark.asyncio
 async def test_multiplexer_correlates_out_of_order_same_type_responses() -> None:
-    mux = Multiplexer()
-    mux.set_connected()
-    mux.set_capabilities(1, 1)
+    mux = connected_multiplexer()
     sent: list[bytes] = []
 
     async def send(frame: bytes) -> None:
         sent.append(frame)
 
-    first = asyncio.create_task(mux.request(202, b"first", send, 1))
-    second = asyncio.create_task(mux.request(202, b"second", send, 1))
+    first = asyncio.create_task(mux.request(202, FrameCodec.encode_frame(202, b"first"), send, 1))
+    second = asyncio.create_task(mux.request(202, FrameCodec.encode_frame(202, b"second"), send, 1))
     await asyncio.sleep(0)
     await asyncio.sleep(0)
-
-    assert sent[0].startswith(b"\x02\x00\x08" + (1).to_bytes(8, "big"))
-    assert sent[1].startswith(b"\x02\x00\x08" + (2).to_bytes(8, "big"))
-    mux.dispatch_correlated(2, 202, b"second-response")
-    mux.dispatch_correlated(1, 202, b"first-response")
-
+    first_id, second_id = [FrameCodec.decode_frame(frame).correlation_id for frame in sent]
+    assert first_id != second_id
+    mux.dispatch_correlated(second_id, 202, b"second-response")
+    mux.dispatch_correlated(first_id, 202, b"first-response")
     assert await first == b"first-response"
     assert await second == b"second-response"
 
 
 @pytest.mark.asyncio
-async def test_multiplexer_serializes_legacy_same_type_requests() -> None:
+async def test_multiplexer_requires_hello_before_requests() -> None:
     mux = Multiplexer()
     mux.set_connected()
+    with pytest.raises(FitzConnectionError, match="HELLO"):
+        await mux.request(100, FrameCodec.encode_frame(100, b""), lambda _: asyncio.sleep(0), 1)
+
+
+def test_unknown_correlation_is_a_protocol_error_and_never_falls_through() -> None:
+    mux = Multiplexer()
+    received: list[bytes] = []
+    mux.register_notification_handler(400, received.append)
+
+    with pytest.raises(ProtocolError, match="Unexpected response correlation"):
+        mux.dispatch_correlated(99, 400, b"later-grant")
+
+    assert received == []
+
+
+@pytest.mark.asyncio
+async def test_correlated_request_waits_for_final_phase() -> None:
+    mux = Multiplexer()
+    mux.set_connected()
+    mux.set_capabilities(2, 0)
     sent: list[bytes] = []
 
     async def send(frame: bytes) -> None:
         sent.append(frame)
 
-    first = asyncio.create_task(mux.request(202, b"first", send, 1))
-    second = asyncio.create_task(mux.request(202, b"second", send, 1))
+    pending = asyncio.create_task(
+        mux.request(400, FrameCodec.encode_frame(400, b"acquire"), send, 1)
+    )
     await asyncio.sleep(0)
     await asyncio.sleep(0)
-    assert sent == [b"first"]
-    mux.dispatch(202, b"first-response")
-    assert await first == b"first-response"
-    await asyncio.sleep(0)
-    await asyncio.sleep(0)
-    assert sent == [b"first", b"second"]
-    mux.dispatch(202, b"second-response")
-    assert await second == b"second-response"
+    correlation = FrameCodec.decode_frame(sent[0]).correlation_id
 
+    mux.dispatch_correlated(correlation, 400, b"queued", response_final=False)
+    assert not pending.done()
+    mux.dispatch_correlated(correlation, 400, b"granted", response_final=True)
 
-def test_unknown_correlation_falls_through_to_push_handler() -> None:
-    mux = Multiplexer()
-    received: list[bytes] = []
-    mux.register_notification_handler(400, received.append)
-
-    mux.dispatch_correlated(99, 400, b"later-grant")
-
-    assert received == [b"later-grant"]
+    assert await pending == b"granted"
 
 
 def test_multiplexer_reports_push_decoder_failures() -> None:
@@ -640,60 +662,36 @@ def _scan_page_response(pairs: list[tuple[bytes, bytes]], has_more: bool) -> byt
     return writer.build()
 
 
+@pytest.mark.parametrize("reverse, key, options", [(False, b"a", 2), (True, b"z", 3)])
 @pytest.mark.asyncio
-async def test_kv_scan_all_uses_forward_successor_without_capability() -> None:
+async def test_kv_scan_all_resumes_exclusively_without_optional_capabilities(
+    reverse, key, options
+) -> None:
     connection = FakeConnection(
-        {MSG_KV_SCAN: [_scan_page_response([(b"a", b"1")], True), _scan_page_response([], False)]}
+        {MSG_KV_SCAN: [_scan_page_response([(key, b"1")], True), _scan_page_response([], False)]}
     )
     transaction = KVTransaction(connection, "kv://r/a/items", 7)
-
-    entries = [entry async for entry in transaction.scan_all()]
-
-    assert [entry.key for entry in entries] == [b"a"]
+    assert [entry.key async for entry in transaction.scan_all(reverse=reverse)] == [key]
     reader = BufferReader(connection.sent[1][1])
     reader.read_u64_be()
     reader.read_route()
     assert reader.read_u8() == 1
-    assert reader.read_bytes(reader.read_u32_be()) == b"a\x00"
+    assert reader.read_bytes(reader.read_u32_be()) == key
     assert reader.read_u8() == 0
-    assert reader.read_u8() == 0
-
-
-@pytest.mark.asyncio
-async def test_kv_scan_all_fails_reverse_without_capability_after_yielding_page() -> None:
-    connection = FakeConnection(
-        {MSG_KV_SCAN: _scan_page_response([(b"z", b"1")], True)},
-        capabilities=CAP_SESSION_METADATA,
-    )
-    transaction = KVTransaction(connection, "kv://r/a/items", 7)
-    iterator = transaction.scan_all(reverse=True)
-
-    assert (await anext(iterator)).key == b"z"
-    with pytest.raises(KVError, match="exclusive KV SCAN"):
-        await anext(iterator)
-
-
-@pytest.mark.asyncio
-async def test_kv_scan_all_uses_exclusive_resume_when_advertised() -> None:
-    connection = FakeConnection(
-        {MSG_KV_SCAN: [_scan_page_response([(b"z", b"1")], True), _scan_page_response([], False)]},
-        capabilities=CAP_KV_SCAN_EXCLUSIVE,
-    )
-    transaction = KVTransaction(connection, "kv://r/a/items", 7)
-
-    assert [entry.key async for entry in transaction.scan_all(reverse=True)] == [b"z"]
-    assert connection.sent[1][1][-1] == 1
+    assert reader.read_optional_u64() is None
+    assert reader.read_u8() == options
+    assert reader.is_eof()
 
 
 @pytest.mark.asyncio
 async def test_kv_error_response_decodes_domain_code_and_message() -> None:
-    connection = FakeConnection({MSG_KV_INSERT: _coded_error(1006, "Key already exists")})
+    connection = FakeConnection({MSG_KV_INSERT: _coded_error(1055, "Key already exists")})
     transaction = KVTransaction(connection, "kv://r/a/items", 7)
 
     with pytest.raises(KVError, match="Key already exists") as raised:
         await transaction.insert(b"key", b"value")
 
-    assert raised.value.domain_code == 1006
+    assert raised.value.domain_code == 1055
 
 
 @pytest.mark.asyncio
@@ -705,8 +703,8 @@ async def test_schedule_backend_error_response_preserves_distinct_code() -> None
     with pytest.raises(ScheduleError, match="backend busy") as raised:
         await ScheduleClient(connection).list_schedules()
 
-    assert raised.value.domain_code == 7010
-    assert is_retryable(raised.value)
+    assert raised.value.domain_code == 7006
+    assert not is_retryable(raised.value)
 
 
 @pytest.mark.asyncio
@@ -724,9 +722,7 @@ async def test_domain_success_decoders_reject_malformed_flags_and_lengths() -> N
         await LeaseClient(FakeConnection({MSG_LEASE_QUERY: b"\0\2"})).query("lease://r/a/item")
 
     schedule = BufferWriter()
-    schedule.write_u8(0)
-    schedule.write_u64_be(0)
-    schedule.write_u8(2)
+    schedule.write_bytes(b"\0\1\0\0\2")
     with pytest.raises(ScheduleError, match="entry marker"):
         await ScheduleClient(FakeConnection({MSG_SCHEDULE_LIST: schedule.build()})).list_schedules()
 
@@ -744,10 +740,12 @@ def _lease_success(response_type: int, token: int) -> bytes:
     return writer.build()
 
 
-def _coded_error(code: int, message: str) -> bytes:
+def _coded_error(code: int, message: str, *, error_class: int = 0, effect: int = 0) -> bytes:
     writer = BufferWriter()
     writer.write_u8(1)
-    writer.write_u32_be(code)
+    writer.write_u16_be(code)
+    writer.write_u8(error_class)
+    writer.write_u8(effect)
     writer.write_string(message)
     return writer.build()
 
@@ -839,6 +837,16 @@ async def test_queued_lease_wait_serializes_uncorrelated_deferred_responses() ->
 
 
 @pytest.mark.asyncio
+async def test_duplicate_queued_lease_acquire_returns_typed_terminal_error() -> None:
+    client = LeaseClient(FakeConnection({MSG_LEASE_ACQUIRE: _lease_success(3, 0)}))
+
+    with pytest.raises(LeaseError) as raised:
+        await client.acquire("lease://r/a/leader", ttl=30, wait=5)
+
+    assert raised.value.code == "LEASE_ALREADY_QUEUED"
+
+
+@pytest.mark.asyncio
 async def test_cancelled_queued_lease_retains_fifo_tombstone() -> None:
     connection = FakeConnection({MSG_LEASE_ACQUIRE: _lease_success(2, 0)})
     client = LeaseClient(connection)
@@ -904,8 +912,8 @@ async def test_disconnect_during_primary_acquire_has_no_unretrieved_internal_fut
 
 
 @pytest.mark.asyncio
-async def test_stream_operations_decode_plain_error_envelopes() -> None:
-    error = _plain_error("stream conflict")
+async def test_stream_operations_decode_common_error_envelopes() -> None:
+    error = _coded_error(2052, "stream conflict")
     connection = FakeConnection(
         dict.fromkeys(
             (
@@ -965,8 +973,10 @@ def test_schedule_subscription_accepts_wildcard_patterns() -> None:
 
 
 @pytest.mark.asyncio
-async def test_schedule_subscribe_decodes_plain_error() -> None:
-    connection = FakeConnection({MSG_SCHEDULE_SUBSCRIBE: _plain_error("bad pattern")})
+async def test_schedule_subscribe_decodes_common_error() -> None:
+    connection = FakeConnection(
+        {MSG_SCHEDULE_SUBSCRIBE: _coded_error(7003, "bad pattern", error_class=3)}
+    )
 
     with pytest.raises(ScheduleError, match="bad pattern"):
         await ScheduleClient(connection)._subscribe_wire("schedule://r/a/*/run")
@@ -976,7 +986,9 @@ async def test_schedule_subscribe_decodes_plain_error() -> None:
 async def test_schedule_crud_list_and_notification_wire_contracts() -> None:
     listing = BufferWriter()
     listing.write_u8(0)
-    listing.write_u64_be(2)
+    listing.write_u8(1)
+    listing.write_u8(0)
+    listing.write_u8(0)
     listing.write_u8(1)
     listing.write_string("schedule://r/a/jobs/nightly")
     listing.write_string("0 0 * * *")
@@ -999,7 +1011,7 @@ async def test_schedule_crud_list_and_notification_wire_contracts() -> None:
     client = ScheduleClient(connection)
 
     await client.cancel("schedule://r/a/jobs/nightly")
-    page = await client.list_schedules(offset=1, limit=5)
+    page = await client.list_schedules(limit=5)
     subscription = await client._subscriptions.subscribe("schedule://r/a/*/nightly")
     notify = BufferWriter()
     notify.write_u64_be(44)
@@ -1008,7 +1020,7 @@ async def test_schedule_crud_list_and_notification_wire_contracts() -> None:
     notify.write_bytes(b"fire")
     connection.notifications[MSG_SCHEDULE_NOTIFY](notify.build())
 
-    assert page.total_count == 2
+    assert page.total_count is None
     assert page.entries[0].delivery_mode is DeliveryMode.SINGLE
     assert page.entries[0].payload == b"job"
     assert (await anext(subscription)).payload == b"fire"
@@ -1018,14 +1030,16 @@ async def test_schedule_crud_list_and_notification_wire_contracts() -> None:
 @pytest.mark.asyncio
 async def test_schedule_rejects_invalid_pagination_and_decode_shapes() -> None:
     client = ScheduleClient(FakeConnection())
-    with pytest.raises(ValueError, match="non-negative"):
+    with pytest.raises(ValueError, match="cursors"):
         await client.list_schedules(offset=-1)
     with pytest.raises(ValueError, match="1000"):
         await client.list_schedules(limit=1001)
 
     malformed = BufferWriter()
     malformed.write_u8(0)
-    malformed.write_u64_be(1)
+    malformed.write_u8(1)
+    malformed.write_u8(0)
+    malformed.write_u8(0)
     malformed.write_u8(1)
     malformed.write_string("schedule://r/a/jobs/nightly")
     malformed.write_string("0 0 * * *")
@@ -1174,14 +1188,16 @@ def test_invalid_queue_route_fails_before_io() -> None:
 @pytest.mark.parametrize("operation", ["append", "commit"])
 @pytest.mark.parametrize(
     ("code", "message"),
-    [(2001, "unrelated wording"), (2002, "concurrency conflict"), (2012, "backend unavailable")],
+    [(2050, "unrelated wording"), (2052, "concurrency conflict"), (2006, "backend unavailable")],
 )
-async def test_stream_session_preserves_versioned_error_code(
+async def test_stream_session_preserves_common_error_code(
     operation: str, code: int, message: str
 ) -> None:
     writer = BufferWriter()
-    writer.write_u8(2)
-    writer.write_u32_be(code)
+    writer.write_u8(1)
+    writer.write_u16_be(code)
+    writer.write_u8(6 if code == 2006 else 0)
+    writer.write_u8(1 if code == 2006 else 0)
     writer.write_string(message)
     connection = FakeConnection(
         {MSG_STREAM_APPEND: writer.build(), MSG_STREAM_COMMIT: writer.build()}

@@ -14,7 +14,9 @@ async def test_should_preserve_coded_capacity_for_queue_completion() -> None:
     # Arrange
     writer = BufferWriter()
     writer.write_u8(1)
-    writer.write_u32_be(4005)
+    writer.write_u16_be(4005)
+    writer.write_u8(5)
+    writer.write_u8(0)
     writer.write_string("not accepted")
 
     async def request(_message_type: int, _payload: bytes) -> bytes:
@@ -37,7 +39,9 @@ async def test_should_preserve_coded_capacity_for_schedule_cancel() -> None:
     # Arrange
     writer = BufferWriter()
     writer.write_u8(1)
-    writer.write_u32_be(7010)
+    writer.write_u16_be(7005)
+    writer.write_u8(5)
+    writer.write_u8(0)
     writer.write_string("not accepted")
 
     async def request(_message_type: int, _payload: bytes) -> bytes:
@@ -49,18 +53,20 @@ async def test_should_preserve_coded_capacity_for_schedule_cancel() -> None:
     with pytest.raises(ScheduleError) as caught:
         await client.cancel("schedule://prod/app/jobs/run")
     # Assert
-    assert caught.value.domain_code == 7010
+    assert caught.value.domain_code == 7005
     assert is_retryable(caught.value)
 
 
-@pytest.mark.parametrize("code, retryable", [(4005, True), (4007, False)])
+@pytest.mark.parametrize("code, retryable", [(4005, True), (4050, False)])
 @pytest.mark.parametrize("operation", ["complete", "extend"])
 @pytest.mark.asyncio
 async def test_should_surface_queue_rejection_without_automatic_replay(code, retryable, operation):
     # Arrange
     writer = BufferWriter()
     writer.write_u8(1)
-    writer.write_u32_be(code)
+    writer.write_u16_be(code)
+    writer.write_u8(5 if code == 4005 else 0)
+    writer.write_u8(0)
     writer.write_string("broker rejection")
     calls = 0
 
@@ -85,16 +91,14 @@ async def test_should_surface_queue_rejection_without_automatic_replay(code, ret
     assert not item._closed
 
 
-def test_should_preserve_long_plain_error_without_inferring_capacity():
+def test_should_reject_legacy_plain_error_without_inferring_capacity():
     # Arrange
     writer = BufferWriter()
     writer.write_u8(1)
     writer.write_string("x" * 4005)
     # Act
-    response = parse_plain_or_coded_response(writer.build())
-    # Assert
-    assert response.error_code is None
-    assert response.error == "x" * 4005
+    with pytest.raises(ProtocolError):
+        parse_plain_or_coded_response(writer.build())
 
 
 def test_should_reject_malformed_capacity_response():
@@ -110,7 +114,9 @@ async def test_should_retain_reservation_until_explicit_successful_completion():
     # Arrange
     writer = BufferWriter()
     writer.write_u8(1)
-    writer.write_u32_be(4005)
+    writer.write_u16_be(4005)
+    writer.write_u8(5)
+    writer.write_u8(0)
     writer.write_string("not accepted")
     payloads = []
 

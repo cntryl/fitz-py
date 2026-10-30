@@ -17,13 +17,12 @@ from fitz_py.protocol.messages import (
     MSG_SCHEDULE_CANCEL,
     MSG_SCHEDULE_CREATE,
     MSG_SCHEDULE_CREATE_BATCH,
-    MSG_SCHEDULE_LIST,
     MSG_SCHEDULE_LIST_V2,
     MSG_SCHEDULE_NOTIFY,
     MSG_SCHEDULE_SUBSCRIBE,
     MSG_SCHEDULE_UNSUBSCRIBE,
 )
-from fitz_py.protocol.response import Response, parse_plain_or_coded_response, parse_response
+from fitz_py.protocol.response import Response, parse_plain_or_coded_response
 from fitz_py.types import BytesLike
 
 
@@ -47,7 +46,9 @@ class ScheduleEntry:
 @dataclass(frozen=True, slots=True)
 class SchedulePage:
     entries: tuple[ScheduleEntry, ...]
-    total_count: int
+    total_count: int | None
+    has_more: bool = False
+    continuation: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,7 +110,13 @@ class ScheduleClient(DomainClient):
             await self.request_frame(MSG_SCHEDULE_CREATE, writer.build())
         )
         if not response.success:
-            raise ScheduleError(f"CREATE failed: {response.error}", "CREATE", response.error_code)
+            raise ScheduleError(
+                f"CREATE failed: {response.error}",
+                "CREATE",
+                response.error_code,
+                response.error_class,
+                response.effect,
+            )
         if response.data:
             raise ScheduleError("CREATE response has trailing bytes", "INVALID_RESPONSE")
         return route
@@ -122,7 +129,13 @@ class ScheduleClient(DomainClient):
             await self.request_frame(MSG_SCHEDULE_CANCEL, writer.build())
         )
         if not response.success:
-            raise ScheduleError(f"CANCEL failed: {response.error}", "CANCEL", response.error_code)
+            raise ScheduleError(
+                f"CANCEL failed: {response.error}",
+                "CANCEL",
+                response.error_code,
+                response.error_class,
+                response.effect,
+            )
         if response.data:
             raise ScheduleError("CANCEL response has trailing bytes", "INVALID_RESPONSE")
 
@@ -144,7 +157,12 @@ class ScheduleClient(DomainClient):
         )
         if not response.success:
             raise domain_error(
-                ScheduleError, "CREATE_BATCH", response.error_code or 0, response.error
+                ScheduleError,
+                "CREATE_BATCH",
+                response.error_code or 0,
+                response.error,
+                response.error_class,
+                response.effect,
             )
         if response.data:
             raise ScheduleError("CREATE_BATCH response has trailing bytes", "INVALID_RESPONSE")
@@ -163,7 +181,14 @@ class ScheduleClient(DomainClient):
             await self.request_frame(MSG_SCHEDULE_LIST_V2, writer.build())
         )
         if not response.success:
-            raise domain_error(ScheduleError, "LIST_V2", response.error_code or 0, response.error)
+            raise domain_error(
+                ScheduleError,
+                "LIST_V2",
+                response.error_code or 0,
+                response.error,
+                response.error_class,
+                response.effect,
+            )
         reader = BufferReader(response.data)
         if reader.read_u8() != 1:
             raise ScheduleError("LIST_V2 response has an invalid version", "INVALID_RESPONSE")
@@ -202,41 +227,14 @@ class ScheduleClient(DomainClient):
     async def list_schedules(
         self, *, offset: int | None = None, limit: int | None = None
     ) -> SchedulePage:
-        if offset is not None and offset < 0:
-            raise ValueError("offset must be non-negative")
+        if offset not in {None, 0}:
+            raise ValueError("Schedule LIST now uses cursors; pass offset=None or 0")
         if limit is not None and not 0 <= limit <= 1000:
             raise ValueError("limit must be between 0 and 1000")
-        writer = BufferWriter()
-        writer.write_optional_u64(offset)
-        writer.write_optional_u64(limit)
-        response = parse_response(await self.request_frame(MSG_SCHEDULE_LIST, writer.build()))
-        if not response.success:
-            raise domain_error(ScheduleError, "LIST", response.error_code or 0, response.error)
-        reader = BufferReader(response.data)
-        total_count = reader.read_u64_be()
-        entries: list[ScheduleEntry] = []
-        while True:
-            marker = reader.read_u8()
-            if marker == 0:
-                break
-            if marker != 1:
-                raise ScheduleError("LIST response has an invalid entry marker", "INVALID_RESPONSE")
-            route, cron = reader.read_string(), reader.read_string()
-            mode_byte = reader.read_u8()
-            if mode_byte not in {0, 1}:
-                raise ScheduleError("Invalid delivery mode", "INVALID_RESPONSE")
-            payload = reader.read_bytes(reader.read_u32_be())
-            entries.append(
-                ScheduleEntry(
-                    route,
-                    cron,
-                    DeliveryMode.BROADCAST if mode_byte == 0 else DeliveryMode.SINGLE,
-                    payload,
-                )
-            )
-        if not reader.is_eof():
-            raise ScheduleError("LIST response has trailing bytes", "INVALID_RESPONSE")
-        return SchedulePage(tuple(entries), total_count)
+        cursor_page = await self.list_v2(limit=limit)
+        return SchedulePage(
+            cursor_page.entries, None, cursor_page.has_more, cursor_page.continuation
+        )
 
     def subscribe(self, route: str) -> LazyAsyncIterator[ScheduleNotification]:
         _pattern(route)
@@ -250,7 +248,11 @@ class ScheduleClient(DomainClient):
         )
         if not response.success:
             raise ScheduleError(
-                f"SUBSCRIBE failed: {response.error}", "SUBSCRIBE", response.error_code
+                f"SUBSCRIBE failed: {response.error}",
+                "SUBSCRIBE",
+                response.error_code,
+                response.error_class,
+                response.effect,
             )
         reader = BufferReader(response.data)
         if reader.read_u8() != 1:
@@ -268,7 +270,11 @@ class ScheduleClient(DomainClient):
         )
         if not response.success:
             raise ScheduleError(
-                f"UNSUBSCRIBE failed: {response.error}", "UNSUBSCRIBE", response.error_code
+                f"UNSUBSCRIBE failed: {response.error}",
+                "UNSUBSCRIBE",
+                response.error_code,
+                response.error_class,
+                response.effect,
             )
         if response.data:
             raise ScheduleError("UNSUBSCRIBE response has trailing bytes", "INVALID_RESPONSE")

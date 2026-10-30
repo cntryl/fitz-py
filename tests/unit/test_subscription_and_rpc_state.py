@@ -22,7 +22,6 @@ from fitz_py.errors import (
 )
 from fitz_py.protocol.buffer import BufferReader, BufferWriter
 from fitz_py.protocol.messages import (
-    CAP_RPC_CANCELLATION,
     MSG_RPC_CANCELLATION,
     MSG_RPC_REQUEST,
     MSG_RPC_RESPONSE,
@@ -344,7 +343,6 @@ async def test_rpc_empty_terminal_response_is_delivered() -> None:
 @pytest.mark.asyncio
 async def test_rpc_negotiated_budget_and_cancellation_result() -> None:
     connection = StubConnection()
-    connection.capabilities = CAP_RPC_CANCELLATION
     client = RPCClient(connection)  # type: ignore[arg-type]
     call = await client.open_call("rpc://realm/app/work", b"request", timeout=2)
 
@@ -352,7 +350,6 @@ async def test_rpc_negotiated_budget_and_cancellation_result() -> None:
     correlation_id = request.read_bytes(16)
     request.read_route()
     request.read_bytes(request.read_u32_be())
-    assert request.read_u8() == 1
     assert request.read_u8() == 1
     assert 0 < request.read_u32_be() <= 2000
     assert request.is_eof()
@@ -372,7 +369,6 @@ async def test_rpc_negotiated_budget_and_cancellation_result() -> None:
 @pytest.mark.parametrize("close_mode", ["aclose", "context_exit"])
 async def test_lazy_rpc_retains_cancellation_outcome_after_disposal(close_mode: str) -> None:
     connection = StubConnection()
-    connection.capabilities = CAP_RPC_CANCELLATION
     client = RPCClient(connection)  # type: ignore[arg-type]
     call = client.call("rpc://realm/app/work", b"body")
     await call.__aenter__()
@@ -390,7 +386,6 @@ async def test_lazy_rpc_retains_cancellation_outcome_after_disposal(close_mode: 
 @pytest.mark.asyncio
 async def test_rpc_does_not_start_handler_with_zero_inbound_budget() -> None:
     connection = StubConnection()
-    connection.capabilities = CAP_RPC_CANCELLATION
     queued = []
     connection.dispatch_async = lambda work: queued.append(work) is None  # type: ignore[method-assign]
     client = RPCClient(connection)  # type: ignore[arg-type]
@@ -405,7 +400,7 @@ async def test_rpc_does_not_start_handler_with_zero_inbound_budget() -> None:
     request.write_bytes(b"z" * 16)
     request.write_route("rpc://realm/app/work")
     request.write_u32_be(0)
-    request.write_bytes(b"\x01\x01\x00\x00\x00\x00")
+    request.write_bytes(b"\x01\x00\x00\x00\x00")
     client._on_request(request.build())
     await queued[0]()
     assert not called
@@ -415,7 +410,6 @@ async def test_rpc_does_not_start_handler_with_zero_inbound_budget() -> None:
 @pytest.mark.asyncio
 async def test_rpc_does_not_send_expired_buffered_response_after_disconnect() -> None:
     connection = StubConnection()
-    connection.capabilities = CAP_RPC_CANCELLATION
     queued = []
     connection.dispatch_async = lambda work: queued.append(work) is None  # type: ignore[method-assign]
     client = RPCClient(connection)  # type: ignore[arg-type]
@@ -428,7 +422,7 @@ async def test_rpc_does_not_send_expired_buffered_response_after_disconnect() ->
     request.write_bytes(b"x" * 16)
     request.write_route("rpc://realm/app/work")
     request.write_u32_be(0)
-    request.write_bytes(b"\x01\x01\x00\x00\x00\x00")
+    request.write_bytes(b"\x01\x00\x00\x00\x00")
     client._on_request(request.build())
     client._disconnect()
     sent_before_dispatch = len(connection.sent)
@@ -439,7 +433,6 @@ async def test_rpc_does_not_send_expired_buffered_response_after_disconnect() ->
 @pytest.mark.asyncio
 async def test_rpc_does_not_send_expired_semaphore_waiter_after_disconnect() -> None:
     connection = StubConnection()
-    connection.capabilities = CAP_RPC_CANCELLATION
     client = RPCClient(connection)  # type: ignore[arg-type]
     holder_started, release_holder = asyncio.Event(), asyncio.Event()
 
@@ -456,7 +449,7 @@ async def test_rpc_does_not_send_expired_semaphore_waiter_after_disconnect() -> 
         writer.write_route("rpc://realm/app/work")
         writer.write_u32_be(len(body))
         writer.write_bytes(body)
-        writer.write_bytes(b"\x01\x01")
+        writer.write_u8(1)
         writer.write_u32_be(budget)
         return writer.build()
 
@@ -481,7 +474,6 @@ async def test_rpc_does_not_send_expired_semaphore_waiter_after_disconnect() -> 
 @pytest.mark.asyncio
 async def test_rpc_downstream_call_inherits_budget_and_parent_cancellation() -> None:
     connection = StubConnection()
-    connection.capabilities = CAP_RPC_CANCELLATION
     client = RPCClient(connection)  # type: ignore[arg-type]
     parent_cancellation = asyncio.Event()
     context = RpcHandlerContext(
@@ -496,7 +488,6 @@ async def test_rpc_downstream_call_inherits_budget_and_parent_cancellation() -> 
     correlation_id = wire.read_bytes(16)
     wire.read_route()
     wire.read_bytes(wire.read_u32_be())
-    assert wire.read_u8() == 1
     assert wire.read_u8() == 1
     assert 0 < wire.read_u32_be() <= 2000
 
@@ -521,7 +512,6 @@ async def test_rpc_cancelling_unstarted_lazy_call_does_not_send_request() -> Non
 @pytest.mark.asyncio
 async def test_rpc_requests_deadline_cancellation_even_without_polling_responses() -> None:
     connection = StubConnection()
-    connection.capabilities = CAP_RPC_CANCELLATION
     client = RPCClient(connection)  # type: ignore[arg-type]
     call = await client.open_call("rpc://realm/app/work", b"request", timeout=0.001)
     await asyncio.wait_for(connection.rpc_control_sent.wait(), 1)
@@ -537,20 +527,24 @@ async def test_rpc_requests_deadline_cancellation_even_without_polling_responses
 
 
 @pytest.mark.asyncio
-async def test_rpc_legacy_call_keeps_payload_and_reports_cancel_unsupported() -> None:
+async def test_rpc_zero_optional_capabilities_still_supports_budget_and_cancellation() -> None:
     connection = StubConnection()
     client = RPCClient(connection)  # type: ignore[arg-type]
     call = await client.open_call("rpc://realm/app/work", b"request")
 
-    assert len(connection.sent[0][1]) == 16 + 4 + len("rpc://realm/app/work") + 4 + len(b"request")
-    assert await call.cancel() == "unsupported"
-    assert not any(message == MSG_RPC_CANCELLATION for message, _ in connection.sent)
+    assert (
+        len(connection.sent[0][1]) == 16 + 4 + len("rpc://realm/app/work") + 4 + len(b"request") + 5
+    )
+    correlation_id = connection.sent[0][1][:16]
+    cancellation = asyncio.create_task(call.cancel())
+    await asyncio.wait_for(connection.rpc_control_sent.wait(), 1)
+    client._on_lifecycle(b"\x04" + correlation_id + b"\x02")
+    assert await cancellation == "forwarded"
 
 
 @pytest.mark.asyncio
 async def test_rpc_worker_receives_cancellation_and_acknowledges_cleanup() -> None:
     connection = StubConnection()
-    connection.capabilities = CAP_RPC_CANCELLATION
     client = RPCClient(connection)  # type: ignore[arg-type]
     started = asyncio.Event()
     contexts = []
@@ -568,7 +562,6 @@ async def test_rpc_worker_receives_cancellation_and_acknowledges_cleanup() -> No
     request.write_route("rpc://realm/app/work")
     request.write_u32_be(0)
     request.write_u8(1)
-    request.write_u8(1)
     request.write_u32_be(2000)
     client._on_request(request.build())
     await started.wait()
@@ -582,7 +575,6 @@ async def test_rpc_worker_receives_cancellation_and_acknowledges_cleanup() -> No
 @pytest.mark.asyncio
 async def test_rpc_acknowledges_cleanup_before_delayed_cancellation_arrives() -> None:
     connection = StubConnection()
-    connection.capabilities = CAP_RPC_CANCELLATION
     client = RPCClient(connection)  # type: ignore[arg-type]
     ended = asyncio.Event()
     cleanup = asyncio.Event()
@@ -598,6 +590,7 @@ async def test_rpc_acknowledges_cleanup_before_delayed_cancellation_arrives() ->
     request.write_bytes(correlation_id)
     request.write_route("rpc://realm/app/work")
     request.write_u32_be(0)
+    request.write_u8(0)
     client._on_request(request.build())
     await asyncio.wait_for(ended.wait(), 1)
     assert not connection.rpc_control_sent.is_set()
@@ -609,7 +602,6 @@ async def test_rpc_acknowledges_cleanup_before_delayed_cancellation_arrives() ->
 @pytest.mark.asyncio
 async def test_rpc_acknowledges_cancelled_buffered_work_without_starting_handler() -> None:
     connection = StubConnection()
-    connection.capabilities = CAP_RPC_CANCELLATION
     queued = []
     connection.dispatch_async = lambda work: queued.append(work) is None  # type: ignore[method-assign]
     client = RPCClient(connection)  # type: ignore[arg-type]
@@ -624,6 +616,7 @@ async def test_rpc_acknowledges_cancelled_buffered_work_without_starting_handler
     request.write_bytes(b"q" * 16)
     request.write_route("rpc://realm/app/work")
     request.write_u32_be(0)
+    request.write_u8(0)
     client._on_request(request.build())
     client._on_lifecycle(b"\x02" + b"q" * 16 + b"\x01")
     await asyncio.wait_for(connection.rpc_control_sent.wait(), 1)
@@ -634,7 +627,6 @@ async def test_rpc_acknowledges_cancelled_buffered_work_without_starting_handler
 @pytest.mark.asyncio
 async def test_rpc_counts_dispatch_buffer_time_against_inherited_deadline() -> None:
     connection = StubConnection()
-    connection.capabilities = CAP_RPC_CANCELLATION
     queued = []
     connection.dispatch_async = lambda work: queued.append(work) is None  # type: ignore[method-assign]
     client = RPCClient(connection)  # type: ignore[arg-type]
@@ -649,7 +641,7 @@ async def test_rpc_counts_dispatch_buffer_time_against_inherited_deadline() -> N
     request.write_bytes(b"b" * 16)
     request.write_route("rpc://realm/app/work")
     request.write_u32_be(0)
-    request.write_bytes(b"\x01\x01\x00\x00\x00\x01")
+    request.write_bytes(b"\x01\x00\x00\x00\x01")
     client._on_request(request.build())
     async with asyncio.timeout(1):
         await client._active_invocations[b"b" * 16].context.cancelled.wait()
@@ -752,6 +744,7 @@ async def test_rpc_dispatch_saturation_sends_terminal_backpressure() -> None:
     request.write_route("rpc://realm/app/work")
     request.write_u32_be(4)
     request.write_bytes(b"body")
+    request.write_u8(0)
 
     client._on_request(request.build())
     async with asyncio.timeout(1):
@@ -765,7 +758,9 @@ async def test_rpc_dispatch_saturation_sends_terminal_backpressure() -> None:
     assert reader.read_u8() == 1
     error = BufferReader(reader.read_bytes(reader.read_u32_be()))
     assert error.read_u8() == 1
-    assert error.read_u32_be() == 6003
+    assert error.read_u16_be() == 6005
+    assert error.read_u8() == 5
+    assert error.read_u8() == 0
 
 
 def test_rpc_worker_rejects_request_trailing_bytes() -> None:
@@ -777,6 +772,7 @@ def test_rpc_worker_rejects_request_trailing_bytes() -> None:
     request.write_u32_be(4)
     request.write_bytes(b"body")
     request.write_u8(0)
+    request.write_u8(0)
 
-    with pytest.raises(RPCError, match="trailing"):
+    with pytest.raises(RPCError, match="bytes after"):
         client._on_request(request.build())

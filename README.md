@@ -17,11 +17,11 @@ If the release wheel has already been supplied, only the last command is needed.
 
 ## Connect
 
-Connection readiness waits for `SERVER_HELLO` within `request_timeout`, so the
-first domain command uses the broker's advertised capabilities. An explicit
-zero capability advertisement preserves legacy behavior; a missing advertisement
-times out and closes the transport. `auth_settle_timeout` is retained as a
-deprecated option.
+Connection readiness waits for Wire-2 `HELLO` within `request_timeout`, so the
+first domain command uses the broker's negotiated message-size and
+in-flight-request limits. Wire 2 carries correlation in the fixed frame header;
+capability bits are reserved as zero. `auth_settle_timeout` is retained as a
+deprecated option for observing `CONNECT_REJECTED`.
 
 ```python
 import asyncio
@@ -43,9 +43,8 @@ async def main():
 asyncio.run(main())
 ```
 
-`service_name` is optional. New brokers record it on the active session after
-advertising the `SESSION_METADATA` capability; surrounding whitespace is trimmed before it is
-reported, and older brokers receive no metadata frame.
+`service_name` is optional and is sent in the `CONNECT` payload with the client
+build identity. Surrounding whitespace is trimmed before it is sent.
 
 `Client.aclose()` is permanent and idempotent. Reconnect is enabled by default after the first
 successful authentication; an authentication rejection permanently closes the client. Configure
@@ -60,7 +59,7 @@ keyword arguments and the frozen policy values exported by `fitz_py`.
 - `client.lease`: queued fenced acquisition, query, change subscriptions, and managed renewal.
 - `client.notice`: fire-and-forget publish and one-wire/many-consumer subscriptions.
 - `client.stream`: append sessions, filtered replay, global cursors/watermarks, and commit events.
-- `client.schedule`: delivery modes, total-count pagination, cancel, and routed notifications.
+- `client.schedule`: delivery modes, cursor pagination, cancel, and routed notifications.
 
 Subscriptions are independently closable async iterators:
 
@@ -96,16 +95,18 @@ queue, stale-handle, and domain failures have stable string codes and structured
 cancellation is preserved. Requests cancelled after transmission leave a FIFO tombstone so a late
 reply cannot corrupt the next same-type request.
 
-When the broker advertises `CAP_RPC_CANCELLATION`, RPC calls carry their remaining timeout budget.
-Closing a started `client.rpc.call()` or cancelling its asyncio task sends a best-effort remote
+RPC calls carry their remaining timeout budget in Wire 2. Closing a started
+`client.rpc.call()` or cancelling its asyncio task sends a best-effort remote
 cancellation; await `call.cancellation` for the broker result, or use `await call.cancel()` to
 cancel and wait for that result. A worker receives `request.context.cancelled` and
 `request.context.remaining_time_ms()`. Pass the remaining time to downstream RPC calls and wait
-for the cancellation event while cleaning up request-owned work. Brokers without this capability
-keep the legacy wire format, and local cancellation cannot stop work already admitted by a worker.
+for the cancellation event while cleaning up request-owned work. Local cancellation cannot stop
+work already admitted by a worker.
 The deadline also expires when the caller is not polling its response stream.
 Workers await request-owned cleanup before returning; the SDK acknowledges cleanup afterward.
-A forwarded cancellation does not prove rollback or make a dispatched call safe to retry.
+A forwarded cancellation does not prove rollback or make a dispatched call safe to retry. RPC
+UUIDs continue to identify caller and worker work in domain payloads; frame correlations route
+client-to-broker responses.
 
 For an explicit A→B→C link, create B's downstream call from the inbound request:
 
@@ -115,19 +116,20 @@ async with client.rpc.call_from_request(request, "rpc://realm/area/child", body)
         await process(frame.body)
 ```
 
-Schedule backend unavailability and broker saturation use the distinct coded
-error `ERR_SCHEDULE_BACKEND_ERROR` (`7010`). It is retryable subject to the
-operation's replay safety; it is never reported as a cron or parse error.
+Schedule saturation is `BUSY` (`7005`) with a not-applied effect. A backend
+failure is `7006` and has an indeterminate effect, so a caller should not retry
+it blindly. Neither is reported as a cron or parse error.
 
-## Schedule broker extensions
+## Schedule pagination
 
-The canonical `schedule.create()` and offset-based `schedule.list_schedules()` remain the
-portable operations. Brokers that expose Schedule 706 and 707 also support
-`schedule.create_batch(entries)` and `schedule.list_v2(cursor=..., limit=...)`.
+Schedule LIST (702) uses cursor pagination. `schedule.list_schedules()` requests
+the first page; `offset` accepts only `None` or `0`. `schedule.list_v2(cursor=...,
+limit=...)` is the explicit cursor API name for the same message. Message 707 is
+retired. `schedule.create_batch(entries)` uses Schedule message 706.
 `create_batch` accepts `ScheduleEntry` values, including each entry's delivery mode.
 `list_v2` returns a `ScheduleCursorPage` with `entries`, `has_more`, and an opaque
-`continuation` to pass as the next cursor. These methods use the broker extension wire
-formats and report coded broker errors as `ScheduleError` domain codes.
+`continuation` to pass as the next cursor. They use the Wire-2 Schedule messages
+and report coded broker errors as `ScheduleError` domain codes.
 
 ## Verification
 

@@ -12,6 +12,7 @@ from fitz_py.domains._routes import is_exact_route_shape, is_selector_route_shap
 from fitz_py.domains.base import DomainClient
 from fitz_py.errors import NoticeError, domain_error
 from fitz_py.protocol.buffer import BufferReader, BufferWriter
+from fitz_py.protocol.frame import ACK_REQUESTED
 from fitz_py.protocol.messages import (
     MSG_NOTICE_NOTIFY,
     MSG_NOTICE_PUBLISH,
@@ -65,6 +66,32 @@ class NoticeClient(DomainClient):
         writer.write_bytes(body)
         await self.connection.send(MSG_NOTICE_PUBLISH, writer.build())
 
+    async def publish_with_ack(self, route: str, body: BytesLike) -> None:
+        """Publish a notice and wait for the broker's correlated acknowledgement."""
+        if not is_exact_route_shape(route, "notice", 3):
+            raise NoticeError(f"Invalid notice route: {route}", "INVALID_ROUTE")
+        body = bytes(body)
+        writer = BufferWriter()
+        writer.write_route(route)
+        writer.write_u32_be(len(body))
+        writer.write_bytes(body)
+        response = parse_response(
+            await self.request_frame_with_flags(
+                MSG_NOTICE_PUBLISH, writer.build(), flags=ACK_REQUESTED
+            )
+        )
+        if not response.success:
+            raise domain_error(
+                NoticeError,
+                "PUBLISH",
+                response.error_code or 0,
+                response.error,
+                response.error_class,
+                response.effect,
+            )
+        if response.data:
+            raise NoticeError("PUBLISH response has trailing bytes", "INVALID_RESPONSE")
+
     def subscribe(self, pattern: str) -> LazyAsyncIterator[Notice]:
         if not is_selector_route_shape(pattern, "notice", 3, allow_realm_wildcard=True):
             raise NoticeError(f"Invalid notice pattern: {pattern}", "INVALID_ROUTE")
@@ -102,6 +129,8 @@ class NoticeClient(DomainClient):
                                 "UNSUBSCRIBE",
                                 response.error_code or 0,
                                 response.error,
+                                response.error_class,
+                                response.effect,
                             )
                         if response.data:
                             raise NoticeError(
@@ -134,7 +163,14 @@ class NoticeClient(DomainClient):
         writer.write_route(pattern)
         response = parse_response(await self.request_frame(MSG_NOTICE_SUBSCRIBE, writer.build()))
         if not response.success:
-            raise domain_error(NoticeError, "SUBSCRIBE", response.error_code or 0, response.error)
+            raise domain_error(
+                NoticeError,
+                "SUBSCRIBE",
+                response.error_code or 0,
+                response.error,
+                response.error_class,
+                response.effect,
+            )
         reader = BufferReader(response.data)
         if reader.read_u8() != 1:
             raise NoticeError("SUBSCRIBE response omitted its id", "INVALID_RESPONSE")
@@ -153,6 +189,8 @@ class NoticeClient(DomainClient):
                     "UNSUBSCRIBE_ALL",
                     response.error_code or 0,
                     response.error,
+                    response.error_class,
+                    response.effect,
                 )
             if response.data:
                 raise NoticeError("UNSUBSCRIBE_ALL response has trailing bytes", "INVALID_RESPONSE")

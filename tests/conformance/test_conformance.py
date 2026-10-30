@@ -1,7 +1,7 @@
 """
 Fitz conformance harness — Python / fitz-py
 
-Covers the canonical 17 scenarios, CS-001 through CS-017.
+Runs the implemented shared scenarios and reports remaining canonical cases as missing.
 
 Configuration via environment variables:
   CONFORMANCE_TRANSPORT   "ws" (default) | "tcp"
@@ -39,10 +39,15 @@ from fitz_py import (
     KVError,
     RequestQueueFullError,
     RPCError,
+    ScheduleError,
     StreamFilterClause,
     StreamFilterSet,
+    is_retryable,
 )
 from tests.integration.fixture.jwt import make_expired_jwt, make_valid_jwt
+from tests.integration.test_stream_boundaries import (
+    test_event_size_boundary_and_long_route_replay as _exercise_stream_boundary,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -146,23 +151,21 @@ def _record(r: ScenarioResult) -> None:
     _results.append(r)
 
 
-def _write_results() -> None:
-    required_ids = {f"CS-{number:03d}" for number in range(1, 18)}
-    recorded_ids = {result.scenario_id for result in _results}
-    missing_ids = sorted(required_ids - recorded_ids)
-    p0 = [r for r in _results if r.priority == "P0"]
-    p1 = [r for r in _results if r.priority == "P1"]
+def _write_results() -> str:
+    required_ids = {f"CS-{number:03d}" for number in range(1, 25)}
+    p0_ids = {f"CS-{number:03d}" for number in (*range(1, 9), 19, 20, 24)}
+    p1_ids = required_ids - p0_ids
+    by_id = {result.scenario_id: result for result in _results}
+    missing_ids = sorted(required_ids - by_id.keys())
 
-    def rate(arr: list[ScenarioResult]) -> float:
-        if not arr:
-            return 1.0
-        return sum(1 for r in arr if r.verdict == "pass") / len(arr)
+    def passed(ids: set[str]) -> int:
+        return sum(1 for item in ids if item in by_id and by_id[item].verdict == "pass")
 
-    p0_rate = rate(p0)
-    p1_rate = rate(p1)
-    any_p0_fail = any(r.verdict != "pass" for r in p0)
-    any_p1_warn = any(r.verdict in ("fail", "partial") for r in p1)
-    overall = "fail" if missing_ids or any_p0_fail else ("partial" if any_p1_warn else "pass")
+    p0_pass = passed(p0_ids)
+    p1_pass = passed(p1_ids)
+    p0_rate = p0_pass / len(p0_ids)
+    p1_rate = p1_pass / len(p1_ids)
+    overall = "fail" if p0_rate < 1 else ("partial" if p1_rate < 1 else "pass")
 
     aggregate = {
         "suite": "fitz-cross-language-client-conformance",
@@ -171,6 +174,10 @@ def _write_results() -> None:
         "client": CLIENT_NAME,
         "transport": CONFORMANCE_TRANSPORT,
         "auth_mode": CONFORMANCE_AUTH_MODE,
+        "p0_pass": p0_pass,
+        "p0_total": len(p0_ids),
+        "p1_pass": p1_pass,
+        "p1_total": len(p1_ids),
         "p0_pass_rate": p0_rate,
         "p1_pass_rate": p1_rate,
         "overall_status": overall,
@@ -183,6 +190,7 @@ def _write_results() -> None:
     output_path.write_text(json.dumps(aggregate, indent=2), encoding="utf-8")
     print(f"\nConformance results written to: {output_path}")
     print(f"Status: {overall.upper()}  P0: {p0_rate:.0%}  P1: {p1_rate:.0%}")
+    return overall
 
 
 # ---------------------------------------------------------------------------
@@ -370,7 +378,8 @@ async def test_cs004_unknown_route() -> None:
         except Exception as exc:
             caught = exc
 
-        assert caught is not None, "expected error for unregistered route"
+        assert isinstance(caught, RPCError), type(caught).__name__
+        assert caught.domain_code == 6051
         evidence.append(f"rpc to unregistered route raised {type(caught).__name__}")
 
         # Client must remain usable
@@ -398,7 +407,7 @@ async def test_cs004_unknown_route() -> None:
 
 
 # ---------------------------------------------------------------------------
-# CS-005 — invalid payload (duplicate insert)
+# CS-005 — invalid payload
 # ---------------------------------------------------------------------------
 
 
@@ -407,31 +416,18 @@ async def test_cs005_invalid_payload() -> None:
     evidence: list[str] = []
     client = await _new_client()
     try:
-        route = _unique_route("kv")
-        tx1 = await client.kv.begin(route)
-        await tx1.insert(b"dup-key", b"first")
-        await tx1.commit("sync")
-        evidence.append("first insert succeeded")
-
-        tx2 = await client.kv.begin(route)
-        caught: Exception | None = None
-        try:
-            await tx2.insert(b"dup-key", b"second")
-        except Exception as exc:
-            caught = exc
-        finally:
-            try:
-                await tx2.rollback()
-            except Exception:
-                pass
-
-        assert caught is not None, "expected error on duplicate insert"
-        evidence.append(f"duplicate insert raised {type(caught).__name__}: {caught}")
-
-        rtx = await client.kv.begin(route, mode="read_only")
-        result = await rtx.get(b"dup-key")
-        assert result is not None
-        evidence.append("client remains usable after server-rejected operation")
+        with pytest.raises(ScheduleError):
+            await client.schedule.create(
+                _unique_route("schedule"),
+                "not a cron",
+                delivery_mode="broadcast",
+                payload=b"payload",
+            )
+        evidence.append("invalid cron produced a Schedule domain error")
+        tx = await client.kv.begin(_unique_route("kv"))
+        await tx.put(b"after-invalid", b"ok")
+        await tx.commit("sync")
+        evidence.append("client remains usable after the rejected operation")
     finally:
         await client.aclose()
 
@@ -470,7 +466,9 @@ async def test_cs006_server_error_mapping() -> None:
             rpc_err = exc
 
         assert isinstance(rpc_err, RPCError), type(rpc_err).__name__
-        assert rpc_err.domain_code is not None
+        assert rpc_err.domain_code == 6051
+        assert rpc_err.effect == 0
+        assert is_retryable(rpc_err)
         evidence.append(f"rpc error type: {type(rpc_err).__name__}")
         evidence.append(f"error.code = {rpc_err.code}")
 
@@ -494,6 +492,7 @@ async def test_cs006_server_error_mapping() -> None:
 
         assert isinstance(kv_err, KVError), type(kv_err).__name__
         assert kv_err.domain_code is not None
+        assert not is_retryable(kv_err)
         evidence.append(f"kv conflict error type: {type(kv_err).__name__}")
         evidence.append(f"kv error code: {kv_err.domain_code}")
     finally:
@@ -588,10 +587,12 @@ async def test_cs008_caller_cancellation() -> None:
     worker_client = await _new_client()
     caller_client = await _new_client()
     handler_finished = asyncio.Event()
+    handler_started = asyncio.Event()
     try:
         route = _unique_route("rpc")
 
         async def _slow_handler(req, writer) -> None:
+            handler_started.set()
             try:
                 await asyncio.sleep(3.0)
                 await writer.send(b"late", end=True)
@@ -606,7 +607,7 @@ async def test_cs008_caller_cancellation() -> None:
                 pass
 
         task = asyncio.create_task(_do_call())
-        await asyncio.sleep(0.1)
+        await asyncio.wait_for(handler_started.wait(), timeout=2.0)
         task.cancel()
 
         caught: BaseException | None = None
@@ -719,12 +720,15 @@ async def test_cs009_disconnect_during_request() -> None:
         CLIENT_NAME,
         CONFORMANCE_TRANSPORT,
         CONFORMANCE_AUTH_MODE,
-        "pass",
-        evidence,
+        "partial",
+        [
+            *evidence,
+            "explicit client close does not exercise unexpected transport loss or reconnect",
+        ],
         0,
     )
     _record(r)
-    assert r.verdict == "pass"
+    assert r.verdict == "partial"
 
 
 # ---------------------------------------------------------------------------
@@ -764,12 +768,12 @@ async def test_cs010_reconnect_behavior() -> None:
         CLIENT_NAME,
         CONFORMANCE_TRANSPORT,
         CONFORMANCE_AUTH_MODE,
-        "pass",
-        evidence,
+        "partial",
+        [*evidence, "subscription and worker restoration and stale handles were not checked"],
         0,
     )
     _record(r)
-    assert r.verdict == "pass"
+    assert r.verdict == "partial"
 
 
 # ---------------------------------------------------------------------------
@@ -790,13 +794,11 @@ async def test_cs011_stream_receive_sequence() -> None:
         evidence.append("stream session appended 3 records")
 
         records = await client.stream.read(route, start_offset=0, limit=10)
-        assert len(records) >= 3, f"expected >=3 stream records, got {len(records)}"
+        assert len(records) == 3, f"expected 3 stream records, got {len(records)}"
         evidence.append(f"read {len(records)} records after commit")
 
-        for i in range(1, len(records)):
-            assert records[i].offset > records[i - 1].offset, (
-                f"out-of-order offsets at {i}: {records[i].offset} <= {records[i - 1].offset}"
-            )
+        for i, record in enumerate(records):
+            assert record.offset == i, f"expected offset {i}, got {record.offset}"
 
         if records:
             evidence.append(f"first offset: {records[0].offset}, last: {records[-1].offset}")
@@ -914,12 +916,12 @@ async def test_cs013_stream_error_mid_flight() -> None:
         CLIENT_NAME,
         CONFORMANCE_TRANSPORT,
         CONFORMANCE_AUTH_MODE,
-        "pass",
-        evidence,
+        "partial",
+        [*evidence, "an error during an active streaming read was not exercised"],
         0,
     )
     _record(r)
-    assert r.verdict == "pass"
+    assert r.verdict == "partial"
 
 
 # ---------------------------------------------------------------------------
@@ -962,12 +964,12 @@ async def test_cs014_concurrent_requests() -> None:
         CLIENT_NAME,
         CONFORMANCE_TRANSPORT,
         CONFORMANCE_AUTH_MODE,
-        "pass",
-        evidence,
+        "partial",
+        [*evidence, "cross-domain concurrency and within-domain ordering were not exercised"],
         0,
     )
     _record(r)
-    assert r.verdict == "pass"
+    assert r.verdict == "partial"
 
 
 # ---------------------------------------------------------------------------
@@ -1024,20 +1026,89 @@ async def test_cs015_shutdown_during_active_work() -> None:
 async def test_cs019_same_type_requests_are_correlated_out_of_order() -> None:
     client = await _new_client(timeout_ms=10000)
     assert client.correlation_enabled
-    assert client.protocol_version == 1
-    assert client.capabilities & 1 == 1
+    assert client.protocol_version == 2
+    assert client.capabilities == 0
     parked_route = _unique_route("queue")
     ready_route = _unique_route("queue")
     await client.queue.enqueue(ready_route, b"second")
 
     parked = asyncio.create_task(client.queue.reserve(parked_route, lease=30, wait=5))
     await asyncio.sleep(0.1)
+    assert not parked.done(), "first reserve must remain parked on its empty queue"
     second = await asyncio.wait_for(client.queue.reserve(ready_route, lease=30, wait=0), timeout=2)
     assert second[0].body == b"second"
+    assert not parked.done(), "second reserve must resolve before the parked first reserve"
     await client.queue.enqueue(parked_route, b"first")
     first = await asyncio.wait_for(parked, timeout=5)
     assert first[0].body == b"first"
     await client.aclose()
+    _record(
+        ScenarioResult(
+            "CS-019",
+            "concurrent same-message-type requests",
+            "P0",
+            CLIENT_NAME,
+            CONFORMANCE_TRANSPORT,
+            CONFORMANCE_AUTH_MODE,
+            "pass",
+            ["second reserve resolved first with its own payload", "parked reserve returned first"],
+            0,
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_cs020_handshake_negotiation() -> None:
+    started = time.monotonic()
+    client = await _new_client()
+    try:
+        assert client.protocol_version == 2
+        assert client.capabilities == 0
+        assert client.max_message_bytes > 0
+        assert client.max_in_flight > 0
+        evidence = [
+            f"protocol_version={client.protocol_version}",
+            f"broker_caps={client.capabilities}",
+            f"max_message_bytes={client.max_message_bytes}",
+            f"max_in_flight={client.max_in_flight}",
+        ]
+    finally:
+        await client.aclose()
+
+    _record(
+        ScenarioResult(
+            "CS-020",
+            "handshake negotiation",
+            "P0",
+            CLIENT_NAME,
+            CONFORMANCE_TRANSPORT,
+            CONFORMANCE_AUTH_MODE,
+            "pass",
+            evidence,
+            round((time.monotonic() - started) * 1000),
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_cs024_stream_event_boundary_and_replay() -> None:
+    await _exercise_stream_boundary(CONFORMANCE_TRANSPORT, CONFORMANCE_AUTH_MODE)
+    _record(
+        ScenarioResult(
+            "CS-024",
+            "400 KiB Stream event boundary and replay",
+            "P0",
+            CLIENT_NAME,
+            CONFORMANCE_TRANSPORT,
+            CONFORMANCE_AUTH_MODE,
+            "pass",
+            [
+                "409600 combined bytes accepted; 409601 rejected with BAD_REQUEST/NOT_APPLIED",
+                "three complete events replayed on a 4096-byte route across multiple pages",
+            ],
+            0,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1088,13 +1159,81 @@ async def test_cs016_filtered_stream_replay() -> None:
     assert result.verdict == "pass"
 
 
-# CS-017 - bounded concurrency under burst load
+# CS-017 - global filtered multi-page replay
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_cs017_bounded_concurrency_under_burst_load() -> None:
+async def test_cs017_global_filtered_multi_page_replay() -> None:
     evidence: list[str] = []
+    client = await _new_client()
+    try:
+        first_route = _unique_route("stream")
+        second_route = first_route.replace("stream://conformance-realm/", "stream://other-realm/")
+        discriminator = f"match-{first_route}"
+        stream_filter = StreamFilterSet(
+            clauses=[StreamFilterClause(kind="Equals", value=discriminator)]
+        )
+        initial = await client.stream.read_page("stream://**", 0, limit=1)
+        assert initial.cursor.captured_watermark is not None
+        next_offset = initial.cursor.captured_watermark
+
+        for route in (first_route, second_route):
+            session = await client.stream.begin(route)
+            await session.append(0, b"skip", discriminator="skip")
+            await session.append(1, b"keep", discriminator=discriminator)
+            await session.commit("sync")
+
+        pages = []
+        fingerprint = None
+        watermark = None
+        while True:
+            page = await client.stream.read_page(
+                "stream://**",
+                next_offset,
+                limit=1,
+                stream_filter=stream_filter,
+                cursor_fingerprint=fingerprint,
+                captured_watermark=watermark,
+            )
+            pages.append(page)
+            if not page.cursor.has_more:
+                break
+            assert page.cursor.last_global_offset is not None
+            assert page.cursor.last_global_offset >= next_offset
+            next_offset = page.cursor.last_global_offset + 1
+            fingerprint = page.cursor.cursor_fingerprint
+            watermark = page.cursor.captured_watermark
+
+        assert len(pages) > 1
+        assert any(page.items and all(item.record is None for item in page.items) for page in pages)
+        records = [item.record for page in pages for item in page.items if item.record is not None]
+        assert [record.route for record in records] == [first_route, second_route]
+        offsets = [record.global_offset for record in records]
+        assert offsets[0] is not None and offsets[1] is not None and offsets[0] < offsets[1]
+        assert not pages[-1].cursor.has_more
+        evidence.append(f"global filtered replay yielded {len(pages)} pages across two realms")
+        evidence.append("filtered-only pages advanced the global cursor through the captured tail")
+    finally:
+        await client.aclose()
+
+    result = ScenarioResult(
+        "CS-017",
+        "global filtered multi-page replay",
+        "P1",
+        CLIENT_NAME,
+        CONFORMANCE_TRANSPORT,
+        CONFORMANCE_AUTH_MODE,
+        "pass",
+        evidence,
+        0,
+    )
+    _record(result)
+    assert result.verdict == "pass"
+
+
+@pytest.mark.asyncio
+async def test_bounded_concurrency_burst_smoke() -> None:
     client = await _new_client(max_in_flight_requests=1, request_queue_size=1)
     try:
         tasks = [asyncio.create_task(client.kv.begin(_unique_route("kv"))) for _ in range(32)]
@@ -1110,23 +1249,8 @@ async def test_cs017_bounded_concurrency_under_burst_load() -> None:
         for transaction in results:
             if not isinstance(transaction, BaseException):
                 await transaction.rollback()
-        evidence.append(f"{len(saturated)} live client requests failed explicitly at capacity")
     finally:
         await client.aclose()
-
-    r = ScenarioResult(
-        "CS-017",
-        "bounded concurrency under burst load",
-        "P1",
-        CLIENT_NAME,
-        CONFORMANCE_TRANSPORT,
-        CONFORMANCE_AUTH_MODE,
-        "pass",
-        evidence,
-        0,
-    )
-    _record(r)
-    assert r.verdict == "pass"
 
 
 # ---------------------------------------------------------------------------

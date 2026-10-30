@@ -16,17 +16,22 @@ from fitz_py.errors import (
     FitzConnectionError,
     FitzTimeoutError,
     FitzTransportError,
+    ProtocolError,
     ReconnectRestoreError,
     is_retryable,
 )
 from fitz_py.multiplexer import Multiplexer
-from fitz_py.protocol.frame import FrameCodec, FrameParser
+from fitz_py.protocol.buffer import BufferReader, BufferWriter
+from fitz_py.protocol.frame import RESPONSE_FINAL, FrameCodec, FrameParser
 from fitz_py.protocol.messages import (
-    CAP_SESSION_METADATA,
     MSG_CONNECT,
-    MSG_CORRELATED,
-    MSG_SERVER_HELLO,
-    MSG_SESSION_METADATA,
+    MSG_CONNECT_REJECTED,
+    MSG_GOAWAY,
+    MSG_HELLO,
+    MSG_RPC_CANCELLATION,
+    MSG_RPC_LIFECYCLE,
+    MSG_RPC_RESPONSE,
+    MSG_RPC_SUBSCRIBE_WORKER,
 )
 from fitz_py.transport.base import Transport
 from fitz_py.types import ClientConfig, ConnectionState, LifecycleEvent
@@ -36,6 +41,16 @@ ReconnectListener = Callable[[], Awaitable[None] | None]
 DisconnectListener = Callable[[], Awaitable[None] | None]
 CloseListener = Callable[[], Awaitable[None] | None]
 T = TypeVar("T")
+
+
+def _one_way_needs_correlation(message_type: int, payload: bytes) -> bool:
+    if not MSG_RPC_SUBSCRIBE_WORKER <= message_type <= MSG_RPC_LIFECYCLE:
+        return False
+    if message_type in (MSG_RPC_RESPONSE, MSG_RPC_LIFECYCLE):
+        return False
+    if message_type == MSG_RPC_CANCELLATION:
+        return payload[:1] == b"\x01"
+    return True
 
 
 class Connection:
@@ -56,11 +71,14 @@ class Connection:
         self._connect_lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
         self._closed = False
-        self._service_name_sent = False
         self._ever_authenticated = False
         self._restoring = False
         self._last_activity = time.monotonic()
         self._auth_error: asyncio.Future[None] | None = None
+        self._max_message_bytes = min(config.max_frame_size, 1_048_576)
+        self._max_in_flight = config.limits.max_in_flight
+        self._session_id = 0
+        self._goaway: tuple[int, float, str] | None = None
         self._reconnect_listeners: dict[tuple[str, str], ReconnectListener] = {}
         self._disconnect_listeners: set[DisconnectListener] = set()
         self._close_listeners: set[CloseListener] = set()
@@ -93,6 +111,22 @@ class Connection:
     @property
     def correlation_enabled(self) -> bool:
         return self._multiplexer.correlation_enabled
+
+    @property
+    def max_message_bytes(self) -> int:
+        return self._max_message_bytes
+
+    @property
+    def max_in_flight(self) -> int:
+        return self._max_in_flight
+
+    @property
+    def session_id(self) -> int:
+        return self._session_id
+
+    @property
+    def goaway(self) -> tuple[int, float, str] | None:
+        return self._goaway
 
     async def connect(self) -> None:
         if self._closed:
@@ -152,12 +186,12 @@ class Connection:
             await asyncio.gather(*owned_tasks, return_exceptions=True)
         await self._dispatcher.close()
 
-    async def request(self, message_type: int, payload: bytes) -> bytes:
+    async def request(self, message_type: int, payload: bytes, *, flags: int = 0) -> bytes:
         self._ensure_authenticated()
         release = await self._gate.acquire()
         started = time.monotonic()
         try:
-            return await self._request_without_gate(message_type, payload)
+            return await self._request_without_gate(message_type, payload, flags=flags)
         finally:
             release()
             self._record_latency(message_type, started)
@@ -167,7 +201,14 @@ class Connection:
         release = await self._gate.acquire()
         try:
             try:
-                await self._send_frame(FrameCodec.encode_frame(message_type, payload))
+                correlation_id = (
+                    self._multiplexer.next_correlation_id()
+                    if _one_way_needs_correlation(message_type, payload)
+                    else 0
+                )
+                await self._send_frame(
+                    FrameCodec.encode_frame(message_type, payload, correlation_id=correlation_id)
+                )
             except (FitzTransportError, FitzConnectionError, FitzTimeoutError) as exc:
                 self._schedule_connection_loss(exc)
                 raise
@@ -177,9 +218,11 @@ class Connection:
     async def send_fire_and_forget(self, message_type: int, payload: bytes) -> None:
         await self.send(message_type, payload)
 
-    async def request_without_admission(self, message_type: int, payload: bytes) -> bytes:
+    async def request_without_admission(
+        self, message_type: int, payload: bytes, *, flags: int = 0
+    ) -> bytes:
         self._ensure_authenticated()
-        return await self._request_without_gate(message_type, payload)
+        return await self._request_without_gate(message_type, payload, flags=flags)
 
     async def reserve_admission(self) -> Callable[[], None]:
         self._ensure_authenticated()
@@ -279,7 +322,6 @@ class Connection:
     async def _open_and_authenticate(self, reconnect: bool) -> None:
         if self._closed:
             raise FitzConnectionError("Client is closed")
-        self._service_name_sent = False
         parser = FrameParser()
         self._parser = parser
         self._gate = self._new_gate()
@@ -343,14 +385,23 @@ class Connection:
             token = await provided
         else:
             token = provided
-        payload = token.encode() if isinstance(token, str) else bytes(token)
-        await self._send_frame(FrameCodec.encode_frame(MSG_CONNECT, payload))
+        token_bytes = token.encode() if isinstance(token, str) else bytes(token)
+        writer = BufferWriter()
+        writer.write_u16_be(2)
+        writer.write_u16_be(2)
+        writer.write_u32_be(0)
+        writer.write_string(token_bytes.decode("utf-8"))
+        writer.write_string((self._config.service_name or "").strip())
+        writer.write_string("fitz-py/0.2.0")
+        await self._send_frame(FrameCodec.encode_frame(MSG_CONNECT, writer.build()))
 
-    async def _request_without_gate(self, message_type: int, payload: bytes) -> bytes:
-        frame = FrameCodec.encode_frame(message_type, payload)
+    async def _request_without_gate(
+        self, message_type: int, payload: bytes, *, flags: int = 0
+    ) -> bytes:
+        frame = FrameCodec.encode_frame(message_type, payload, flags=flags)
         try:
             return await self._multiplexer.request(
-                message_type, frame, self._send_frame, self._config.request_timeout
+                message_type, frame, self._send_frame, self._config.request_timeout, flags
             )
         except (FitzTransportError, FitzConnectionError, FitzTimeoutError) as exc:
             self._schedule_connection_loss(exc)
@@ -360,6 +411,11 @@ class Connection:
         transport = self._transport
         if transport is None:
             raise FitzConnectionError("No active transport")
+        if len(frame) > self._max_message_bytes:
+            raise FitzTransportError(
+                f"Fitz message length {len(frame)} exceeds max message size "
+                f"{self._max_message_bytes}"
+            )
         async with self._write_lock:
             await transport.send(frame)
             self._last_activity = time.monotonic()
@@ -377,52 +433,75 @@ class Connection:
         except BaseException as exc:  # noqa: BLE001
             if self._state is ConnectionState.AUTHENTICATING and self._auth_error is not None:
                 if not self._auth_error.done():
-                    self._auth_error.set_exception(AuthenticationError(str(exc) or "auth rejected"))
+                    self._auth_error.set_exception(exc)
                 return
             if not self._closed and self._transport is transport:
                 await self._connection_lost(exc)
 
     async def _dispatch_transport_frame(self, data: bytes, parser: FrameParser) -> None:
-        pending_correlation: int | None = None
-        for frame in parser.parse_frames(data):
-            if frame.message_type == MSG_SERVER_HELLO:
-                if pending_correlation is not None:
-                    raise FitzConnectionError("CORRELATED record cannot label SERVER_HELLO")
-                if len(frame.payload) >= 6:
-                    self._multiplexer.set_capabilities(
-                        int.from_bytes(frame.payload[:2], "big"),
-                        int.from_bytes(frame.payload[2:6], "big"),
-                    )
-                    if self._auth_error is not None and not self._auth_error.done():
-                        self._auth_error.set_result(None)
-                    if (
-                        self._config.service_name is not None
-                        and self._multiplexer.capabilities & CAP_SESSION_METADATA
-                        and not self._service_name_sent
-                    ):
-                        encoded = self._config.service_name.strip().encode("utf-8")
-                        payload = len(encoded).to_bytes(4, "big") + encoded
-                        await self._send_frame(
-                            FrameCodec.encode_frame(MSG_SESSION_METADATA, payload)
-                        )
-                        self._service_name_sent = True
-                continue
-            if frame.message_type == MSG_CORRELATED:
-                if len(frame.payload) != 8 or pending_correlation is not None:
-                    raise FitzConnectionError("Malformed CORRELATED record")
-                pending_correlation = int.from_bytes(frame.payload, "big")
-                if pending_correlation == 0:
-                    raise FitzConnectionError("Zero CORRELATED identifier")
-                continue
-            if pending_correlation is None:
-                self._multiplexer.dispatch(frame.message_type, frame.payload)
-            else:
-                self._multiplexer.dispatch_correlated(
-                    pending_correlation, frame.message_type, frame.payload
-                )
-                pending_correlation = None
-        if pending_correlation is not None:
-            raise FitzConnectionError("CORRELATED record did not label a response")
+        if len(data) > self._max_message_bytes:
+            raise FitzConnectionError(
+                f"Fitz message length {len(data)} exceeds max message size "
+                f"{self._max_message_bytes}"
+            )
+        frames = parser.parse_frames(data)
+        if not frames:
+            return
+        frame = frames[0]
+        if frame.message_type == MSG_HELLO:
+            if frame.flags != 0 or frame.correlation_id != 0 or len(frame.payload) < 22:
+                raise FitzConnectionError("Malformed HELLO message")
+            reader = BufferReader(frame.payload)
+            version = reader.read_u16_be()
+            capabilities = reader.read_u32_be()
+            server_max_message_bytes = reader.read_u32_be()
+            server_max_in_flight = reader.read_u32_be()
+            self._session_id = reader.read_u64_be()
+            if version != 2 or server_max_message_bytes < 15 or server_max_in_flight < 1:
+                raise FitzConnectionError("Broker advertised invalid Wire-2 limits")
+            self._max_message_bytes = min(
+                server_max_message_bytes, self._config.max_frame_size, 1_048_576
+            )
+            self._max_in_flight = min(server_max_in_flight, self._config.limits.max_in_flight)
+            transport = self._transport
+            if transport is not None:
+                transport.set_max_frame_size(self._max_message_bytes)
+            self._multiplexer.set_capabilities(version, capabilities)
+            self._gate = RequestGate(self._max_in_flight, self._config.limits.request_queue_size)
+            if self._auth_error is not None and not self._auth_error.done():
+                self._auth_error.set_result(None)
+            return
+        if frame.message_type == MSG_CONNECT_REJECTED:
+            reader = BufferReader(frame.payload)
+            code = reader.read_u16_be()
+            message = reader.read_string()
+            if not reader.is_eof() or frame.flags != 0 or frame.correlation_id != 0:
+                raise FitzConnectionError("Malformed CONNECT_REJECTED message")
+            if code == 50:
+                raise ProtocolError(f"wire version mismatch: {message}", domain_code=code)
+            raise AuthenticationError(message or "authentication rejected", {"code": code})
+        if frame.message_type == MSG_GOAWAY:
+            reader = BufferReader(frame.payload)
+            code = reader.read_u16_be()
+            grace_ms = reader.read_u32_be()
+            reason = reader.read_string()
+            if not reader.is_eof() or frame.flags != 0 or frame.correlation_id != 0:
+                raise FitzConnectionError("Malformed GOAWAY message")
+            self._goaway = (code, grace_ms / 1000, reason)
+            callback = self._config.on_goaway
+            if callback is not None:
+                with contextlib.suppress(Exception):
+                    callback(code, grace_ms / 1000, reason)
+            return
+        if frame.correlation_id == 0:
+            self._multiplexer.dispatch(frame.message_type, frame.payload)
+        else:
+            self._multiplexer.dispatch_correlated(
+                frame.correlation_id,
+                frame.message_type,
+                frame.payload,
+                bool(frame.flags & RESPONSE_FINAL),
+            )
 
     async def _connection_lost(self, cause: BaseException) -> None:
         if self._state in {
@@ -471,6 +550,10 @@ class Connection:
                 return
             except BaseException as exc:  # noqa: BLE001
                 self._emit("reconnect_failed", attempt=attempt, error=exc)
+                if isinstance(exc, ProtocolError) and exc.domain_code == 50:
+                    self._set_state(ConnectionState.DISCONNECTED, "reconnect_exhausted")
+                    await self._notify_close()
+                    return
                 delay = min(delay * 2, policy.max_backoff)
         if not self._closed:
             self._set_state(ConnectionState.DISCONNECTED, "reconnect_exhausted")

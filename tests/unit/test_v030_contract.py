@@ -11,6 +11,7 @@ from fitz_py.domains.queue import _duration as queue_duration
 from fitz_py.domains.rpc import ResponseFrame, ResponseWriter, RPCCall
 from fitz_py.errors import FitzConnectionError
 from fitz_py.multiplexer import Multiplexer
+from fitz_py.protocol.frame import FrameCodec
 from fitz_py.types import ClientConfig
 
 
@@ -220,24 +221,31 @@ async def test_rpc_response_sequence_advances_only_after_write() -> None:
 
 
 @pytest.mark.asyncio
-async def test_multiplexer_cancellation_during_send_keeps_tombstone() -> None:
+async def test_multiplexer_cancellation_during_send_isolates_late_reply() -> None:
     mux = Multiplexer()
+    mux.set_capabilities(2, 0)
+    mux.set_connected()
+    sent: list[bytes] = []
     entered = asyncio.Event()
     transmitted = asyncio.Event()
 
-    async def send(_frame: bytes) -> None:
+    async def send(frame: bytes) -> None:
+        sent.append(frame)
         entered.set()
         await transmitted.wait()
 
-    cancelled = asyncio.create_task(mux.request(9, b"first", send, 1))
+    cancelled = asyncio.create_task(mux.request(9, FrameCodec.encode_frame(9, b"first"), send, 1))
     await entered.wait()
     cancelled.cancel()
     transmitted.set()
     with pytest.raises(asyncio.CancelledError):
         await cancelled
 
-    current = asyncio.create_task(mux.request(9, b"second", send, 1))
+    current = asyncio.create_task(mux.request(9, FrameCodec.encode_frame(9, b"second"), send, 1))
     await asyncio.sleep(0)
-    mux.dispatch(9, b"late")
-    mux.dispatch(9, b"current")
+    await asyncio.sleep(0)
+    first_id, second_id = [FrameCodec.decode_frame(frame).correlation_id for frame in sent]
+    mux.dispatch_correlated(first_id, 9, b"late")
+    assert not current.done()
+    mux.dispatch_correlated(second_id, 9, b"current")
     assert await current == b"current"

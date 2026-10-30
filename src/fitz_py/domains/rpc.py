@@ -22,7 +22,6 @@ from fitz_py.errors import (
 )
 from fitz_py.protocol.buffer import BufferReader, BufferWriter
 from fitz_py.protocol.messages import (
-    CAP_RPC_CANCELLATION,
     MSG_RPC_CANCELLATION,
     MSG_RPC_LIFECYCLE,
     MSG_RPC_REQUEST,
@@ -33,7 +32,6 @@ from fitz_py.protocol.messages import (
 from fitz_py.protocol.response import parse_response
 from fitz_py.types import BytesLike
 
-_RPC_EXTENSION_VERSION = 1
 _RPC_CANCELLATION_GRACE_SECONDS = 5.0
 _MAX_RPC_BUDGET_MS = 86_400_000
 RpcCancellationOutcome = Literal[
@@ -410,7 +408,8 @@ class RPCClient(DomainClient):
         writer.write_route(route)
         writer.write_u32_be(len(body))
         writer.write_bytes(body)
-        if self.connection.capabilities & CAP_RPC_CANCELLATION and deadline is not None:
+        remaining_ms: int | None = None
+        if deadline is not None:
             loop = asyncio.get_running_loop()
             remaining_ms = max(
                 0,
@@ -419,7 +418,7 @@ class RPCClient(DomainClient):
                     int((deadline - loop.time()) * 1000),
                 ),
             )
-            _write_request_budget(writer, remaining_ms)
+        _write_request_budget(writer, remaining_ms)
         try:
             await self.connection.send(MSG_RPC_REQUEST, writer.build())
         except BaseException:
@@ -460,14 +459,19 @@ class RPCClient(DomainClient):
         writer = BufferWriter()
         writer.write_route(route)
         writer.write_u32_be(registration.max_concurrency)
-        if self.connection.capabilities & CAP_RPC_CANCELLATION:
-            writer.write_u8(_RPC_EXTENSION_VERSION)
-            writer.write_u8(1)
+        writer.write_u8(1)
         response = parse_response(
             await self.request_frame(MSG_RPC_SUBSCRIBE_WORKER, writer.build())
         )
         if not response.success:
-            raise domain_error(RPCError, "SUBSCRIBE", response.error_code or 0, response.error)
+            raise domain_error(
+                RPCError,
+                "SUBSCRIBE",
+                response.error_code or 0,
+                response.error,
+                response.error_class,
+                response.effect,
+            )
         _expect_empty_rpc_success(response.data, "SUBSCRIBE")
 
     async def _unregister(self, route: str, identity: object) -> None:
@@ -482,7 +486,12 @@ class RPCClient(DomainClient):
             )
             if not response.success:
                 raise domain_error(
-                    RPCError, "UNSUBSCRIBE", response.error_code or 0, response.error
+                    RPCError,
+                    "UNSUBSCRIBE",
+                    response.error_code or 0,
+                    response.error,
+                    response.error_class,
+                    response.effect,
                 )
             _expect_empty_rpc_success(response.data, "UNSUBSCRIBE")
             if self._workers.get(route) is registration:
@@ -544,9 +553,6 @@ class RPCClient(DomainClient):
             self._pending.pop(correlation_id, None)
         if call._cancellation.done():  # noqa: SLF001
             return
-        if not self.connection.capabilities & CAP_RPC_CANCELLATION:
-            self._resolve_call_outcome(call, "unsupported")
-            return
         if call._key in self._pending_cancellations:  # noqa: SLF001
             return
         loop = asyncio.get_running_loop()
@@ -602,8 +608,6 @@ class RPCClient(DomainClient):
 
     async def _acknowledge_invocation(self, invocation: _ActiveInvocation) -> None:
         self._forget_invocation(invocation)
-        if not self.connection.capabilities & CAP_RPC_CANCELLATION:
-            return
         with contextlib.suppress(Exception):
             await self.connection.send(
                 MSG_RPC_CANCELLATION,
@@ -641,7 +645,7 @@ class RPCClient(DomainClient):
             lambda: self._run_worker(registration, request, active)
         ):
             self._forget_invocation(active)
-            self._schedule_terminal(response, 6003, "Worker is locally saturated", active)
+            self._schedule_terminal(response, 6005, "Worker is locally saturated", active)
 
     async def _run_worker(
         self,
@@ -660,7 +664,7 @@ class RPCClient(DomainClient):
                     active.context.cancelled.set()
                     if not active.cancellation_requested:
                         await self._send_error(
-                            active.response, 6001, "Inbound RPC request deadline elapsed"
+                            active.response, 6007, "Inbound RPC request deadline elapsed"
                         )
                     return
                 if active.context.cancelled.is_set():
@@ -672,13 +676,13 @@ class RPCClient(DomainClient):
                     if not active.response.ended:
                         with contextlib.suppress(Exception):
                             await self._send_error(
-                                active.response, 6010, "Worker handler cancelled"
+                                active.response, 6007, "Worker handler cancelled"
                             )
                     raise
                 except Exception as exc:  # noqa: BLE001
                     if active.response.ended:
                         return
-                    await self._send_error(active.response, 6010, str(exc) or type(exc).__name__)
+                    await self._send_error(active.response, 6006, str(exc) or type(exc).__name__)
         finally:
             active.finished = True
             # Cancellation may already be ordered at the broker while its
@@ -756,7 +760,9 @@ class RPCClient(DomainClient):
     async def _send_error(response: ResponseWriter, code: int, message: str) -> None:
         error = BufferWriter()
         error.write_u8(1)
-        error.write_u32_be(code)
+        error.write_u16_be(code)
+        error.write_u8(code % 1000)
+        error.write_u8(0 if code % 1000 == 5 else 1 if code % 1000 in {6, 7} else 0)
         error.write_string(message)
         await response.send(error.build(), end=True)
 
@@ -805,24 +811,27 @@ def _looks_like_request(payload: bytes) -> bool:
         return False
 
 
-def _write_request_budget(writer: BufferWriter, remaining_budget_ms: int) -> None:
+def _write_request_budget(writer: BufferWriter, remaining_budget_ms: int | None) -> None:
+    if remaining_budget_ms is None:
+        writer.write_u8(0)
+        return
     if not 0 <= remaining_budget_ms <= _MAX_RPC_BUDGET_MS:
         raise ValueError(f"remaining budget must be in 0..={_MAX_RPC_BUDGET_MS} milliseconds")
-    writer.write_u8(_RPC_EXTENSION_VERSION)
     writer.write_u8(1)
     writer.write_u32_be(remaining_budget_ms)
 
 
 def _read_request_budget(reader: BufferReader) -> int | None:
     if reader.is_eof():
+        raise RPCError("RPC request omitted its budget flag", "INVALID_RESPONSE")
+    flag = reader.read_u8()
+    if flag == 0:
+        if not reader.is_eof():
+            raise RPCError("RPC request has bytes after an empty budget", "INVALID_RESPONSE")
         return None
-    if reader.remaining_bytes() != 6:
+    if flag != 1 or reader.remaining_bytes() != 4:
         raise RPCError("RPC request has trailing or truncated extension bytes", "INVALID_RESPONSE")
-    version = reader.read_u8()
-    flags = reader.read_u8()
     remaining_budget_ms = reader.read_u32_be()
-    if version != _RPC_EXTENSION_VERSION or flags != 1:
-        raise RPCError("Unsupported RPC request extension", "INVALID_RESPONSE")
     if remaining_budget_ms > _MAX_RPC_BUDGET_MS:
         raise RPCError("RPC remaining budget exceeds one day", "INVALID_RESPONSE")
     return remaining_budget_ms
@@ -850,7 +859,7 @@ def _decode_terminal_error(body: bytes) -> RPCError | None:
     if (
         response.success
         or response.error_code is None
-        or not 6001 <= response.error_code <= 6013
+        or not (6001 <= response.error_code <= 6010 or 6050 <= response.error_code <= 6055)
         or response.data
     ):
         return None
@@ -858,6 +867,8 @@ def _decode_terminal_error(body: bytes) -> RPCError | None:
         f"CALL failed: {response.error or f'status {response.error_code}'}",
         "CALL",
         response.error_code,
+        response.error_class,
+        response.effect,
     )
 
 

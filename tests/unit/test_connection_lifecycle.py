@@ -7,12 +7,15 @@ import pytest
 from fitz_py._runtime import AsyncSubscription
 from fitz_py.connection import Connection
 from fitz_py.errors import FitzConnectionError, FitzTransportError
-from fitz_py.protocol.frame import FrameCodec
+from fitz_py.protocol.buffer import BufferReader
+from fitz_py.protocol.frame import RESPONSE_FINAL, FrameCodec
 from fitz_py.protocol.messages import (
-    CAP_SESSION_METADATA,
-    MSG_CONNECT,
+    MSG_NOTICE_PUBLISH,
+    MSG_RPC_CANCELLATION,
+    MSG_RPC_LIFECYCLE,
+    MSG_RPC_REQUEST,
+    MSG_RPC_RESPONSE,
     MSG_SERVER_HELLO,
-    MSG_SESSION_METADATA,
 )
 from fitz_py.transport.base import Transport
 from fitz_py.types import (
@@ -21,6 +24,25 @@ from fitz_py.types import (
     HeartbeatPolicy,
     ReconnectPolicy,
 )
+
+
+def hello_payload() -> bytes:
+    return (
+        (2).to_bytes(2, "big")
+        + (0).to_bytes(4, "big")
+        + (1_048_576).to_bytes(4, "big")
+        + (64).to_bytes(4, "big")
+        + (1).to_bytes(8, "big")
+    )
+
+
+def connect_service_name(frame: bytes) -> str:
+    reader = BufferReader(FrameCodec.decode_frame(frame).payload)
+    assert reader.read_u16_be() == 2
+    assert reader.read_u16_be() == 2
+    assert reader.read_u32_be() == 0
+    reader.read_string()
+    return reader.read_string()
 
 
 class FakeTransport(Transport):
@@ -36,9 +58,7 @@ class FakeTransport(Transport):
     async def connect(self) -> None:
         self.connected = True
         if self.send_hello and self.inbound.empty():
-            self.inbound.put_nowait(
-                FrameCodec.encode_frame(MSG_SERVER_HELLO, b"\x00\x01\x00\x00\x00\x00")
-            )
+            self.inbound.put_nowait(FrameCodec.encode_frame(MSG_SERVER_HELLO, hello_payload()))
 
     async def close(self) -> None:
         self.closed = True
@@ -93,7 +113,11 @@ async def test_connection_request_push_send_and_close_lifecycle() -> None:
         await asyncio.sleep(0)
     outbound = FrameCodec.decode_frame(transport.sent[-1])
     assert (outbound.message_type, outbound.payload) == (77, b"request")
-    await transport.inbound.put(FrameCodec.encode_frame(77, b"response"))
+    await transport.inbound.put(
+        FrameCodec.encode_frame(
+            77, b"response", flags=RESPONSE_FINAL, correlation_id=outbound.correlation_id
+        )
+    )
     assert await request == b"response"
 
     await connection.send(78, b"one-way")
@@ -110,25 +134,40 @@ async def test_connection_request_push_send_and_close_lifecycle() -> None:
         await connection.connect()
 
 
+@pytest.mark.parametrize(
+    ("message_type", "payload", "requires_correlation"),
+    [
+        (MSG_RPC_RESPONSE, b"response", False),
+        (MSG_RPC_CANCELLATION, b"\x03" + b"x" * 16, False),
+        (MSG_RPC_CANCELLATION, b"\x01" + b"x" * 16, True),
+        (MSG_RPC_REQUEST, b"request", True),
+        (MSG_RPC_LIFECYCLE, b"lifecycle", False),
+        (MSG_NOTICE_PUBLISH, b"publish", False),
+    ],
+)
 @pytest.mark.asyncio
-async def test_connection_reports_service_name_only_after_metadata_capability() -> None:
+async def test_one_way_send_uses_message_correlation_policy(
+    message_type: int, payload: bytes, requires_correlation: bool
+) -> None:
     transport = FakeTransport()
-    connection = Connection(
-        lambda: transport,
-        config(service_name="orders-worker"),
-    )
-
+    connection = Connection(lambda: transport, config())
     await connection.connect()
-    transport.send_event.clear()
-    hello = (1).to_bytes(2, "big") + CAP_SESSION_METADATA.to_bytes(4, "big")
-    await transport.inbound.put(FrameCodec.encode_frame(MSG_SERVER_HELLO, hello))
-    async with asyncio.timeout(1):
-        await transport.send_event.wait()
+    try:
+        await connection.send_fire_and_forget(message_type, payload)
+        frame = FrameCodec.decode_frame(transport.sent[-1])
+        assert frame.message_type == message_type
+        assert (frame.correlation_id != 0) is requires_correlation
+    finally:
+        await connection.close()
 
-    metadata = FrameCodec.decode_frame(transport.sent[1])
-    assert metadata.message_type == MSG_SESSION_METADATA
-    assert metadata.payload == b"\x00\x00\x00\x0dorders-worker"
 
+@pytest.mark.asyncio
+async def test_connection_includes_service_name_in_structured_connect() -> None:
+    transport = FakeTransport()
+    connection = Connection(lambda: transport, config(service_name="orders-worker"))
+    await connection.connect()
+    assert connect_service_name(transport.sent[0]) == "orders-worker"
+    assert len(transport.sent) == 1
     await connection.close()
 
 
@@ -136,37 +175,19 @@ async def test_connection_reports_service_name_only_after_metadata_capability() 
 async def test_connection_trims_service_name_before_utf8_limit_and_encoding() -> None:
     service_name = "é" * 64
     transport = FakeTransport()
-    connection = Connection(
-        lambda: transport,
-        config(service_name=f" {service_name} "),
-    )
-
+    connection = Connection(lambda: transport, config(service_name=f" {service_name} "))
     await connection.connect()
-    transport.send_event.clear()
-    hello = (1).to_bytes(2, "big") + CAP_SESSION_METADATA.to_bytes(4, "big")
-    await transport.inbound.put(FrameCodec.encode_frame(MSG_SERVER_HELLO, hello))
-    async with asyncio.timeout(1):
-        await transport.send_event.wait()
-
-    metadata = FrameCodec.decode_frame(transport.sent[1])
-    assert metadata.message_type == MSG_SESSION_METADATA
-    encoded_name = service_name.encode("utf-8")
-    assert metadata.payload == len(encoded_name).to_bytes(4, "big") + encoded_name
+    assert connect_service_name(transport.sent[0]) == service_name
     await connection.close()
 
 
 @pytest.mark.asyncio
-async def test_connection_omits_service_name_when_metadata_capability_is_missing() -> None:
+async def test_connection_uses_empty_name_without_a_separate_metadata_message() -> None:
     transport = FakeTransport()
-    connection = Connection(
-        lambda: transport,
-        config(service_name="orders-worker", auth_settle_timeout=0),
-    )
-
+    connection = Connection(lambda: transport, config())
     await connection.connect()
-
+    assert connect_service_name(transport.sent[0]) == ""
     assert len(transport.sent) == 1
-    assert FrameCodec.decode_frame(transport.sent[0]).message_type == MSG_CONNECT
     await connection.close()
 
 
@@ -346,12 +367,27 @@ async def test_old_transport_frame_cannot_resolve_new_generation_request() -> No
         while connection.generation != 2:  # noqa: ASYNC110
             await asyncio.sleep(0)
 
+    transports[1].send_event.clear()
     request = asyncio.create_task(connection.request(77, b"request"))
     await transports[1].send_event.wait()
-    await transports[0].inbound.put(FrameCodec.encode_frame(77, b"stale"))
+    await transports[0].inbound.put(
+        FrameCodec.encode_frame(
+            77,
+            b"stale",
+            flags=RESPONSE_FINAL,
+            correlation_id=FrameCodec.decode_frame(transports[0].sent[-1]).correlation_id,
+        )
+    )
     await asyncio.sleep(0)
     assert not request.done()
-    await transports[1].inbound.put(FrameCodec.encode_frame(77, b"current"))
+    await transports[1].inbound.put(
+        FrameCodec.encode_frame(
+            77,
+            b"current",
+            flags=RESPONSE_FINAL,
+            correlation_id=FrameCodec.decode_frame(transports[1].sent[-1]).correlation_id,
+        )
+    )
     assert await request == b"current"
     await connection.close()
 

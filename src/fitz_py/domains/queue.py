@@ -94,7 +94,14 @@ class QueueClient(DomainClient):
             writer.write_u64_be(seconds)
         response = parse_response(await self.request_frame(MSG_QUEUE_ENQUEUE, writer.build()))
         if not response.success:
-            raise domain_error(QueueError, "ENQUEUE", response.error_code or 0, response.error)
+            raise domain_error(
+                QueueError,
+                "ENQUEUE",
+                response.error_code or 0,
+                response.error,
+                response.error_class,
+                response.effect,
+            )
         reader = BufferReader(response.data)
         if reader.remaining_bytes() != 8:
             raise QueueError("ENQUEUE response must contain one item id", "INVALID_RESPONSE")
@@ -124,7 +131,14 @@ class QueueClient(DomainClient):
             writer.write_u64_be(wait)
         response = parse_response(await self.request_frame(MSG_QUEUE_RESERVE, writer.build()))
         if not response.success:
-            raise domain_error(QueueError, "RESERVE", response.error_code or 0, response.error)
+            raise domain_error(
+                QueueError,
+                "RESERVE",
+                response.error_code or 0,
+                response.error,
+                response.error_class,
+                response.effect,
+            )
         reader = BufferReader(response.data)
         if reader.is_eof():
             return []
@@ -164,7 +178,13 @@ class QueueClient(DomainClient):
             await self.request_frame(MSG_QUEUE_COMPLETE, writer.build())
         )
         if not response.success:
-            raise QueueError(f"COMPLETE failed: {response.error}", "COMPLETE", response.error_code)
+            raise QueueError(
+                f"COMPLETE failed: {response.error}",
+                "COMPLETE",
+                response.error_code,
+                response.error_class,
+                response.effect,
+            )
         if response.data:
             raise QueueError("COMPLETE response has trailing bytes", "INVALID_RESPONSE")
 
@@ -179,7 +199,13 @@ class QueueClient(DomainClient):
             await self.request_frame(MSG_QUEUE_EXTEND, writer.build())
         )
         if not response.success:
-            raise QueueError(f"EXTEND failed: {response.error}", "EXTEND", response.error_code)
+            raise QueueError(
+                f"EXTEND failed: {response.error}",
+                "EXTEND",
+                response.error_code,
+                response.error_class,
+                response.effect,
+            )
         if response.data:
             raise QueueError("EXTEND response has trailing bytes", "INVALID_RESPONSE")
 
@@ -191,7 +217,11 @@ class QueueClient(DomainClient):
         )
         if not response.success:
             raise QueueError(
-                f"SUBSCRIBE failed: {response.error}", "SUBSCRIBE", response.error_code
+                f"SUBSCRIBE failed: {response.error}",
+                "SUBSCRIBE",
+                response.error_code,
+                response.error_class,
+                response.effect,
             )
         reader = BufferReader(response.data)
         if reader.read_u8() != 1:
@@ -209,7 +239,11 @@ class QueueClient(DomainClient):
         )
         if not response.success:
             raise QueueError(
-                f"UNSUBSCRIBE failed: {response.error}", "UNSUBSCRIBE", response.error_code
+                f"UNSUBSCRIBE failed: {response.error}",
+                "UNSUBSCRIBE",
+                response.error_code,
+                response.error_class,
+                response.effect,
             )
         if response.data:
             raise QueueError("UNSUBSCRIBE response has trailing bytes", "INVALID_RESPONSE")

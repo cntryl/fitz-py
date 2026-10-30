@@ -9,6 +9,8 @@ from __future__ import annotations
 import importlib
 import sys
 
+import pytest
+
 
 def pytest_sessionfinish(session, exitstatus) -> None:
     # Lazy import — test_conformance is fully initialised by the time this hook fires.
@@ -40,4 +42,6 @@ def pytest_sessionfinish(session, exitstatus) -> None:
     if _results is None or _write_results is None:
         return
     if _results:
-        _write_results()
+        overall = _write_results()
+        if overall == "fail":
+            session.exitstatus = pytest.ExitCode.TESTS_FAILED
