@@ -150,6 +150,14 @@ class Client:
         return self._connection.capabilities
 
     @property
+    def max_message_bytes(self) -> int:
+        return self._connection.max_message_bytes
+
+    @property
+    def max_in_flight(self) -> int:
+        return self._connection.max_in_flight
+
+    @property
     def correlation_enabled(self) -> bool:
         return self._connection.correlation_enabled
 

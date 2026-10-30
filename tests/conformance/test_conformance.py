@@ -1058,6 +1058,39 @@ async def test_cs019_same_type_requests_are_correlated_out_of_order() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cs020_handshake_negotiation() -> None:
+    started = time.monotonic()
+    client = await _new_client()
+    try:
+        assert client.protocol_version == 2
+        assert client.capabilities == 0
+        assert client.max_message_bytes > 0
+        assert client.max_in_flight > 0
+        evidence = [
+            f"protocol_version={client.protocol_version}",
+            f"broker_caps={client.capabilities}",
+            f"max_message_bytes={client.max_message_bytes}",
+            f"max_in_flight={client.max_in_flight}",
+        ]
+    finally:
+        await client.aclose()
+
+    _record(
+        ScenarioResult(
+            "CS-020",
+            "handshake negotiation",
+            "P0",
+            CLIENT_NAME,
+            CONFORMANCE_TRANSPORT,
+            CONFORMANCE_AUTH_MODE,
+            "pass",
+            evidence,
+            round((time.monotonic() - started) * 1000),
+        )
+    )
+
+
+@pytest.mark.asyncio
 async def test_cs024_stream_event_boundary_and_replay() -> None:
     await _exercise_stream_boundary(CONFORMANCE_TRANSPORT, CONFORMANCE_AUTH_MODE)
     _record(
