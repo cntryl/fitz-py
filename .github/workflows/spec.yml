@@ -6,8 +6,8 @@ on:
       broker_tag:
         description: Fitz broker image tag
         type: choice
-        options: [main, develop]
-        default: main
+        options: [0.3.0, main, develop]
+        default: 0.3.0
   push:
     branches: [main]
   pull_request:
@@ -21,10 +21,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Automatic acceptance pins the qualified candidate required by RPC chain tests.
+# Automatic acceptance pins the published Wire 2 release.
 # Explicit main/develop dispatches remain diagnostic; no broker promotion occurs.
 env:
-  FITZ_BROKER_IMAGE: ghcr.io/cntryl/fitz:${{ inputs.broker_tag || 'develop' }}
+  FITZ_BROKER_IMAGE: ghcr.io/cntryl/fitz:${{ inputs.broker_tag || '0.3.0' }}
 
 jobs:
   spec:
