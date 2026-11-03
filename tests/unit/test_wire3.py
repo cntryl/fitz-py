@@ -8,9 +8,9 @@ import pytest
 
 from fitz_py.connection import Connection
 from fitz_py.domains.queue import QueueClient, QueueItem
-from fitz_py.errors import CodecError, QueueError, StaleHandleError
+from fitz_py.errors import CodecError, ProtocolError, QueueError, StaleHandleError
 from fitz_py.protocol.extensions import decode_payload, encode_capabilities, encode_payload
-from fitz_py.protocol.frame import FrameCodec
+from fitz_py.protocol.frame import FrameCodec, FrameParser
 from tests.unit.test_connection_lifecycle import FakeTransport, config
 
 VECTORS = dict(
@@ -68,6 +68,20 @@ def test_should_reject_invalid_capability_lists(capabilities: tuple[int, ...]) -
 def test_should_require_explicit_hello_capabilities() -> None:
     with pytest.raises(CodecError):
         decode_payload(bytes(22), 2, 0)
+
+
+def test_should_reject_every_truncated_prefix_of_wire3_hello() -> None:
+    payload = FrameCodec.decode_frame(
+        bytes.fromhex(VECTORS["hello_wire3_queue_capabilities"])
+    ).payload
+    for size in range(len(payload)):
+        with pytest.raises(CodecError):
+            decode_payload(payload[:size], 2, 4)
+
+
+def test_should_skip_repeated_unknown_fields_in_any_order() -> None:
+    payload = bytes.fromhex("000000026869100100000000100000000000100000000000")
+    assert decode_payload(payload, 104, 4) == (b"hi", ())
 
 
 async def complete_request(transport, operation, response):
@@ -133,5 +147,19 @@ async def test_should_reject_ttl_without_negotiated_support_before_sending() -> 
         with pytest.raises(QueueError, match="not negotiated"):
             await QueueClient(connection).enqueue("queue://acme/jobs/q", b"job", ttl_hours=2)
         assert len(transport.sent) == 1
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_should_reject_repeated_hello_after_negotiating_session() -> None:
+    transport = FakeTransport()
+    connection = Connection(lambda: transport, config())
+    await connection.connect()
+    try:
+        with pytest.raises(ProtocolError, match="Repeated HELLO"):
+            await connection._dispatch_transport_frame(
+                bytes.fromhex(VECTORS["hello_wire3_queue_capabilities"]), FrameParser()
+            )
     finally:
         await connection.close()

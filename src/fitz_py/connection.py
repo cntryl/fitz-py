@@ -468,6 +468,8 @@ class Connection:
                 frame.payload, frame.message_type, frame.flags
             )
         if frame.message_type == MSG_HELLO:
+            if self.protocol_version != 0:
+                raise ProtocolError("Repeated HELLO cannot renegotiate an established session")
             if (
                 frame.flags != EXTENSIONS_PRESENT
                 or frame.correlation_id != 0
