@@ -11,11 +11,18 @@ from fitz_py.domains._subscriptions import SubscriptionRegistry
 from fitz_py.domains.base import DomainClient
 from fitz_py.errors import QueueError, StaleHandleError, domain_error
 from fitz_py.protocol.buffer import BufferReader, BufferWriter
+from fitz_py.protocol.extensions import (
+    EXTENSIONS_PRESENT,
+    QUEUE_MESSAGE_TTL,
+    QUEUE_NACK,
+    encode_payload,
+)
 from fitz_py.protocol.messages import (
     MSG_QUEUE_AVAILABILITY_NOTIFY,
     MSG_QUEUE_COMPLETE,
     MSG_QUEUE_ENQUEUE,
     MSG_QUEUE_EXTEND,
+    MSG_QUEUE_NACK,
     MSG_QUEUE_RESERVE,
     MSG_QUEUE_SUBSCRIBE,
     MSG_QUEUE_UNSUBSCRIBE,
@@ -55,6 +62,11 @@ class QueueItem:
         await self._client._complete(self.route, self._id, self._token)  # noqa: SLF001
         self._closed = True
 
+    async def nack(self, visibility_seconds: int = 0) -> None:
+        self._ensure_valid()
+        await self._client._nack(self.route, self._id, self._token, visibility_seconds)  # noqa: SLF001
+        self._closed = True
+
 
 class QueueClient(DomainClient):
     def __init__(self, connection: Connection) -> None:
@@ -79,11 +91,16 @@ class QueueClient(DomainClient):
         if callable(on_close):
             on_close(self._subscriptions.terminate)
 
-    async def enqueue(self, route: str, body: BytesLike, *, delay: int | None = None) -> int:
+    async def enqueue(
+        self, route: str, body: BytesLike, *, delay: int | None = None, ttl_hours: int | None = None
+    ) -> int:
         _exact(route)
         body = bytes(body)
         if delay is not None:
             _duration(delay, "delay")
+        if ttl_hours is not None:
+            _ttl(ttl_hours)
+            self._require_capability(QUEUE_MESSAGE_TTL)
         writer = BufferWriter()
         writer.write_route(route)
         writer.write_u32_be(len(body))
@@ -92,7 +109,15 @@ class QueueClient(DomainClient):
         writer.write_u8(int(seconds > 0))
         if seconds:
             writer.write_u64_be(seconds)
-        response = parse_response(await self.request_frame(MSG_QUEUE_ENQUEUE, writer.build()))
+        payload = writer.build()
+        if ttl_hours is None:
+            raw = await self.request_frame(MSG_QUEUE_ENQUEUE, payload)
+        else:
+            payload = encode_payload(payload, ((1, ttl_hours.to_bytes(4, "big")),))
+            raw = await self.request_frame_with_flags(
+                MSG_QUEUE_ENQUEUE, payload, flags=EXTENSIONS_PRESENT
+            )
+        response = parse_response(raw)
         if not response.success:
             raise domain_error(
                 QueueError,
@@ -188,6 +213,34 @@ class QueueClient(DomainClient):
         if response.data:
             raise QueueError("COMPLETE response has trailing bytes", "INVALID_RESPONSE")
 
+    def _require_capability(self, capability_id: int) -> None:
+        if capability_id not in self.connection.capability_ids:
+            raise QueueError(
+                f"Queue capability {capability_id} was not negotiated", "UNSUPPORTED_CAPABILITY"
+            )
+
+    async def _nack(self, route: str, item_id: int, token: int, visibility_seconds: int) -> None:
+        _duration(visibility_seconds, "visibility_seconds")
+        self._require_capability(QUEUE_NACK)
+        writer = BufferWriter()
+        writer.write_route(route)
+        writer.write_u64_be(item_id)
+        writer.write_u64_be(token)
+        writer.write_u64_be(visibility_seconds)
+        response = parse_plain_or_coded_response(
+            await self.request_frame(MSG_QUEUE_NACK, writer.build())
+        )
+        if not response.success:
+            raise QueueError(
+                f"NACK failed: {response.error}",
+                "NACK",
+                response.error_code,
+                response.error_class,
+                response.effect,
+            )
+        if response.data:
+            raise QueueError("NACK response has trailing bytes", "INVALID_RESPONSE")
+
     async def _extend(self, route: str, item_id: int, token: int, lease: int) -> None:
         _duration(lease, "lease", positive=True)
         writer = BufferWriter()
@@ -278,3 +331,8 @@ def _duration(value: object, name: str, *, positive: bool = False) -> None:
     if value < (1 if positive else 0):
         qualifier = "positive" if positive else "non-negative"
         raise ValueError(f"{name} must be {qualifier}")
+
+
+def _ttl(value: object) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 0xFFFFFFFF:
+        raise ValueError("ttl_hours must be a positive u32 number of hours")

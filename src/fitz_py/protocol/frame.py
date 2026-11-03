@@ -8,7 +8,7 @@ HEADER_LEN = 15
 MAX_MESSAGE_SIZE = 1_048_576
 ACK_REQUESTED = 1
 RESPONSE_FINAL = 2
-VALID_FLAGS = ACK_REQUESTED | RESPONSE_FINAL
+VALID_FLAGS = ACK_REQUESTED | RESPONSE_FINAL | 4
 
 
 @dataclass(slots=True)
@@ -46,6 +46,8 @@ class FrameCodec:
 
     @staticmethod
     def decode_frame(data: bytes) -> Frame:
+        if len(data) > MAX_MESSAGE_SIZE:
+            raise CodecError(f"Message exceeds {MAX_MESSAGE_SIZE} bytes")
         if len(data) < HEADER_LEN:
             raise CodecError(f"Message header is truncated: {len(data)} bytes")
         message_type = int.from_bytes(data[:2], "big")
