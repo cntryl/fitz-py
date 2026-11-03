@@ -8,6 +8,7 @@ from fitz_py._runtime import AsyncSubscription
 from fitz_py.connection import Connection
 from fitz_py.errors import FitzConnectionError, FitzTransportError
 from fitz_py.protocol.buffer import BufferReader
+from fitz_py.protocol.extensions import encode_capabilities, encode_payload
 from fitz_py.protocol.frame import RESPONSE_FINAL, FrameCodec
 from fitz_py.protocol.messages import (
     MSG_NOTICE_PUBLISH,
@@ -27,19 +28,25 @@ from fitz_py.types import (
 
 
 def hello_payload() -> bytes:
-    return (
-        (2).to_bytes(2, "big")
-        + (0).to_bytes(4, "big")
-        + (1_048_576).to_bytes(4, "big")
-        + (64).to_bytes(4, "big")
-        + (1).to_bytes(8, "big")
+    return encode_payload(
+        (
+            (3).to_bytes(2, "big")
+            + (0).to_bytes(4, "big")
+            + (1_048_576).to_bytes(4, "big")
+            + (64).to_bytes(4, "big")
+            + (1).to_bytes(8, "big")
+        ),
+        ((1, encode_capabilities((1, 2))),),
     )
 
 
 def connect_service_name(frame: bytes) -> str:
-    reader = BufferReader(FrameCodec.decode_frame(frame).payload)
-    assert reader.read_u16_be() == 2
-    assert reader.read_u16_be() == 2
+    from fitz_py.protocol.extensions import decode_payload
+
+    raw = FrameCodec.decode_frame(frame)
+    reader = BufferReader(decode_payload(raw.payload, raw.message_type, raw.flags)[0])
+    assert reader.read_u16_be() == 3
+    assert reader.read_u16_be() == 3
     assert reader.read_u32_be() == 0
     reader.read_string()
     return reader.read_string()
@@ -58,7 +65,9 @@ class FakeTransport(Transport):
     async def connect(self) -> None:
         self.connected = True
         if self.send_hello and self.inbound.empty():
-            self.inbound.put_nowait(FrameCodec.encode_frame(MSG_SERVER_HELLO, hello_payload()))
+            self.inbound.put_nowait(
+                FrameCodec.encode_frame(MSG_SERVER_HELLO, hello_payload(), flags=4)
+            )
 
     async def close(self) -> None:
         self.closed = True

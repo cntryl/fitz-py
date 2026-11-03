@@ -31,6 +31,7 @@ class Multiplexer:
         self._on_error = on_error
         self._protocol_version = 0
         self._capabilities = 0
+        self.capability_ids: tuple[int, ...] = ()
         self._next_correlation_id = 1
 
     def set_connected(self) -> None:
@@ -41,6 +42,7 @@ class Multiplexer:
         self._connected = False
         self._protocol_version = 0
         self._capabilities = 0
+        self.capability_ids = ()
         self._legacy_lanes.clear()
         self.cancel_all()
 
@@ -100,7 +102,7 @@ class Multiplexer:
     ) -> bytes:
         future = asyncio.get_running_loop().create_future()
         if not self.correlation_enabled:
-            raise FitzConnectionError("Wire-2 HELLO is required before sending requests")
+            raise FitzConnectionError("Wire-3 HELLO is required before sending requests")
         correlation_id = self.next_correlation_id()
         frame_data = (
             frame_data[:2] + bytes((flags,)) + correlation_id.to_bytes(8, "big") + frame_data[11:]

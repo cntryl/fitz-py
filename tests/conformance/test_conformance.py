@@ -1026,7 +1026,7 @@ async def test_cs015_shutdown_during_active_work() -> None:
 async def test_cs019_same_type_requests_are_correlated_out_of_order() -> None:
     client = await _new_client(timeout_ms=10000)
     assert client.correlation_enabled
-    assert client.protocol_version == 2
+    assert client.protocol_version == 3
     assert client.capabilities == 0
     parked_route = _unique_route("queue")
     ready_route = _unique_route("queue")
@@ -1062,7 +1062,7 @@ async def test_cs020_handshake_negotiation() -> None:
     started = time.monotonic()
     client = await _new_client()
     try:
-        assert client.protocol_version == 2
+        assert client.protocol_version == 3
         assert client.capabilities == 0
         assert client.max_message_bytes > 0
         assert client.max_in_flight > 0

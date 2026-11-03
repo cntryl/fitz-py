@@ -22,6 +22,13 @@ from fitz_py.errors import (
 )
 from fitz_py.multiplexer import Multiplexer
 from fitz_py.protocol.buffer import BufferReader, BufferWriter
+from fitz_py.protocol.extensions import (
+    CLIENT_CAPABILITY_IDS,
+    EXTENSIONS_PRESENT,
+    decode_payload,
+    encode_capabilities,
+    encode_payload,
+)
 from fitz_py.protocol.frame import RESPONSE_FINAL, FrameCodec, FrameParser
 from fitz_py.protocol.messages import (
     MSG_CONNECT,
@@ -107,6 +114,10 @@ class Connection:
     @property
     def capabilities(self) -> int:
         return self._multiplexer.capabilities
+
+    @property
+    def capability_ids(self) -> tuple[int, ...]:
+        return self._multiplexer.capability_ids
 
     @property
     def correlation_enabled(self) -> bool:
@@ -387,13 +398,16 @@ class Connection:
             token = provided
         token_bytes = token.encode() if isinstance(token, str) else bytes(token)
         writer = BufferWriter()
-        writer.write_u16_be(2)
-        writer.write_u16_be(2)
+        writer.write_u16_be(3)
+        writer.write_u16_be(3)
         writer.write_u32_be(0)
         writer.write_string(token_bytes.decode("utf-8"))
         writer.write_string((self._config.service_name or "").strip())
-        writer.write_string("fitz-py/0.2.0")
-        await self._send_frame(FrameCodec.encode_frame(MSG_CONNECT, writer.build()))
+        writer.write_string("fitz-py/0.4.0")
+        payload = encode_payload(writer.build(), ((1, encode_capabilities(CLIENT_CAPABILITY_IDS)),))
+        await self._send_frame(
+            FrameCodec.encode_frame(MSG_CONNECT, payload, flags=EXTENSIONS_PRESENT)
+        )
 
     async def _request_without_gate(
         self, message_type: int, payload: bytes, *, flags: int = 0
@@ -448,8 +462,19 @@ class Connection:
         if not frames:
             return
         frame = frames[0]
+        capability_ids: tuple[int, ...] = ()
+        if frame.flags & EXTENSIONS_PRESENT or frame.message_type == MSG_HELLO:
+            frame.payload, capability_ids = decode_payload(
+                frame.payload, frame.message_type, frame.flags
+            )
         if frame.message_type == MSG_HELLO:
-            if frame.flags != 0 or frame.correlation_id != 0 or len(frame.payload) < 22:
+            if self.protocol_version != 0:
+                raise ProtocolError("Repeated HELLO cannot renegotiate an established session")
+            if (
+                frame.flags != EXTENSIONS_PRESENT
+                or frame.correlation_id != 0
+                or len(frame.payload) != 22
+            ):
                 raise FitzConnectionError("Malformed HELLO message")
             reader = BufferReader(frame.payload)
             version = reader.read_u16_be()
@@ -457,8 +482,13 @@ class Connection:
             server_max_message_bytes = reader.read_u32_be()
             server_max_in_flight = reader.read_u32_be()
             self._session_id = reader.read_u64_be()
-            if version != 2 or server_max_message_bytes < 15 or server_max_in_flight < 1:
-                raise FitzConnectionError("Broker advertised invalid Wire-2 limits")
+            if (
+                version != 3
+                or capabilities != 0
+                or server_max_message_bytes < 15
+                or server_max_in_flight < 1
+            ):
+                raise FitzConnectionError("Broker advertised invalid Wire-3 limits")
             self._max_message_bytes = min(
                 server_max_message_bytes, self._config.max_frame_size, 1_048_576
             )
@@ -467,6 +497,9 @@ class Connection:
             if transport is not None:
                 transport.set_max_frame_size(self._max_message_bytes)
             self._multiplexer.set_capabilities(version, capabilities)
+            self._multiplexer.capability_ids = tuple(
+                value for value in capability_ids if value in CLIENT_CAPABILITY_IDS
+            )
             self._gate = RequestGate(self._max_in_flight, self._config.limits.request_queue_size)
             if self._auth_error is not None and not self._auth_error.done():
                 self._auth_error.set_result(None)
@@ -475,7 +508,11 @@ class Connection:
             reader = BufferReader(frame.payload)
             code = reader.read_u16_be()
             message = reader.read_string()
-            if not reader.is_eof() or frame.flags != 0 or frame.correlation_id != 0:
+            if (
+                not reader.is_eof()
+                or frame.flags & ~EXTENSIONS_PRESENT
+                or frame.correlation_id != 0
+            ):
                 raise FitzConnectionError("Malformed CONNECT_REJECTED message")
             if code == 50:
                 raise ProtocolError(f"wire version mismatch: {message}", domain_code=code)
@@ -485,7 +522,11 @@ class Connection:
             code = reader.read_u16_be()
             grace_ms = reader.read_u32_be()
             reason = reader.read_string()
-            if not reader.is_eof() or frame.flags != 0 or frame.correlation_id != 0:
+            if (
+                not reader.is_eof()
+                or frame.flags & ~EXTENSIONS_PRESENT
+                or frame.correlation_id != 0
+            ):
                 raise FitzConnectionError("Malformed GOAWAY message")
             self._goaway = (code, grace_ms / 1000, reason)
             callback = self._config.on_goaway

@@ -1,13 +1,11 @@
-# Canonical Client Spec
+# Canonical Client Specification
 
-`fitz-py` does not define protocol behavior locally.
+This SDK implements Fitz 0.4.0 / Wire 3. The server repository owns protocol behavior:
 
-The canonical Fitz client specification lives in the server repository:
+- [Client specification](https://github.com/cntryl/fitz/blob/main/docs/clients/client-spec.md)
+- [Wire 3 framing and negotiation](https://github.com/cntryl/fitz/blob/main/docs/clients/spec/wire-routing-3.md)
+- [Extension and capability registry](https://github.com/cntryl/fitz/blob/main/docs/clients/spec/extension-registry.md)
+- [Client implementation guide](https://github.com/cntryl/fitz/blob/main/docs/clients/client-implementation-guide.md)
+- [Shared conformance scenarios](https://github.com/cntryl/fitz/blob/main/docs/clients/cross-language-conformance-suite.yaml)
 
-- `../../fitz/docs/clients/spec/`
-- `../../fitz/docs/clients/cross-language-conformance-suite.yaml`
-- `../../fitz/docs/clients/client-perfection-scoreboard.md`
-
-Use `fitz-ts` as the forward implementation reference and cross-check wire-sensitive behavior
-against the current broker source. When prose and the running codec disagree, record the drift and
-follow the current broker contract.
+See [Wire 3 migration](WIRE3_MIGRATION.md) for the SDK's Queue TTL and NACK APIs and coordinated upgrade guidance.

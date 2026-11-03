@@ -22,9 +22,9 @@ async def test_connect_waits_for_hello_beyond_authentication_settlement() -> Non
         await asyncio.sleep(0.025)
         assert not connected.done()
         hello = hello_payload()
-        await transport.inbound.put(FrameCodec.encode_frame(MSG_SERVER_HELLO, hello))
+        await transport.inbound.put(FrameCodec.encode_frame(MSG_SERVER_HELLO, hello, flags=4))
         await connected
-        assert connection.protocol_version == 2
+        assert connection.protocol_version == 3
         assert connection.capabilities == 0
     finally:
         await connection.close()

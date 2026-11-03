@@ -150,6 +150,10 @@ class Client:
         return self._connection.capabilities
 
     @property
+    def capability_ids(self) -> tuple[int, ...]:
+        return self._connection.capability_ids
+
+    @property
     def max_message_bytes(self) -> int:
         return self._connection.max_message_bytes
 

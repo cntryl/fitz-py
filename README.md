@@ -1,6 +1,8 @@
 # fitz-py
 
-`fitz-py` is the typed, asyncio-native Python client for the Fitz broker. Version 0.2.0 is a
+Current release candidate: **0.4.0**, requiring Fitz **0.4.0 / Wire 3**. See [Wire 3 migration](WIRE3_MIGRATION.md) for Queue TTL, NACK, negotiation, and coordinated upgrade guidance.
+
+`fitz-py` is the typed, asyncio-native Python client for the Fitz broker. Version 0.4.0 is a
 deliberate clean break: clients are configured once, domain clients are cached properties, streamed
 results are async iterators, and network/runtime queues are bounded.
 
@@ -10,16 +12,16 @@ local wheel from this checkout:
 ```bash
 python -m pip install build
 python -m build --wheel
-python -m pip install dist/cntryl_fitz-0.2.0-py3-none-any.whl
+python -m pip install dist/cntryl_fitz-0.4.0-py3-none-any.whl
 ```
 
 If the release wheel has already been supplied, only the last command is needed.
 
 ## Connect
 
-Connection readiness waits for Wire-2 `HELLO` within `request_timeout`, so the
+Connection readiness waits for Wire 3 `HELLO` within `request_timeout`, so the
 first domain command uses the broker's negotiated message-size and
-in-flight-request limits. Wire 2 carries correlation in the fixed frame header;
+in-flight-request limits. Wire 3 carries correlation in the fixed frame header;
 capability bits are reserved as zero. `auth_settle_timeout` is retained as a
 deprecated option for observing `CONNECT_REJECTED`.
 
@@ -95,7 +97,7 @@ queue, stale-handle, and domain failures have stable string codes and structured
 cancellation is preserved. Requests cancelled after transmission leave a FIFO tombstone so a late
 reply cannot corrupt the next same-type request.
 
-RPC calls carry their remaining timeout budget in Wire 2. Closing a started
+RPC calls carry their remaining timeout budget in Wire 3. Closing a started
 `client.rpc.call()` or cancelling its asyncio task sends a best-effort remote
 cancellation; await `call.cancellation` for the broker result, or use `await call.cancel()` to
 cancel and wait for that result. A worker receives `request.context.cancelled` and
@@ -128,7 +130,7 @@ limit=...)` is the explicit cursor API name for the same message. Message 707 is
 retired. `schedule.create_batch(entries)` uses Schedule message 706.
 `create_batch` accepts `ScheduleEntry` values, including each entry's delivery mode.
 `list_v2` returns a `ScheduleCursorPage` with `entries`, `has_more`, and an opaque
-`continuation` to pass as the next cursor. They use the Wire-2 Schedule messages
+`continuation` to pass as the next cursor. They use the Wire 3 Schedule messages
 and report coded broker errors as `ScheduleError` domain codes.
 
 ## Verification
@@ -149,7 +151,7 @@ python -m benchmarks.hotpath
 python -m build
 ```
 
-The repository owns its broker Compose stack and a vendored copy of the canonical 17-scenario
+The repository owns its broker Compose stack and a vendored copy of the canonical 24-scenario
 cross-language suite. CI runs Python 3.11-3.14, wheel smoke tests, TCP/WebSocket, and
 anonymous/JWT broker legs. Canonical behavior remains owned by the Fitz server documentation.
 
